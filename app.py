@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify, render_template_string
 import requests
 import re
 import time
+import os
 import dns.resolver
 import smtplib
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -141,7 +142,7 @@ def home():
     ''')
 
 # ==========================================
-# VERIFY PAGE (4-Batch Progress)
+# VERIFY PAGE
 # ==========================================
 @app.route('/verify')
 def verify_page():
@@ -709,7 +710,10 @@ def find_emails(domain):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5"
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1"
     }
     
     # METHOD 1: Fetch the contact pages and strip HTML
@@ -718,14 +722,16 @@ def find_emails(domain):
         f"https://{domain}/pages/contact-us",
         f"https://{domain}/contact",
         f"https://{domain}/pages/about",
+        f"https://{domain}/pages/about-us",
         f"https://{domain}/pages/customer-service",
         f"https://{domain}/pages/support",
+        f"https://{domain}/pages/help",
         f"https://{domain}",
     ]
     
     for page_url in pages_to_check:
         try:
-            r = requests.get(page_url, headers=headers, timeout=10)
+            r = requests.get(page_url, headers=headers, timeout=15)
             if r.status_code == 200:
                 # Strip all HTML/JS/CSS
                 clean = re.sub(r'<script[^>]*>.*?</script>', ' ', r.text, flags=re.DOTALL)
@@ -752,17 +758,18 @@ def find_emails(domain):
                 mailtos = re.findall(r'mailto:([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', r.text)
                 for email in mailtos:
                     emails.append(email.lower())
-        except:
+                    
+        except Exception as e:
             continue
     
     # METHOD 2: Fetch sitemap and check /pages/ URLs
     try:
-        r = requests.get(f"https://{domain}/sitemap.xml", headers=headers, timeout=8)
+        r = requests.get(f"https://{domain}/sitemap.xml", headers=headers, timeout=10)
         if r.status_code == 200:
             page_urls = re.findall(r'<loc>(https://[^<]*?/pages/[^<]+)</loc>', r.text)
             for page_url in page_urls[:5]:
                 try:
-                    r2 = requests.get(page_url, headers=headers, timeout=8)
+                    r2 = requests.get(page_url, headers=headers, timeout=10)
                     if r2.status_code == 200:
                         clean = re.sub(r'<[^>]+>', ' ', r2.text)
                         found = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', clean)
@@ -846,3 +853,10 @@ def get_email():
         return jsonify({'success': True, 'emails': emails})
     else:
         return jsonify({'success': False, 'message': 'No email found'})
+
+# ==========================================
+# RENDER / PYTHONANYWHERE STARTUP
+# ==========================================
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
