@@ -5,6 +5,8 @@ import os
 import dns.resolver
 import smtplib
 import hashlib
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
 import psycopg2
@@ -77,6 +79,19 @@ def init_db():
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) UNIQUE NOT NULL,
             found_emails TEXT, verified_emails TEXT, scout_recipients TEXT,
             scout_subject TEXT, scout_message TEXT, scout_count INTEGER DEFAULT 0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        # NEW: Verify jobs table
+        cur.execute("""CREATE TABLE IF NOT EXISTS verify_jobs (
+            id SERIAL PRIMARY KEY,
+            user_email VARCHAR(255) NOT NULL,
+            job_name VARCHAR(255),
+            total INTEGER DEFAULT 0,
+            processed INTEGER DEFAULT 0,
+            valid_emails TEXT,
+            invalid_emails TEXT,
+            remaining_emails TEXT,
+            status VARCHAR(50) DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
         conn.commit(); cur.close()
         print("✅ DB ready")
@@ -179,6 +194,191 @@ def verify_email(email):
         return email, False, "Unknown"
 
 # ==========================================
+# BACKGROUND VERIFY WORKER
+# ==========================================
+def background_verify_worker(job_id):
+    """Runs in background thread. Processes emails in chunks, saves to DB."""
+    print(f"🔄 Job {job_id} started")
+    conn = get_db()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT remaining_emails, valid_emails, invalid_emails FROM verify_jobs WHERE id = %s", (job_id,))
+        row = cur.fetchone()
+        cur.close()
+        if not row: return
+        remaining = row[0].split('|||') if row[0] else []
+        valid = row[1].split('|||') if row[1] else []
+        invalid = row[2].split('|||') if row[2] else []
+    finally:
+        release_db(conn)
+
+    CHUNK_SIZE = 100
+
+    while remaining:
+        # Check if cancelled
+        conn = get_db()
+        if not conn: break
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT status FROM verify_jobs WHERE id = %s", (job_id,))
+            status_row = cur.fetchone()
+            cur.close()
+            if not status_row or status_row[0] == 'cancelled':
+                print(f"⏹️ Job {job_id} cancelled")
+                return
+        finally:
+            release_db(conn)
+
+        chunk = remaining[:CHUNK_SIZE]
+        remaining = remaining[CHUNK_SIZE:]
+
+        # Verify chunk
+        with ThreadPoolExecutor(max_workers=20) as ex:
+            futures = {ex.submit(verify_email, e): e for e in chunk}
+            for f in as_completed(futures):
+                email, ok, reason = f.result()
+                if ok: valid.append(email)
+                else: invalid.append(email + " - " + reason)
+
+        # Save progress after each chunk
+        conn = get_db()
+        if not conn: break
+        try:
+            cur = conn.cursor()
+            new_status = 'completed' if not remaining else 'running'
+            cur.execute("""UPDATE verify_jobs SET processed=%s, valid_emails=%s, invalid_emails=%s,
+                remaining_emails=%s, status=%s, updated_at=NOW() WHERE id=%s""",
+                (len(valid) + len(invalid), '|||'.join(valid), '|||'.join(invalid),
+                 '|||'.join(remaining), new_status, job_id))
+            conn.commit(); cur.close()
+        finally:
+            release_db(conn)
+
+    print(f"✅ Job {job_id} complete")
+
+# ==========================================
+# START BACKGROUND VERIFY
+# ==========================================
+@app.route('/verify-async', methods=['POST'])
+@login_required
+def verify_async():
+    user_email = session.get('user_id')
+    data = request.json
+    emails = data.get('emails', [])
+    job_name = data.get('name', f"Job {int(time.time())}")
+    
+    if not emails:
+        return jsonify({'error': 'No emails'}), 400
+    
+    conn = get_db()
+    if not conn: return jsonify({'error': 'No DB'}), 500
+    try:
+        cur = conn.cursor()
+        cur.execute("""INSERT INTO verify_jobs (user_email, job_name, total, remaining_emails, valid_emails, invalid_emails, status)
+            VALUES (%s, %s, %s, %s, '', '', 'pending') RETURNING id""",
+            (user_email, job_name, len(emails), '|||'.join(emails)))
+        job_id = cur.fetchone()[0]
+        conn.commit(); cur.close()
+    finally:
+        release_db(conn)
+    
+    # Start background thread
+    thread = threading.Thread(target=background_verify_worker, args=(job_id,), daemon=True)
+    thread.start()
+    
+    return jsonify({'success': True, 'job_id': job_id, 'total': len(emails)})
+
+# ==========================================
+# GET JOB STATUS
+# ==========================================
+@app.route('/verify-status/<int:job_id>')
+@login_required
+def verify_status(job_id):
+    conn = get_db()
+    if not conn: return jsonify({'error': 'No DB'}), 500
+    try:
+        cur = conn.cursor()
+        cur.execute("""SELECT id, job_name, total, processed, status, valid_emails, invalid_emails, created_at
+            FROM verify_jobs WHERE id = %s""", (job_id,))
+        row = cur.fetchone(); cur.close()
+        if not row: return jsonify({'error': 'Not found'}), 404
+        valid_count = len(row[5].split('|||')) if row[5] else 0
+        invalid_count = len(row[6].split('|||')) if row[6] else 0
+        return jsonify({
+            'id': row[0], 'name': row[1], 'total': row[2], 'processed': row[3],
+            'status': row[4], 'valid': valid_count, 'invalid': invalid_count,
+            'created_at': str(row[7])
+        })
+    finally:
+        release_db(conn)
+
+# ==========================================
+# GET JOB RESULTS
+# ==========================================
+@app.route('/verify-results/<int:job_id>')
+@login_required
+def verify_results(job_id):
+    conn = get_db()
+    if not conn: return jsonify({'error': 'No DB'}), 500
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT valid_emails, invalid_emails FROM verify_jobs WHERE id = %s", (job_id,))
+        row = cur.fetchone(); cur.close()
+        if not row: return jsonify({'error': 'Not found'}), 404
+        return jsonify({
+            'valid': row[0].split('|||') if row[0] else [],
+            'invalid': row[1].split('|||') if row[1] else []
+        })
+    finally:
+        release_db(conn)
+
+# ==========================================
+# LIST LAST 3 JOBS
+# ==========================================
+@app.route('/verify-jobs')
+@login_required
+def verify_jobs_list():
+    user_email = session.get('user_id')
+    conn = get_db()
+    if not conn: return jsonify({'jobs': []})
+    try:
+        cur = conn.cursor()
+        cur.execute("""SELECT id, job_name, total, processed, status, created_at,
+            valid_emails, invalid_emails
+            FROM verify_jobs WHERE user_email = %s
+            ORDER BY created_at DESC LIMIT 3""", (user_email,))
+        rows = cur.fetchall(); cur.close()
+        jobs = []
+        for r in rows:
+            valid_count = len(r[6].split('|||')) if r[6] else 0
+            invalid_count = len(r[7].split('|||')) if r[7] else 0
+            jobs.append({
+                'id': r[0], 'name': r[1], 'total': r[2], 'processed': r[3],
+                'status': r[4], 'created_at': str(r[5]),
+                'valid': valid_count, 'invalid': invalid_count
+            })
+        return jsonify({'jobs': jobs})
+    finally:
+        release_db(conn)
+
+# ==========================================
+# CANCEL JOB
+# ==========================================
+@app.route('/verify-cancel/<int:job_id>', methods=['POST'])
+@login_required
+def verify_cancel(job_id):
+    conn = get_db()
+    if not conn: return jsonify({'error': 'No DB'}), 500
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE verify_jobs SET status='cancelled' WHERE id=%s AND user_email=%s", (job_id, session.get('user_id')))
+        conn.commit(); cur.close()
+        return jsonify({'success': True})
+    finally:
+        release_db(conn)
+
+# ==========================================
 # FINDER
 # ==========================================
 def find_emails(domain):
@@ -219,7 +419,7 @@ def find_emails(domain):
     return final
 
 # ==========================================
-# NAVBAR + DRAWER
+# NAVBAR
 # ==========================================
 NAVBAR = '''
 <style>
@@ -357,37 +557,36 @@ async function findBulkEmails(){
     return render_page("Finder", body)
 
 # ==========================================
-# VERIFY (CHUNKED)
+# VERIFY
 # ==========================================
 @app.route('/verify')
 @login_required
 def verify_page():
     body = '''<div style="max-width:800px;margin:20px auto;padding:20px">
-<div style="background:#f59e0b;color:white;padding:20px;border-radius:10px;margin-bottom:20px"><h1 style="margin:0">✅ Verify Emails</h1><p style="margin:5px 0 0 0">Chunked processing — handles any list size</p></div>
+<div style="background:#f59e0b;color:white;padding:20px;border-radius:10px;margin-bottom:20px">
+<h1 style="margin:0">✅ Verify Emails (Background)</h1>
+<p style="margin:5px 0 0 0">Drop emails, close browser, come back later</p>
+</div>
+
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
-<textarea id="emailsInput" style="width:100%;height:200px;border:1px solid #ddd;border-radius:5px;padding:10px;font-family:monospace;box-sizing:border-box" placeholder="email1@example.com&#10;email2@example.com"></textarea>
+<h3 style="margin-top:0">📋 Last 3 Jobs</h3>
+<div id="jobsList" style="margin-bottom:15px">Loading...</div>
+<button onclick="refreshJobs()" style="background:#3b82f6;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px">🔄 Refresh</button>
+</div>
+
+<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
+<h3 style="margin-top:0">🆕 New Verification</h3>
+<textarea id="emailsInput" style="width:100%;height:180px;border:1px solid #ddd;border-radius:5px;padding:10px;font-family:monospace;box-sizing:border-box" placeholder="email1@example.com&#10;email2@example.com"></textarea>
 <div style="border:2px dashed #ddd;padding:15px;text-align:center;margin:10px 0">
 <input type="file" id="emailFile" accept=".csv,.txt">
 <button onclick="readFile()" style="background:#f59e0b;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;margin-left:10px">Upload</button>
 </div>
 <button onclick="loadFromFinder()" style="background:#f59e0b;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-right:8px;margin-bottom:8px">📥 From Finder</button>
-<button id="startBtn" onclick="startVerify()" style="background:#0d9488;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-bottom:8px">🔍 Verify</button>
-<button id="stopBtn" onclick="stopVerify()" style="background:#ef4444;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-bottom:8px;display:none">⏹️ Stop</button>
-<div id="progressContainer" style="display:none;width:100%;background:#e0e0e0;border-radius:10px;margin-top:15px">
-<div id="progressBar" style="width:0%;height:24px;background:linear-gradient(90deg,#4ade80,#22c55e);border-radius:10px;text-align:center;color:white;font-size:13px;line-height:24px;transition:width 0.3s">0%</div>
+<button onclick="startBackgroundVerify()" style="background:#0d9488;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-bottom:8px">▶️ Start Background Verify</button>
+<div id="startMsg" style="margin-top:10px"></div>
 </div>
-<div id="progressText" style="font-weight:bold;margin-top:8px;text-align:center"></div>
 </div>
-<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1)">
-<h3 style="margin-top:0">📊 Results</h3>
-<p style="color:green;font-weight:bold" id="validCount">✅ Valid: 0</p>
-<p style="color:red;font-weight:bold" id="invalidCount">❌ Invalid: 0</p>
-<div id="result" style="max-height:400px;overflow-y:auto"></div>
-<button onclick="downloadValid()" style="background:#0d9488;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-right:8px;margin-top:10px">⬇️ Download Valid</button>
-<button onclick="sendToScout()" style="background:#3b82f6;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-top:10px">📨 Send to Scout</button>
-</div></div>
 <script>
-let valid=[],invalid=[],isRunning=false,shouldStop=false;
 async function loadFromFinder(){
   const res=await fetch('/get-stored-emails');const data=await res.json();
   if(data.emails&&data.emails.length>0){document.getElementById('emailsInput').value=data.emails.join('\\n');alert('Loaded '+data.emails.length)}
@@ -402,82 +601,97 @@ function readFile(){
     alert('Loaded '+emails.length+' emails');
   };r.readAsText(f);
 }
-function stopVerify(){shouldStop=true}
-async function startVerify(){
-  if(isRunning){alert('Already running');return}
+async function startBackgroundVerify(){
   const emails=document.getElementById('emailsInput').value.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);
   if(emails.length===0){alert('Enter emails');return}
-  valid=[];invalid=[];isRunning=true;shouldStop=false;
-  document.getElementById('startBtn').style.display='none';
-  document.getElementById('stopBtn').style.display='inline-block';
-  document.getElementById('progressContainer').style.display='block';
-  document.getElementById('result').innerHTML='';
-  
-  const CHUNK_SIZE=150;
-  const totalChunks=Math.ceil(emails.length/CHUNK_SIZE);
-  
-  for(let i=0;i<totalChunks;i++){
-    if(shouldStop){break}
-    const chunk=emails.slice(i*CHUNK_SIZE,(i+1)*CHUNK_SIZE);
-    const startTime=Date.now();
-    
-    try{
-      const res=await fetch('/verify-chunk',{
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({emails:chunk})
-      });
-      const data=await res.json();
-      if(data.valid)valid=valid.concat(data.valid);
-      if(data.invalid)invalid=invalid.concat(data.invalid);
-    }catch(e){
-      console.error('Chunk error:',e);
+  const name=prompt('Name this job (optional):','Job '+new Date().toLocaleString());
+  document.getElementById('startMsg').innerHTML='<p style="color:#666">Starting background job...</p>';
+  try{
+    const res=await fetch('/verify-async',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({emails:emails,name:name||'Untitled'})});
+    const data=await res.json();
+    if(data.success){
+      document.getElementById('startMsg').innerHTML='<p style="color:green">✅ Job #'+data.job_id+' started! You can close this page.</p>';
+      document.getElementById('emailsInput').value='';
+      refreshJobs();
     }
-    
-    const percent=Math.round(((i+1)/totalChunks)*100);
-    document.getElementById('progressBar').style.width=percent+'%';
-    document.getElementById('progressBar').textContent=percent+'%';
-    document.getElementById('progressText').textContent='Processed '+(i+1)*CHUNK_SIZE+' / '+emails.length+' emails ('+valid.length+' valid, '+invalid.length+' invalid)';
-    document.getElementById('validCount').textContent='✅ Valid: '+valid.length;
-    document.getElementById('invalidCount').textContent='❌ Invalid: '+invalid.length;
-    
-    // Update results incrementally
-    let html='<h4>Valid:</h4>';
-    valid.slice(-30).forEach(e=>{html+='<div style="background:#d4edda;padding:5px;margin:3px 0;border-radius:4px;color:#155724;word-break:break-all;font-size:13px">✅ '+e+'</div>'});
-    html+='<h4>Invalid (last 30):</h4>';
-    invalid.slice(-30).forEach(e=>{html+='<div style="background:#f8d7da;padding:5px;margin:3px 0;border-radius:4px;color:#721c24;word-break:break-all;font-size:13px">❌ '+e+'</div>'});
-    document.getElementById('result').innerHTML=html;
-  }
-  
-  isRunning=false;
-  document.getElementById('startBtn').style.display='inline-block';
-  document.getElementById('stopBtn').style.display='none';
-  document.getElementById('progressText').textContent=shouldStop?'⏹️ Stopped':'✅ Complete! '+valid.length+' valid, '+invalid.length+' invalid';
-  
-  await fetch('/save-verified',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({valid:valid})});
+  }catch(e){document.getElementById('startMsg').innerHTML='<p style="color:red">Error: '+e+'</p>'}
 }
-function downloadValid(){
-  if(!valid.length){alert('No valid');return}
-  const csv='Email\\n'+valid.join('\\n');
+async function refreshJobs(){
+  const res=await fetch('/verify-jobs');
+  const data=await res.json();
+  const container=document.getElementById('jobsList');
+  if(!data.jobs||data.jobs.length===0){container.innerHTML='<p style="color:#666">No jobs yet.</p>';return}
+  let html='';
+  data.jobs.forEach(job=>{
+    const percent=job.total>0?Math.round((job.processed/job.total)*100):0;
+    const statusColor=job.status==='completed'?'#0d9488':(job.status==='running'?'#f59e0b':'#ef4444');
+    const statusIcon=job.status==='completed'?'✅':(job.status==='running'?'🔄':'⏹️');
+    html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+statusColor+'">';
+    html+='<div style="font-weight:bold">'+statusIcon+' '+job.name+' <span style="color:#666;font-weight:normal;font-size:13px">#'+job.id+'</span></div>';
+    html+='<div style="font-size:13px;color:#666;margin-top:4px">'+job.created_at+'</div>';
+    html+='<div style="margin-top:8px;background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+percent+'%;height:16px;background:'+statusColor+';text-align:center;color:white;font-size:11px;line-height:16px">'+percent+'%</div></div>';
+    html+='<div style="font-size:13px;margin-top:6px">Processed: '+job.processed+' / '+job.total+' | ✅ '+job.valid+' | ❌ '+job.invalid+'</div>';
+    html+='<div style="margin-top:8px">';
+    html+='<button onclick="loadResults('+job.id+')" style="background:#3b82f6;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:13px;margin-right:5px">View Results</button>';
+    if(job.status==='running'){html+='<button onclick="cancelJob('+job.id+')" style="background:#ef4444;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:13px">Cancel</button>'}
+    html+='</div>';
+    html+='<div id="result-'+job.id+'" style="margin-top:10px"></div>';
+    html+='</div>';
+  });
+  container.innerHTML=html;
+}
+async function loadResults(jobId){
+  const res=await fetch('/verify-results/'+jobId);
+  const data=await res.json();
+  const container=document.getElementById('result-'+jobId);
+  if(!data.valid&&!data.invalid){container.innerHTML='<p>No results yet.</p>';return}
+  let html='<h4 style="margin:8px 0 4px 0">✅ Valid: '+data.valid.length+'</h4>';
+  html+='<div style="max-height:150px;overflow-y:auto;background:white;padding:8px;border-radius:5px;font-size:12px;word-break:break-all">';
+  data.valid.slice(0,50).forEach(e=>{html+='<div style="color:#155724">'+e+'</div>'});
+  if(data.valid.length>50)html+='<div style="color:#666">... +'+(data.valid.length-50)+' more</div>';
+  html+='</div>';
+  html+='<h4 style="margin:8px 0 4px 0">❌ Invalid: '+data.invalid.length+'</h4>';
+  html+='<div style="max-height:100px;overflow-y:auto;background:white;padding:8px;border-radius:5px;font-size:12px;word-break:break-all">';
+  data.invalid.slice(0,30).forEach(e=>{html+='<div style="color:#721c24">'+e+'</div>'});
+  if(data.invalid.length>30)html+='<div style="color:#666">... +'+(data.invalid.length-30)+' more</div>';
+  html+='</div>';
+  html+='<div style="margin-top:10px"><button onclick="downloadJob('+jobId+')" style="background:#0d9488;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px;margin-right:5px">⬇️ Download Valid</button>';
+  html+='<button onclick="sendJobToScout('+jobId+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">📨 Send to Scout</button></div>';
+  container.innerHTML=html;
+}
+async function downloadJob(jobId){
+  const res=await fetch('/verify-results/'+jobId);
+  const data=await res.json();
+  const csv='Email\\n'+data.valid.join('\\n');
   const b=new Blob([csv],{type:'text/csv'});const u=URL.createObjectURL(b);
-  const a=document.createElement('a');a.href=u;a.download='valid.csv';a.click();
+  const a=document.createElement('a');a.href=u;a.download='valid_job_'+jobId+'.csv';a.click();
 }
-async function sendToScout(){
-  if(!valid.length){alert('No valid');return}
-  await fetch('/save-scout-recipients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients:valid})});
+async function sendJobToScout(jobId){
+  const res=await fetch('/verify-results/'+jobId);
+  const data=await res.json();
+  await fetch('/save-scout-recipients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients:data.valid})});
   window.location.href='/scout';
 }
+async function cancelJob(jobId){
+  if(!confirm('Cancel this job?'))return;
+  await fetch('/verify-cancel/'+jobId,{method:'POST'});
+  refreshJobs();
+}
+window.onload=function(){
+  refreshJobs();
+  setInterval(refreshJobs,10000);
+};
 </script>'''
     return render_page("Verify", body)
 
 # ==========================================
-# SCOUT
+# SCOUT (unchanged)
 # ==========================================
 @app.route('/scout')
 @login_required
 def scout():
     body = '''<div style="max-width:800px;margin:20px auto;padding:20px">
-<div style="background:#0d9488;color:white;padding:20px;border-radius:10px;margin-bottom:20px"><h1 style="margin:0">📨 Email Scout</h1><p style="margin:5px 0 0 0">Saved to server — never lost</p></div>
+<div style="background:#0d9488;color:white;padding:20px;border-radius:10px;margin-bottom:20px"><h1 style="margin:0">📨 Email Scout</h1></div>
 <div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
 <h3 style="margin-top:0">📥 Recipients</h3>
 <textarea id="emailsInput" style="width:100%;height:160px;border:1px solid #ddd;border-radius:5px;padding:10px;font-family:monospace;box-sizing:border-box"></textarea>
@@ -592,31 +806,6 @@ def bulk_email():
     if user_email and all_found:
         save_user_state(user_email, found_emails='|||'.join(all_found))
     return jsonify({'success': bool(results), 'results': results})
-
-# NEW: Chunked verify — only 150 emails per request
-@app.route('/verify-chunk', methods=['POST'])
-@login_required
-def verify_chunk():
-    emails = request.json.get('emails', [])[:150]
-    if not emails: return jsonify({'valid': [], 'invalid': []})
-    valid, invalid = [], []
-    with ThreadPoolExecutor(max_workers=20) as ex:
-        futures = {ex.submit(verify_email, e): e for e in emails}
-        for f in as_completed(futures):
-            email, ok, reason = f.result()
-            if ok: valid.append(email)
-            else: invalid.append(email + " - " + reason)
-    return jsonify({'valid': valid, 'invalid': invalid})
-
-# Save verified list (from client-side accumulation)
-@app.route('/save-verified', methods=['POST'])
-@login_required
-def save_verified_route():
-    user_email = session.get('user_id')
-    valid = request.json.get('valid', [])
-    if user_email:
-        save_user_state(user_email, verified_emails='|||'.join(valid))
-    return jsonify({'success': True})
 
 @app.route('/store-emails', methods=['POST'])
 @login_required
