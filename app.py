@@ -7,7 +7,6 @@ import json
 import hashlib
 import threading
 import random
-import string
 import dns.resolver
 import smtplib
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -108,7 +107,6 @@ def login_required(f):
     return decorated
 
 def generate_case_id():
-    """Generate a fake-looking Case ID like ESS3115"""
     return "ESS" + str(random.randint(10000, 99999))
 
 def get_cached_emails(domain):
@@ -272,7 +270,7 @@ def find_emails(domain):
     return final
 
 # ==========================================
-# STORE AUDIT ENGINE (WITH STRUCTURED ISSUES)
+# STORE AUDIT ENGINE
 # ==========================================
 def audit_store(domain, case_id):
     raw = domain.strip().lower()
@@ -282,9 +280,7 @@ def audit_store(domain, case_id):
     report = {
         "domain": raw, "case_id": case_id,
         "audited_at": datetime.now().isoformat(),
-        "checks": {}, "scores": {}, 
-        "issues": [],    # structured: {title, description, recommendation, severity}
-        "positives": []
+        "checks": {}, "scores": {}, "issues": [], "positives": []
     }
     if not raw or '.' not in raw:
         report['error'] = "Invalid domain"
@@ -296,7 +292,6 @@ def audit_store(domain, case_id):
     }
     base_url = f"https://{raw}"
     
-    # CHECK 1: HTTPS & speed
     try:
         start = time.time()
         r = requests.get(base_url, headers=headers, timeout=10, allow_redirects=True)
@@ -320,7 +315,6 @@ def audit_store(domain, case_id):
         report["error"] = f"Could not reach store: {str(e)[:100]}"
         return report
     
-    # CHECK 2: Shopify
     is_shopify = any(x in html.lower() for x in [
         'cdn.shopify.com', 'shopify.theme', 'shopify-section',
         'shopify-payment-button', 'myshopify.com', 'shopify.com/s/files'
@@ -329,7 +323,6 @@ def audit_store(domain, case_id):
     if is_shopify:
         report["positives"].append("Confirmed Shopify store")
     
-    # CHECK 3: Products
     try:
         r2 = requests.get(f"{base_url}/products.json?limit=250", headers=headers, timeout=10)
         if r2.status_code == 200:
@@ -347,7 +340,7 @@ def audit_store(domain, case_id):
             elif product_count < 10:
                 report["issues"].append({
                     "title": f"Only {product_count} Products Listed",
-                    "description": f"Store has only {product_count} products. This makes the store look new or incomplete to visitors.",
+                    "description": f"Store has only {product_count} products. This makes the store look new or incomplete.",
                     "recommendation": "Add more products. Aim for 20+ to build trust and increase order value.",
                     "severity": "medium"
                 })
@@ -356,7 +349,6 @@ def audit_store(domain, case_id):
     except:
         report["checks"]["product_count"] = None
     
-    # CHECK 4: Theme
     theme_name = None
     theme_match = re.search(r'"theme_name"\s*:\s*"([^"]+)"', html)
     if theme_match:
@@ -366,7 +358,6 @@ def audit_store(domain, case_id):
         if tm: theme_name = f"Theme ID {tm.group(1)}"
     report["checks"]["theme"] = theme_name or "Unknown"
     
-    # CHECK 5: Mobile
     has_viewport = 'name="viewport"' in html.lower() or "name='viewport'" in html.lower()
     report["checks"]["mobile_responsive"] = has_viewport
     if has_viewport:
@@ -374,12 +365,11 @@ def audit_store(domain, case_id):
     else:
         report["issues"].append({
             "title": "Not Mobile Responsive",
-            "description": "Store is missing the viewport meta tag. Over 70% of shoppers use phones — the store may look broken on mobile.",
+            "description": "Store is missing the viewport meta tag. Over 70% of shoppers use phones.",
             "recommendation": "Switch to a mobile-first Shopify theme like Dawn or Refresh.",
             "severity": "high"
         })
     
-    # CHECK 6: Contact info
     has_email = bool(re.search(r'mailto:[^"\']+', html))
     has_phone = bool(re.search(r'tel:[^"\']+', html))
     has_contact = 'contact' in html.lower()
@@ -391,12 +381,11 @@ def audit_store(domain, case_id):
     else:
         report["issues"].append({
             "title": "No Contact Information",
-            "description": "No visible email or phone number on the homepage. Customers won't trust a store they can't reach.",
+            "description": "No visible email or phone number. Customers won't trust a store they can't reach.",
             "recommendation": "Add a Contact page with email, phone, and business address in the footer.",
             "severity": "high"
         })
     
-    # CHECK 7: Socials
     socials = []
     for p in ['facebook.com', 'instagram.com', 'twitter.com', 'x.com', 'tiktok.com', 'youtube.com', 'pinterest.com']:
         if p in html.lower(): socials.append(p.split('.')[0])
@@ -406,12 +395,11 @@ def audit_store(domain, case_id):
     elif len(socials) == 0:
         report["issues"].append({
             "title": "No Social Media Links",
-            "description": "Store has no Facebook, Instagram, or TikTok links. Social proof builds trust with new visitors.",
+            "description": "Store has no Facebook, Instagram, or TikTok links. Social proof builds trust.",
             "recommendation": "Add your social profiles to the footer. Post regularly to drive traffic.",
             "severity": "medium"
         })
     
-    # CHECK 8: Policies (parallel)
     policies = ['/policies/refund-policy', '/policies/privacy-policy', '/policies/terms-of-service', '/policies/shipping-policy']
     policies_found = [0]
     def check_policy(p):
@@ -427,19 +415,18 @@ def audit_store(domain, case_id):
     elif policies_found[0] < 2:
         report["issues"].append({
             "title": f"Missing {4 - policies_found[0]} Policy Pages",
-            "description": f"Only {policies_found[0]}/4 essential policy pages exist. Missing policies can lead to payment processor issues and customer disputes.",
-            "recommendation": "Add Refund, Privacy, Terms, and Shipping policies in your Shopify admin under Settings → Policies.",
+            "description": f"Only {policies_found[0]}/4 essential policy pages exist.",
+            "recommendation": "Add Refund, Privacy, Terms, and Shipping policies in Settings → Policies.",
             "severity": "high"
         })
     elif policies_found[0] < 4:
         report["issues"].append({
             "title": f"Only {policies_found[0]}/4 Policy Pages",
-            "description": "Some essential policy pages are missing. This is a trust signal for customers.",
+            "description": "Some essential policy pages are missing.",
             "recommendation": "Add the remaining policies in your Shopify admin.",
             "severity": "medium"
         })
     
-    # CHECK 9: Currency
     currency_match = re.search(r'"currency"\s*:\s*"([A-Z]{3})"', html)
     if currency_match:
         report["checks"]["currency"] = currency_match.group(1)
@@ -447,7 +434,6 @@ def audit_store(domain, case_id):
         c2 = re.search(r'Shopify\.currency\s*=\s*\{[^}]*"active"\s*:\s*"([A-Z]{3})"', html)
         report["checks"]["currency"] = c2.group(1) if c2 else "Unknown"
     
-    # CHECK 10: Apps
     detected_apps = []
     app_signatures = {
         "Klaviyo": ["klaviyo"], "Judge.me": ["judge.me", "judgeme"], "Yotpo": ["yotpo"],
@@ -464,17 +450,15 @@ def audit_store(domain, case_id):
                 detected_apps.append(app_name); break
     report["checks"]["detected_apps"] = detected_apps
     
-    # Additional issues based on apps
     has_analytics = any('Pixel' in a or 'Analytics' in a for a in detected_apps)
     if not has_analytics:
         report["issues"].append({
             "title": "No Tracking Pixel Detected",
-            "description": "Store has no Facebook Pixel or Google Analytics installed. You're losing valuable ad optimization data.",
+            "description": "Store has no Facebook Pixel or Google Analytics installed. You're losing ad optimization data.",
             "recommendation": "Install Facebook Pixel and Google Analytics via Shopify App Store.",
             "severity": "high"
         })
     
-    # SCORES
     scores = {}
     trust = 0
     if has_email or has_phone: trust += 30
@@ -857,21 +841,21 @@ function openBulk(){
     return render_page("Scout", body)
 
 # ==========================================
-# STORE AUDIT PAGE
+# STORE AUDIT PAGE (with search box on top)
 # ==========================================
 @app.route('/audit')
 @login_required
 def audit_page():
     body = '''<div style="max-width:900px;margin:20px auto;padding:20px">
-<div style="background:#65a30d;color:white;padding:20px;border-radius:10px;margin-bottom:20px">
-<h1 style="margin:0">📊 Shopify Security Analysis</h1>
-<p style="margin:5px 0 0 0">Real audit of any Shopify store — no fake numbers</p>
-</div>
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
 <label style="font-weight:bold">Store URL</label>
 <input type="text" id="auditUrl" placeholder="e.g. golfsociety.shop" style="width:100%;padding:12px;border:2px solid #ddd;border-radius:8px;font-size:16px;margin:10px 0;box-sizing:border-box">
 <button onclick="runAudit()" style="background:#65a30d;color:white;padding:12px 30px;border:none;border-radius:8px;cursor:pointer;font-size:16px;width:100%">🔍 Run Audit</button>
 <div id="auditStatus" style="margin-top:10px"></div>
+</div>
+<div style="background:#65a30d;color:white;padding:20px;border-radius:10px;margin-bottom:20px">
+<h1 style="margin:0">📊 Shopify Security Analysis</h1>
+<p style="margin:5px 0 0 0">Real audit of any Shopify store</p>
 </div>
 <div id="auditResult"></div>
 </div>
@@ -937,7 +921,6 @@ function renderReport(r){
   const issues=r.issues||[];
   let html='';
   
-  // HEADER (matching the target design)
   html+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">';
   html+='<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
   html+='<div><h2 style="margin:0">Store Audit Overview</h2>';
@@ -945,7 +928,6 @@ function renderReport(r){
   if(r.case_id){html+='<div style="background:#f3f4f6;padding:6px 12px;border-radius:6px;font-size:13px;color:#374151">Case ID: <b>'+r.case_id+'</b></div>';}
   html+='</div></div>';
   
-  // SCORES
   html+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">';
   html+='<h3 style="margin-top:0">📈 Scores</h3>';
   html+=scoreBar('Overall',scores.overall_score||0);
@@ -954,7 +936,6 @@ function renderReport(r){
   html+=scoreBar('Marketing',scores.marketing_score||0);
   html+='</div>';
   
-  // CRITICAL ALERT (if any high-severity issues)
   const highIssues=issues.filter(i=>i.severity==='high');
   if(highIssues.length>0){
     html+='<div style="background:#fef2f2;border-left:4px solid #ef4444;padding:15px;border-radius:8px;margin-bottom:20px">';
@@ -963,7 +944,6 @@ function renderReport(r){
     html+='</div>';
   }
   
-  // ISSUES FOUND - EXPANDED WITH DETAILS
   if(issues.length>0){
     html+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">';
     html+='<h3 style="margin-top:0;color:#991b1b">⚠️ Issues Found ('+issues.length+')</h3>';
@@ -982,7 +962,6 @@ function renderReport(r){
     html+='</div>';
   }
   
-  // POSITIVES
   if(r.positives&&r.positives.length>0){
     html+='<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:15px;border-radius:8px;margin-bottom:20px">';
     html+='<h3 style="margin-top:0;color:#166534">✅ What Works Well</h3>';
@@ -990,7 +969,6 @@ function renderReport(r){
     html+='</div>';
   }
   
-  // DETAILED CHECKS
   html+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">';
   html+='<h3 style="margin-top:0">🔍 Detailed Checks</h3>';
   html+='<table style="width:100%;border-collapse:collapse;font-size:14px">';
@@ -1013,7 +991,6 @@ function renderReport(r){
   html+=row('Detected Apps', (checks.detected_apps&&checks.detected_apps.length>0)?checks.detected_apps.join(', '):'None detected');
   html+='</table></div>';
   
-  // DISCLAIMER
   html+='<div style="background:#eff6ff;border-left:4px solid #3b82f6;padding:15px;border-radius:8px;font-size:13px;color:#1e40af">';
   html+='<b>ℹ️ Note:</b> This audit uses only publicly available data. Sales, customer counts, and checkout abandonment cannot be measured from outside a store.';
   html+='</div>';
