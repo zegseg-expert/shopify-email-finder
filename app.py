@@ -520,7 +520,7 @@ NAVBAR = '''
 <a href="/" onclick="closeDrawer()">🔍 Email Finder</a>
 <a href="/verify" onclick="closeDrawer()">✅ Verify Emails</a>
 <a href="/scout" onclick="closeDrawer()">📨 Email Scout</a>
-<a href="/audit" onclick="closeDrawer()">📊 Store Audit</a>
+<a href="/audit" onclick="closeDrawer()">🛡️ Security Analysis</a>
 <hr style="border-color:#374151;margin:20px 0">
 <a href="/logout" onclick="closeDrawer()" style="color:#ef4444">🚪 Logout</a>
 </div>
@@ -841,7 +841,7 @@ function openBulk(){
     return render_page("Scout", body)
 
 # ==========================================
-# STORE AUDIT PAGE (with search box on top)
+# STORE AUDIT PAGE (with shield icon)
 # ==========================================
 @app.route('/audit')
 @login_required
@@ -853,9 +853,15 @@ def audit_page():
 <button onclick="runAudit()" style="background:#65a30d;color:white;padding:12px 30px;border:none;border-radius:8px;cursor:pointer;font-size:16px;width:100%">🔍 Run Audit</button>
 <div id="auditStatus" style="margin-top:10px"></div>
 </div>
-<div style="background:#65a30d;color:white;padding:20px;border-radius:10px;margin-bottom:20px">
-<h1 style="margin:0">📊 Shopify Security Analysis</h1>
-<p style="margin:5px 0 0 0">Real audit of any Shopify store</p>
+<div style="background:#65a30d;color:white;padding:20px;border-radius:10px;margin-bottom:20px;display:flex;align-items:center;gap:16px">
+<svg width="56" height="56" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" style="flex-shrink:0">
+<path d="M32 4L8 14V30C8 45 19 57 32 60C45 57 56 45 56 30V14L32 4Z" fill="white" opacity="0.25" stroke="white" stroke-width="2" stroke-linejoin="round"/>
+<path d="M22 32L29 39L43 25" stroke="white" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
+<div>
+<h1 style="margin:0;font-size:24px">Security Analysis</h1>
+<p style="margin:4px 0 0 0;font-size:14px;opacity:0.9">Real audit of any Shopify store</p>
+</div>
 </div>
 <div id="auditResult"></div>
 </div>
@@ -998,7 +1004,7 @@ function renderReport(r){
   document.getElementById('auditResult').innerHTML=html;
 }
 </script>'''
-    return render_page("Store Audit", body)
+    return render_page("Security Analysis", body)
 
 # ==========================================
 # API ROUTES
