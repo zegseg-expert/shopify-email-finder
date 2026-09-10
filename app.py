@@ -5,6 +5,7 @@ import time
 import os
 import dns.resolver
 import smtplib
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
@@ -12,6 +13,40 @@ app.secret_key = 'super_secret_key_12345'
 
 found_emails_store = []
 verified_emails_store = []
+
+# ==========================================
+# DEBUG ROUTE (for diagnosing blocking)
+# ==========================================
+@app.route('/debug/<path:domain>')
+def debug(domain):
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5"
+        }
+        url = f"https://{domain}/pages/contact"
+        r = requests.get(url, headers=headers, timeout=15)
+        
+        emails_in_response = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', r.text)
+        
+        result = {
+            "url_tested": url,
+            "status_code": r.status_code,
+            "content_length": len(r.text),
+            "has_at_symbol": "@" in r.text,
+            "cloudflare_protected": "data-cfemail" in r.text,
+            "mailto_links_found": re.findall(r'mailto:([^"\']+)', r.text)[:10],
+            "emails_found_in_html": emails_in_response[:10],
+            "sample_first_500_chars": r.text[:500]
+        }
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "url_tested": f"https://{domain}/pages/contact"
+        })
 
 # ==========================================
 # EMAIL VERIFICATION FUNCTION
@@ -696,7 +731,7 @@ def scout():
     ''')
 
 # ==========================================
-# ADVANCED EMAIL FINDING FUNCTION (V4 - Bulletproof)
+# ADVANCED EMAIL FINDING FUNCTION
 # ==========================================
 def find_emails(domain):
     # CLEAN THE URL
@@ -710,13 +745,9 @@ def find_emails(domain):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1"
+        "Accept-Language": "en-US,en;q=0.5"
     }
     
-    # METHOD 1: Fetch the contact pages and strip HTML
     pages_to_check = [
         f"https://{domain}/pages/contact",
         f"https://{domain}/pages/contact-us",
@@ -733,17 +764,14 @@ def find_emails(domain):
         try:
             r = requests.get(page_url, headers=headers, timeout=15)
             if r.status_code == 200:
-                # Strip all HTML/JS/CSS
                 clean = re.sub(r'<script[^>]*>.*?</script>', ' ', r.text, flags=re.DOTALL)
                 clean = re.sub(r'<style[^>]*>.*?</style>', ' ', clean, flags=re.DOTALL)
                 clean = re.sub(r'<[^>]+>', ' ', clean)
                 
-                # Search emails in clean text
                 found = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', clean)
                 for email in found:
                     emails.append(email.lower())
                 
-                # Decode Cloudflare data-cfemail
                 cf_emails = re.findall(r'data-cfemail="([a-f0-9]+)"', r.text)
                 for cf in cf_emails:
                     try:
@@ -754,15 +782,13 @@ def find_emails(domain):
                     except:
                         pass
                 
-                # Find mailto: links
                 mailtos = re.findall(r'mailto:([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', r.text)
                 for email in mailtos:
                     emails.append(email.lower())
                     
-        except Exception as e:
+        except:
             continue
     
-    # METHOD 2: Fetch sitemap and check /pages/ URLs
     try:
         r = requests.get(f"https://{domain}/sitemap.xml", headers=headers, timeout=10)
         if r.status_code == 200:
@@ -780,7 +806,6 @@ def find_emails(domain):
     except:
         pass
     
-    # Filter out junk emails
     skip_words = [
         '.jpg', '.png', '.jpeg', '.gif', '.svg', '2x', '3x', 'wix', 'sentry',
         'godaddy', 'namecheap', 'markmonitor', 'tucows', 'domainabuse', 'abuse@',
