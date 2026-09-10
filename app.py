@@ -16,9 +16,6 @@ app = Flask(__name__)
 app.secret_key = 'super_secret_key_12345_change_this'
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
-# ==========================================
-# DB POOL
-# ==========================================
 _db_pool = None
 
 def init_pool():
@@ -46,9 +43,6 @@ def release_db(conn):
         try: _db_pool.putconn(conn)
         except: pass
 
-# ==========================================
-# DNS CACHE
-# ==========================================
 _dns_cache = {}
 def resolve_mx(domain):
     if domain in _dns_cache: return _dns_cache[domain]
@@ -61,9 +55,6 @@ def resolve_mx(domain):
         _dns_cache[domain] = None
         return None
 
-# ==========================================
-# DB INIT
-# ==========================================
 def init_db():
     conn = get_db()
     if not conn: return
@@ -80,7 +71,6 @@ def init_db():
             found_emails TEXT, verified_emails TEXT, scout_recipients TEXT,
             scout_subject TEXT, scout_message TEXT, scout_count INTEGER DEFAULT 0,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        # NEW: Verify jobs table
         cur.execute("""CREATE TABLE IF NOT EXISTS verify_jobs (
             id SERIAL PRIMARY KEY,
             user_email VARCHAR(255) NOT NULL,
@@ -102,9 +92,6 @@ try:
     init_pool(); init_db()
 except: pass
 
-# ==========================================
-# HELPERS
-# ==========================================
 def hash_password(p): return hashlib.sha256(p.encode()).hexdigest()
 
 def login_required(f):
@@ -172,9 +159,6 @@ def load_user_state(user_email):
     except: return {}
     finally: release_db(conn)
 
-# ==========================================
-# VERIFY
-# ==========================================
 def verify_email(email):
     try:
         if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
@@ -193,19 +177,14 @@ def verify_email(email):
     except:
         return email, False, "Unknown"
 
-# ==========================================
-# BACKGROUND VERIFY WORKER
-# ==========================================
 def background_verify_worker(job_id):
-    """Runs in background thread. Processes emails in chunks, saves to DB."""
     print(f"🔄 Job {job_id} started")
     conn = get_db()
     if not conn: return
     try:
         cur = conn.cursor()
         cur.execute("SELECT remaining_emails, valid_emails, invalid_emails FROM verify_jobs WHERE id = %s", (job_id,))
-        row = cur.fetchone()
-        cur.close()
+        row = cur.fetchone(); cur.close()
         if not row: return
         remaining = row[0].split('|||') if row[0] else []
         valid = row[1].split('|||') if row[1] else []
@@ -214,34 +193,26 @@ def background_verify_worker(job_id):
         release_db(conn)
 
     CHUNK_SIZE = 100
-
     while remaining:
-        # Check if cancelled
         conn = get_db()
         if not conn: break
         try:
             cur = conn.cursor()
             cur.execute("SELECT status FROM verify_jobs WHERE id = %s", (job_id,))
-            status_row = cur.fetchone()
-            cur.close()
-            if not status_row or status_row[0] == 'cancelled':
+            sr = cur.fetchone(); cur.close()
+            if not sr or sr[0] == 'cancelled':
                 print(f"⏹️ Job {job_id} cancelled")
                 return
         finally:
             release_db(conn)
-
         chunk = remaining[:CHUNK_SIZE]
         remaining = remaining[CHUNK_SIZE:]
-
-        # Verify chunk
         with ThreadPoolExecutor(max_workers=20) as ex:
             futures = {ex.submit(verify_email, e): e for e in chunk}
             for f in as_completed(futures):
                 email, ok, reason = f.result()
                 if ok: valid.append(email)
                 else: invalid.append(email + " - " + reason)
-
-        # Save progress after each chunk
         conn = get_db()
         if not conn: break
         try:
@@ -254,12 +225,8 @@ def background_verify_worker(job_id):
             conn.commit(); cur.close()
         finally:
             release_db(conn)
-
     print(f"✅ Job {job_id} complete")
 
-# ==========================================
-# START BACKGROUND VERIFY
-# ==========================================
 @app.route('/verify-async', methods=['POST'])
 @login_required
 def verify_async():
@@ -267,10 +234,7 @@ def verify_async():
     data = request.json
     emails = data.get('emails', [])
     job_name = data.get('name', f"Job {int(time.time())}")
-    
-    if not emails:
-        return jsonify({'error': 'No emails'}), 400
-    
+    if not emails: return jsonify({'error': 'No emails'}), 400
     conn = get_db()
     if not conn: return jsonify({'error': 'No DB'}), 500
     try:
@@ -282,16 +246,10 @@ def verify_async():
         conn.commit(); cur.close()
     finally:
         release_db(conn)
-    
-    # Start background thread
     thread = threading.Thread(target=background_verify_worker, args=(job_id,), daemon=True)
     thread.start()
-    
     return jsonify({'success': True, 'job_id': job_id, 'total': len(emails)})
 
-# ==========================================
-# GET JOB STATUS
-# ==========================================
 @app.route('/verify-status/<int:job_id>')
 @login_required
 def verify_status(job_id):
@@ -303,19 +261,16 @@ def verify_status(job_id):
             FROM verify_jobs WHERE id = %s""", (job_id,))
         row = cur.fetchone(); cur.close()
         if not row: return jsonify({'error': 'Not found'}), 404
-        valid_count = len(row[5].split('|||')) if row[5] else 0
-        invalid_count = len(row[6].split('|||')) if row[6] else 0
         return jsonify({
             'id': row[0], 'name': row[1], 'total': row[2], 'processed': row[3],
-            'status': row[4], 'valid': valid_count, 'invalid': invalid_count,
+            'status': row[4],
+            'valid': len(row[5].split('|||')) if row[5] else 0,
+            'invalid': len(row[6].split('|||')) if row[6] else 0,
             'created_at': str(row[7])
         })
     finally:
         release_db(conn)
 
-# ==========================================
-# GET JOB RESULTS
-# ==========================================
 @app.route('/verify-results/<int:job_id>')
 @login_required
 def verify_results(job_id):
@@ -333,9 +288,6 @@ def verify_results(job_id):
     finally:
         release_db(conn)
 
-# ==========================================
-# LIST LAST 3 JOBS
-# ==========================================
 @app.route('/verify-jobs')
 @login_required
 def verify_jobs_list():
@@ -344,27 +296,21 @@ def verify_jobs_list():
     if not conn: return jsonify({'jobs': []})
     try:
         cur = conn.cursor()
-        cur.execute("""SELECT id, job_name, total, processed, status, created_at,
-            valid_emails, invalid_emails
-            FROM verify_jobs WHERE user_email = %s
-            ORDER BY created_at DESC LIMIT 3""", (user_email,))
+        cur.execute("""SELECT id, job_name, total, processed, status, created_at, valid_emails, invalid_emails
+            FROM verify_jobs WHERE user_email = %s ORDER BY created_at DESC LIMIT 3""", (user_email,))
         rows = cur.fetchall(); cur.close()
         jobs = []
         for r in rows:
-            valid_count = len(r[6].split('|||')) if r[6] else 0
-            invalid_count = len(r[7].split('|||')) if r[7] else 0
             jobs.append({
                 'id': r[0], 'name': r[1], 'total': r[2], 'processed': r[3],
                 'status': r[4], 'created_at': str(r[5]),
-                'valid': valid_count, 'invalid': invalid_count
+                'valid': len(r[6].split('|||')) if r[6] else 0,
+                'invalid': len(r[7].split('|||')) if r[7] else 0
             })
         return jsonify({'jobs': jobs})
     finally:
         release_db(conn)
 
-# ==========================================
-# CANCEL JOB
-# ==========================================
 @app.route('/verify-cancel/<int:job_id>', methods=['POST'])
 @login_required
 def verify_cancel(job_id):
@@ -378,9 +324,6 @@ def verify_cancel(job_id):
     finally:
         release_db(conn)
 
-# ==========================================
-# FINDER
-# ==========================================
 def find_emails(domain):
     domain = domain.strip().lower().replace("https://", "").replace("http://", "").replace("www.", "")
     domain = domain.split("/")[0]
@@ -418,9 +361,6 @@ def find_emails(domain):
     cache_emails(domain, final)
     return final
 
-# ==========================================
-# NAVBAR
-# ==========================================
 NAVBAR = '''
 <style>
 .navbar{position:fixed;top:0;left:0;right:0;height:56px;background:#1f2937;color:white;display:flex;align-items:center;padding:0 16px;z-index:9999;box-shadow:0 2px 8px rgba(0,0,0,0.2)}
@@ -458,9 +398,6 @@ function closeDrawer(){document.getElementById('drawer').classList.remove('open'
 def render_page(title, body):
     return f'<!DOCTYPE html><html><head><title>{title}</title><meta name="viewport" content="width=device-width,initial-scale=1">{NAVBAR}</head><body style="margin:0;font-family:Arial"><div class="page-content">{body}</div></body></html>'
 
-# ==========================================
-# AUTH
-# ==========================================
 SIGNUP_HTML = '''<!DOCTYPE html><html><head><title>Sign Up</title><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>body{font-family:Arial;background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh;display:flex;justify-content:center;align-items:center;margin:0;padding:20px}.box{background:white;padding:40px;border-radius:15px;box-shadow:0 10px 30px rgba(0,0,0,0.3);width:100%;max-width:400px}h2{text-align:center}input{width:100%;padding:12px;margin:8px 0;border:2px solid #ddd;border-radius:8px;font-size:16px;box-sizing:border-box}button{width:100%;padding:12px;background:#667eea;color:white;border:none;border-radius:8px;font-size:16px;cursor:pointer;margin-top:10px}.error{color:#721c24;background:#f8d7da;padding:10px;border-radius:5px;margin-bottom:15px}.link{text-align:center;margin-top:15px}.link a{color:#667eea}</style></head><body>
 <div class="box"><h2>📧 Sign Up</h2>{% if error %}<div class="error">{{ error }}</div>{% endif %}
@@ -519,9 +456,6 @@ def login():
 def logout():
     session.clear(); return redirect('/login')
 
-# ==========================================
-# HOME
-# ==========================================
 @app.route('/')
 @login_required
 def home():
@@ -556,9 +490,6 @@ async function findBulkEmails(){
 </script>'''
     return render_page("Finder", body)
 
-# ==========================================
-# VERIFY
-# ==========================================
 @app.route('/verify')
 @login_required
 def verify_page():
@@ -567,14 +498,12 @@ def verify_page():
 <h1 style="margin:0">✅ Verify Emails (Background)</h1>
 <p style="margin:5px 0 0 0">Drop emails, close browser, come back later</p>
 </div>
-
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
 <h3 style="margin-top:0">📋 Last 3 Jobs</h3>
 <div id="jobsList" style="margin-bottom:15px">Loading...</div>
 <button onclick="refreshJobs()" style="background:#3b82f6;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px">🔄 Refresh</button>
 </div>
-
-<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
+<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1)">
 <h3 style="margin-top:0">🆕 New Verification</h3>
 <textarea id="emailsInput" style="width:100%;height:180px;border:1px solid #ddd;border-radius:5px;padding:10px;font-family:monospace;box-sizing:border-box" placeholder="email1@example.com&#10;email2@example.com"></textarea>
 <div style="border:2px dashed #ddd;padding:15px;text-align:center;margin:10px 0">
@@ -584,8 +513,7 @@ def verify_page():
 <button onclick="loadFromFinder()" style="background:#f59e0b;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-right:8px;margin-bottom:8px">📥 From Finder</button>
 <button onclick="startBackgroundVerify()" style="background:#0d9488;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-bottom:8px">▶️ Start Background Verify</button>
 <div id="startMsg" style="margin-top:10px"></div>
-</div>
-</div>
+</div></div>
 <script>
 async function loadFromFinder(){
   const res=await fetch('/get-stored-emails');const data=await res.json();
@@ -604,8 +532,8 @@ function readFile(){
 async function startBackgroundVerify(){
   const emails=document.getElementById('emailsInput').value.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);
   if(emails.length===0){alert('Enter emails');return}
-  const name=prompt('Name this job (optional):','Job '+new Date().toLocaleString());
-  document.getElementById('startMsg').innerHTML='<p style="color:#666">Starting background job...</p>';
+  const name=prompt('Name this job:','Job '+new Date().toLocaleString());
+  document.getElementById('startMsg').innerHTML='<p style="color:#666">Starting...</p>';
   try{
     const res=await fetch('/verify-async',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({emails:emails,name:name||'Untitled'})});
     const data=await res.json();
@@ -624,17 +552,14 @@ async function refreshJobs(){
   let html='';
   data.jobs.forEach(job=>{
     const percent=job.total>0?Math.round((job.processed/job.total)*100):0;
-    const statusColor=job.status==='completed'?'#0d9488':(job.status==='running'?'#f59e0b':'#ef4444');
-    const statusIcon=job.status==='completed'?'✅':(job.status==='running'?'🔄':'⏹️');
-    html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+statusColor+'">';
-    html+='<div style="font-weight:bold">'+statusIcon+' '+job.name+' <span style="color:#666;font-weight:normal;font-size:13px">#'+job.id+'</span></div>';
+    const sc=job.status==='completed'?'#0d9488':(job.status==='running'?'#f59e0b':'#ef4444');
+    const si=job.status==='completed'?'✅':(job.status==='running'?'🔄':'⏹️');
+    html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+sc+'">';
+    html+='<div style="font-weight:bold">'+si+' '+job.name+' <span style="color:#666;font-weight:normal;font-size:13px">#'+job.id+'</span></div>';
     html+='<div style="font-size:13px;color:#666;margin-top:4px">'+job.created_at+'</div>';
-    html+='<div style="margin-top:8px;background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+percent+'%;height:16px;background:'+statusColor+';text-align:center;color:white;font-size:11px;line-height:16px">'+percent+'%</div></div>';
+    html+='<div style="margin-top:8px;background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+percent+'%;height:16px;background:'+sc+';text-align:center;color:white;font-size:11px;line-height:16px">'+percent+'%</div></div>';
     html+='<div style="font-size:13px;margin-top:6px">Processed: '+job.processed+' / '+job.total+' | ✅ '+job.valid+' | ❌ '+job.invalid+'</div>';
-    html+='<div style="margin-top:8px">';
-    html+='<button onclick="loadResults('+job.id+')" style="background:#3b82f6;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:13px;margin-right:5px">View Results</button>';
-    if(job.status==='running'){html+='<button onclick="cancelJob('+job.id+')" style="background:#ef4444;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:13px">Cancel</button>'}
-    html+='</div>';
+    html+='<button onclick="loadResults('+job.id+')" style="background:#3b82f6;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:13px;margin-top:8px">View Results</button>';
     html+='<div id="result-'+job.id+'" style="margin-top:10px"></div>';
     html+='</div>';
   });
@@ -644,18 +569,15 @@ async function loadResults(jobId){
   const res=await fetch('/verify-results/'+jobId);
   const data=await res.json();
   const container=document.getElementById('result-'+jobId);
-  if(!data.valid&&!data.invalid){container.innerHTML='<p>No results yet.</p>';return}
   let html='<h4 style="margin:8px 0 4px 0">✅ Valid: '+data.valid.length+'</h4>';
-  html+='<div style="max-height:150px;overflow-y:auto;background:white;padding:8px;border-radius:5px;font-size:12px;word-break:break-all">';
+  html+='<div style="max-height:120px;overflow-y:auto;background:white;padding:8px;border-radius:5px;font-size:12px;word-break:break-all">';
   data.valid.slice(0,50).forEach(e=>{html+='<div style="color:#155724">'+e+'</div>'});
-  if(data.valid.length>50)html+='<div style="color:#666">... +'+(data.valid.length-50)+' more</div>';
   html+='</div>';
   html+='<h4 style="margin:8px 0 4px 0">❌ Invalid: '+data.invalid.length+'</h4>';
-  html+='<div style="max-height:100px;overflow-y:auto;background:white;padding:8px;border-radius:5px;font-size:12px;word-break:break-all">';
+  html+='<div style="max-height:80px;overflow-y:auto;background:white;padding:8px;border-radius:5px;font-size:12px;word-break:break-all">';
   data.invalid.slice(0,30).forEach(e=>{html+='<div style="color:#721c24">'+e+'</div>'});
-  if(data.invalid.length>30)html+='<div style="color:#666">... +'+(data.invalid.length-30)+' more</div>';
   html+='</div>';
-  html+='<div style="margin-top:10px"><button onclick="downloadJob('+jobId+')" style="background:#0d9488;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px;margin-right:5px">⬇️ Download Valid</button>';
+  html+='<div style="margin-top:10px"><button onclick="downloadJob('+jobId+')" style="background:#0d9488;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px;margin-right:5px">⬇️ Download</button>';
   html+='<button onclick="sendJobToScout('+jobId+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">📨 Send to Scout</button></div>';
   container.innerHTML=html;
 }
@@ -672,21 +594,10 @@ async function sendJobToScout(jobId){
   await fetch('/save-scout-recipients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients:data.valid})});
   window.location.href='/scout';
 }
-async function cancelJob(jobId){
-  if(!confirm('Cancel this job?'))return;
-  await fetch('/verify-cancel/'+jobId,{method:'POST'});
-  refreshJobs();
-}
-window.onload=function(){
-  refreshJobs();
-  setInterval(refreshJobs,10000);
-};
+window.onload=function(){refreshJobs();setInterval(refreshJobs,10000)};
 </script>'''
     return render_page("Verify", body)
 
-# ==========================================
-# SCOUT (unchanged)
-# ==========================================
 @app.route('/scout')
 @login_required
 def scout():
@@ -694,7 +605,7 @@ def scout():
 <div style="background:#0d9488;color:white;padding:20px;border-radius:10px;margin-bottom:20px"><h1 style="margin:0">📨 Email Scout</h1></div>
 <div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
 <h3 style="margin-top:0">📥 Recipients</h3>
-<textarea id="emailsInput" style="width:100%;height:160px;border:1px solid #ddd;border-radius:5px;padding:10px;font-family:monospace;box-sizing:border-box"></textarea>
+<textarea id="emailsInput" oninput="syncRecipients()" style="width:100%;height:160px;border:1px solid #ddd;border-radius:5px;padding:10px;font-family:monospace;box-sizing:border-box"></textarea>
 <button onclick="loadFromFinder()" style="background:#0d9488;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;margin:8px 4px 0 0">From Finder</button>
 <button onclick="loadFromVerified()" style="background:#f59e0b;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;margin:8px 4px 0 0">From Verified</button>
 <button onclick="clearAll()" style="background:#ef4444;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;margin:8px 4px 0 0">Clear</button>
@@ -730,6 +641,14 @@ def scout():
 </div></div>
 <script>
 let recipients=[],scoutedEmails=0,isRunning=false;
+
+// NEW: sync recipients from textarea whenever it changes
+function syncRecipients(){
+  const val=document.getElementById('emailsInput').value;
+  recipients=val.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);
+  updateUI();
+  saveState();
+}
 window.onload=async function(){
   try{
     const res=await fetch('/load-scout-state');const data=await res.json();
@@ -738,7 +657,8 @@ window.onload=async function(){
     if(data.message)document.getElementById('messageBody').value=data.message;
     if(data.count)scoutedEmails=data.count;
   }catch(e){}
-  updateUI();
+  // If server state was empty, sync from textarea (in case user pasted before)
+  syncRecipients();
 };
 function updateUI(){
   document.getElementById('emailCount').textContent=recipients.length+' recipients';
@@ -760,7 +680,7 @@ async function loadFromVerified(){
 function clearAll(){recipients=[];scoutedEmails=0;document.getElementById('emailsInput').value='';document.getElementById('subjectLine').value='';document.getElementById('messageBody').value='';updateUI();saveState();isRunning=false;document.getElementById('autoClickStatus').textContent='Off'}
 function insertPh(t){document.getElementById('messageBody').value+=t;saveState()}
 function generatePreview(){const s=document.getElementById('subjectLine').value;const m=document.getElementById('messageBody').value;const p=document.getElementById('preview');p.innerHTML='<b>Subject:</b> '+s+'<br><br><b>Message:</b><br>'+m.replace('{name}','John Doe').replace('{email}','john@store.com');p.style.display='block'}
-function startCampaign(){if(recipients.length===0){alert('Add recipients');return}isRunning=true;document.getElementById('autoClickStatus').textContent='On';document.getElementById('launchStatus').innerHTML='<p style="color:green">🚀 Started</p>';openNextEmail()}
+function startCampaign(){if(recipients.length===0){alert('Add recipients first');return}isRunning=true;document.getElementById('autoClickStatus').textContent='On';document.getElementById('launchStatus').innerHTML='<p style="color:green">🚀 Started</p>';openNextEmail()}
 function stopCampaign(){isRunning=false;document.getElementById('autoClickStatus').textContent='Off';document.getElementById('launchStatus').innerHTML='<p style="color:red">⏹️ Stopped</p>';saveState()}
 function openNextEmail(){
   if(!isRunning)return;
@@ -785,9 +705,6 @@ function openBulk(){
 </script>'''
     return render_page("Scout", body)
 
-# ==========================================
-# API
-# ==========================================
 @app.route('/bulk-email', methods=['POST'])
 @login_required
 def bulk_email():
