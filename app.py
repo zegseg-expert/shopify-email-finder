@@ -2,20 +2,27 @@ from flask import Flask, request, jsonify, render_template_string, session, redi
 import requests
 import re
 import os
-import dns.resolver
-import smtplib
+import time
+import json
+import ssl
+import socket
 import hashlib
 import threading
-import time
+import dns.resolver
+import smtplib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
 import psycopg2
 from psycopg2 import pool
+from datetime import datetime
 
 app = Flask(__name__)
 app.secret_key = 'super_secret_key_12345_change_this'
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
+# ==========================================
+# DB POOL
+# ==========================================
 _db_pool = None
 
 def init_pool():
@@ -43,6 +50,9 @@ def release_db(conn):
         try: _db_pool.putconn(conn)
         except: pass
 
+# ==========================================
+# DNS CACHE
+# ==========================================
 _dns_cache = {}
 def resolve_mx(domain):
     if domain in _dns_cache: return _dns_cache[domain]
@@ -55,6 +65,9 @@ def resolve_mx(domain):
         _dns_cache[domain] = None
         return None
 
+# ==========================================
+# DB INIT
+# ==========================================
 def init_db():
     conn = get_db()
     if not conn: return
@@ -72,17 +85,16 @@ def init_db():
             scout_subject TEXT, scout_message TEXT, scout_count INTEGER DEFAULT 0,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
         cur.execute("""CREATE TABLE IF NOT EXISTS verify_jobs (
-            id SERIAL PRIMARY KEY,
-            user_email VARCHAR(255) NOT NULL,
-            job_name VARCHAR(255),
-            total INTEGER DEFAULT 0,
-            processed INTEGER DEFAULT 0,
-            valid_emails TEXT,
-            invalid_emails TEXT,
-            remaining_emails TEXT,
+            id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
+            job_name VARCHAR(255), total INTEGER DEFAULT 0, processed INTEGER DEFAULT 0,
+            valid_emails TEXT, invalid_emails TEXT, remaining_emails TEXT,
             status VARCHAR(50) DEFAULT 'pending',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS store_audits (
+            id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
+            domain VARCHAR(255) NOT NULL, report JSONB,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
         conn.commit(); cur.close()
         print("✅ DB ready")
     except Exception as e: print(f"❌ DB: {e}")
@@ -92,6 +104,9 @@ try:
     init_pool(); init_db()
 except: pass
 
+# ==========================================
+# HELPERS
+# ==========================================
 def hash_password(p): return hashlib.sha256(p.encode()).hexdigest()
 
 def login_required(f):
@@ -159,6 +174,9 @@ def load_user_state(user_email):
     except: return {}
     finally: release_db(conn)
 
+# ==========================================
+# EMAIL VERIFY
+# ==========================================
 def verify_email(email):
     try:
         if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
@@ -200,9 +218,7 @@ def background_verify_worker(job_id):
             cur = conn.cursor()
             cur.execute("SELECT status FROM verify_jobs WHERE id = %s", (job_id,))
             sr = cur.fetchone(); cur.close()
-            if not sr or sr[0] == 'cancelled':
-                print(f"⏹️ Job {job_id} cancelled")
-                return
+            if not sr or sr[0] == 'cancelled': return
         finally:
             release_db(conn)
         chunk = remaining[:CHUNK_SIZE]
@@ -227,103 +243,9 @@ def background_verify_worker(job_id):
             release_db(conn)
     print(f"✅ Job {job_id} complete")
 
-@app.route('/verify-async', methods=['POST'])
-@login_required
-def verify_async():
-    user_email = session.get('user_id')
-    data = request.json
-    emails = data.get('emails', [])
-    job_name = data.get('name', f"Job {int(time.time())}")
-    if not emails: return jsonify({'error': 'No emails'}), 400
-    conn = get_db()
-    if not conn: return jsonify({'error': 'No DB'}), 500
-    try:
-        cur = conn.cursor()
-        cur.execute("""INSERT INTO verify_jobs (user_email, job_name, total, remaining_emails, valid_emails, invalid_emails, status)
-            VALUES (%s, %s, %s, %s, '', '', 'pending') RETURNING id""",
-            (user_email, job_name, len(emails), '|||'.join(emails)))
-        job_id = cur.fetchone()[0]
-        conn.commit(); cur.close()
-    finally:
-        release_db(conn)
-    thread = threading.Thread(target=background_verify_worker, args=(job_id,), daemon=True)
-    thread.start()
-    return jsonify({'success': True, 'job_id': job_id, 'total': len(emails)})
-
-@app.route('/verify-status/<int:job_id>')
-@login_required
-def verify_status(job_id):
-    conn = get_db()
-    if not conn: return jsonify({'error': 'No DB'}), 500
-    try:
-        cur = conn.cursor()
-        cur.execute("""SELECT id, job_name, total, processed, status, valid_emails, invalid_emails, created_at
-            FROM verify_jobs WHERE id = %s""", (job_id,))
-        row = cur.fetchone(); cur.close()
-        if not row: return jsonify({'error': 'Not found'}), 404
-        return jsonify({
-            'id': row[0], 'name': row[1], 'total': row[2], 'processed': row[3],
-            'status': row[4],
-            'valid': len(row[5].split('|||')) if row[5] else 0,
-            'invalid': len(row[6].split('|||')) if row[6] else 0,
-            'created_at': str(row[7])
-        })
-    finally:
-        release_db(conn)
-
-@app.route('/verify-results/<int:job_id>')
-@login_required
-def verify_results(job_id):
-    conn = get_db()
-    if not conn: return jsonify({'error': 'No DB'}), 500
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT valid_emails, invalid_emails FROM verify_jobs WHERE id = %s", (job_id,))
-        row = cur.fetchone(); cur.close()
-        if not row: return jsonify({'error': 'Not found'}), 404
-        return jsonify({
-            'valid': row[0].split('|||') if row[0] else [],
-            'invalid': row[1].split('|||') if row[1] else []
-        })
-    finally:
-        release_db(conn)
-
-@app.route('/verify-jobs')
-@login_required
-def verify_jobs_list():
-    user_email = session.get('user_id')
-    conn = get_db()
-    if not conn: return jsonify({'jobs': []})
-    try:
-        cur = conn.cursor()
-        cur.execute("""SELECT id, job_name, total, processed, status, created_at, valid_emails, invalid_emails
-            FROM verify_jobs WHERE user_email = %s ORDER BY created_at DESC LIMIT 3""", (user_email,))
-        rows = cur.fetchall(); cur.close()
-        jobs = []
-        for r in rows:
-            jobs.append({
-                'id': r[0], 'name': r[1], 'total': r[2], 'processed': r[3],
-                'status': r[4], 'created_at': str(r[5]),
-                'valid': len(r[6].split('|||')) if r[6] else 0,
-                'invalid': len(r[7].split('|||')) if r[7] else 0
-            })
-        return jsonify({'jobs': jobs})
-    finally:
-        release_db(conn)
-
-@app.route('/verify-cancel/<int:job_id>', methods=['POST'])
-@login_required
-def verify_cancel(job_id):
-    conn = get_db()
-    if not conn: return jsonify({'error': 'No DB'}), 500
-    try:
-        cur = conn.cursor()
-        cur.execute("UPDATE verify_jobs SET status='cancelled' WHERE id=%s AND user_email=%s", (job_id, session.get('user_id')))
-        conn.commit(); cur.close()
-        return jsonify({'success': True})
-    finally:
-        release_db(conn)
-
+# ==========================================
+# EMAIL FINDER
+# ==========================================
 def find_emails(domain):
     domain = domain.strip().lower().replace("https://", "").replace("http://", "").replace("www.", "")
     domain = domain.split("/")[0]
@@ -361,6 +283,260 @@ def find_emails(domain):
     cache_emails(domain, final)
     return final
 
+# ==========================================
+# STORE AUDIT ENGINE (REAL DATA ONLY)
+# ==========================================
+def audit_store(domain):
+    """Perform a real, measurable audit of a public Shopify store."""
+    # Clean domain
+    raw = domain.strip().lower()
+    raw = raw.replace("https://", "").replace("http://", "").replace("www.", "")
+    raw = raw.split("/")[0]
+    
+    report = {
+        "domain": raw,
+        "audited_at": datetime.now().isoformat(),
+        "checks": {},
+        "scores": {},
+        "warnings": [],
+        "positives": []
+    }
+    
+    if not raw or '.' not in raw:
+        report['error'] = "Invalid domain"
+        return report
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.5"
+    }
+    
+    base_url = f"https://{raw}"
+    
+    # ==========================================
+    # CHECK 1: HTTPS & RESPONSE TIME
+    # ==========================================
+    try:
+        start = time.time()
+        r = requests.get(base_url, headers=headers, timeout=10, allow_redirects=True)
+        load_time = round(time.time() - start, 2)
+        report["checks"]["https"] = True
+        report["checks"]["http_status"] = r.status_code
+        report["checks"]["load_time_seconds"] = load_time
+        report["checks"]["final_url"] = r.url
+        html = r.text
+        
+        if load_time < 1.5:
+            report["positives"].append(f"Fast load time ({load_time}s)")
+        elif load_time > 3:
+            report["warnings"].append(f"Slow load time ({load_time}s) - may hurt conversions")
+        else:
+            report["checks"]["load_time_note"] = f"Acceptable ({load_time}s)"
+    except Exception as e:
+        report["checks"]["https"] = False
+        report["error"] = f"Could not reach store: {str(e)[:100]}"
+        return report
+    
+    # ==========================================
+    # CHECK 2: IS IT A SHOPIFY STORE?
+    # ==========================================
+    is_shopify = any(x in html.lower() for x in [
+        'cdn.shopify.com', 'shopify.theme', 'shopify-section',
+        'shopify-payment-button', 'myshopify.com', 'shopify.com/s/files'
+    ])
+    report["checks"]["is_shopify"] = is_shopify
+    if is_shopify:
+        report["positives"].append("Confirmed Shopify store")
+    
+    # ==========================================
+    # CHECK 3: PRODUCT COUNT (from Shopify's public /products.json)
+    # ==========================================
+    try:
+        r2 = requests.get(f"{base_url}/products.json?limit=250", headers=headers, timeout=10)
+        if r2.status_code == 200:
+            data = r2.json()
+            product_count = len(data.get('products', []))
+            # Note: limit is 250 per page. If exactly 250, there may be more.
+            report["checks"]["product_count"] = product_count
+            report["checks"]["product_count_capped"] = (product_count == 250)
+            if product_count == 0:
+                report["warnings"].append("No products visible via API")
+            elif product_count < 10:
+                report["warnings"].append(f"Only {product_count} products - may look sparse to customers")
+            else:
+                report["positives"].append(f"{product_count}+ products listed")
+    except:
+        report["checks"]["product_count"] = None
+    
+    # ==========================================
+    # CHECK 4: THEME NAME (from /theme.json or HTML)
+    # ==========================================
+    theme_name = None
+    theme_match = re.search(r'"theme_name"\s*:\s*"([^"]+)"', html)
+    if theme_match:
+        theme_name = theme_match.group(1)
+    else:
+        theme_match = re.search(r'/cdn/shop/t/(\d+)/assets/', html)
+        if theme_match:
+            theme_name = f"Theme ID {theme_match.group(1)}"
+    report["checks"]["theme"] = theme_name or "Unknown"
+    
+    # ==========================================
+    # CHECK 5: MOBILE VIEWPORT
+    # ==========================================
+    has_viewport = 'name="viewport"' in html.lower() or "name='viewport'" in html.lower()
+    report["checks"]["mobile_responsive"] = has_viewport
+    if has_viewport:
+        report["positives"].append("Mobile responsive (viewport meta tag)")
+    else:
+        report["warnings"].append("Missing mobile viewport - may look bad on phones")
+    
+    # ==========================================
+    # CHECK 6: CONTACT INFO PRESENT
+    # ==========================================
+    has_email = bool(re.search(r'mailto:[^"\']+', html))
+    has_phone = bool(re.search(r'tel:[^"\']+', html))
+    has_contact_link = 'contact' in html.lower()
+    report["checks"]["has_email_link"] = has_email
+    report["checks"]["has_phone_link"] = has_phone
+    report["checks"]["has_contact_page"] = has_contact_link
+    
+    if has_email or has_phone:
+        report["positives"].append("Contact info present")
+    else:
+        report["warnings"].append("No visible email or phone - hurts customer trust")
+    
+    # ==========================================
+    # CHECK 7: SOCIAL LINKS
+    # ==========================================
+    socials = []
+    for platform in ['facebook.com', 'instagram.com', 'twitter.com', 'x.com', 'tiktok.com', 'youtube.com', 'pinterest.com']:
+        if platform in html.lower():
+            socials.append(platform.split('.')[0])
+    report["checks"]["social_links"] = socials
+    if len(socials) >= 2:
+        report["positives"].append(f"Active on {len(socials)} social platforms")
+    elif len(socials) == 0:
+        report["warnings"].append("No social media links found")
+    
+    # ==========================================
+    # CHECK 8: POLICY PAGES
+    # ==========================================
+    policies_found = 0
+    policies_checked = ['/policies/refund-policy', '/policies/privacy-policy', '/policies/terms-of-service', '/policies/shipping-policy']
+    for p in policies_checked:
+        try:
+            r3 = requests.get(f"{base_url}{p}", headers=headers, timeout=5)
+            if r3.status_code == 200:
+                policies_found += 1
+        except:
+            pass
+    report["checks"]["policy_pages_found"] = f"{policies_found}/4"
+    if policies_found == 4:
+        report["positives"].append("All policy pages present (trust signal)")
+    elif policies_found < 2:
+        report["warnings"].append(f"Only {policies_found}/4 policy pages - customers may distrust")
+    
+    # ==========================================
+    # CHECK 9: CURRENCY
+    # ==========================================
+    currency_match = re.search(r'"currency"\s*:\s*"([A-Z]{3})"', html)
+    if currency_match:
+        report["checks"]["currency"] = currency_match.group(1)
+    else:
+        # Look for Shopify.currency
+        c2 = re.search(r'Shopify\.currency\s*=\s*\{[^}]*"active"\s*:\s*"([A-Z]{3})"', html)
+        report["checks"]["currency"] = c2.group(1) if c2 else "Unknown"
+    
+    # ==========================================
+    # CHECK 10: APP DETECTION (Common Shopify apps)
+    # ==========================================
+    detected_apps = []
+    app_signatures = {
+        "Klaviyo (Email Marketing)": ["klaviyo"],
+        "Judge.me (Reviews)": ["judge.me", "judgeme"],
+        "Yotpo (Reviews)": ["yotpo"],
+        "Loox (Reviews)": ["loox.io"],
+        "Privy (Popups)": ["privy.com"],
+        "ReConvert (Upsells)": ["reconvert"],
+        "Bold (Upsells)": ["boldapps", "bold.com"],
+        "Recharge (Subscriptions)": ["rechargepayments"],
+        "Tidio (Chat)": ["tidio"],
+        "Gorgias (Support)": ["gorgias"],
+        "Zendesk (Support)": ["zendesk"],
+        "Facebook Pixel": ["connect.facebook.net", "fbq("],
+        "Google Analytics": ["google-analytics.com", "gtag("],
+        "TikTok Pixel": ["analytics.tiktok.com"],
+    }
+    for app_name, sigs in app_signatures.items():
+        for sig in sigs:
+            if sig in html.lower():
+                detected_apps.append(app_name)
+                break
+    report["checks"]["detected_apps"] = detected_apps
+    
+    # ==========================================
+    # SCORING (100% based on real checks)
+    # ==========================================
+    scores = {}
+    
+    # Trust Score (contact + policies + socials)
+    trust = 0
+    if has_email or has_phone: trust += 30
+    trust += int((policies_found / 4) * 40)
+    if len(socials) >= 2: trust += 20
+    elif len(socials) == 1: trust += 10
+    if is_shopify: trust += 10
+    scores["trust_score"] = min(trust, 100)
+    
+    # Technical Score (https + speed + mobile + status)
+    tech = 0
+    if report["checks"].get("https"): tech += 25
+    if report["checks"].get("http_status") == 200: tech += 25
+    if has_viewport: tech += 25
+    lt = report["checks"].get("load_time_seconds", 5)
+    if lt < 1.5: tech += 25
+    elif lt < 3: tech += 15
+    elif lt < 5: tech += 5
+    scores["technical_score"] = tech
+    
+    # Marketing Score (apps + socials + product count)
+    mkt = 0
+    mkt += min(len(detected_apps) * 8, 40)
+    if len(socials) >= 3: mkt += 30
+    elif len(socials) >= 1: mkt += 15
+    pc = report["checks"].get("product_count") or 0
+    if pc >= 10: mkt += 20
+    elif pc >= 5: mkt += 10
+    if any('Pixel' in a or 'Analytics' in a for a in detected_apps):
+        mkt += 10
+    scores["marketing_score"] = min(mkt, 100)
+    
+    # Overall Score
+    scores["overall_score"] = int((scores["trust_score"] + scores["technical_score"] + scores["marketing_score"]) / 3)
+    
+    report["scores"] = scores
+    
+    # Save to DB
+    user_email = session.get('user_id') if session else None
+    if user_email:
+        conn = get_db()
+        if conn:
+            try:
+                cur = conn.cursor()
+                cur.execute("""INSERT INTO store_audits (user_email, domain, report)
+                    VALUES (%s, %s, %s)""", (user_email, raw, json.dumps(report)))
+                conn.commit(); cur.close()
+            except Exception as e:
+                print(f"save audit error: {e}")
+            finally:
+                release_db(conn)
+    
+    return report
+
+# ==========================================
+# NAVBAR
+# ==========================================
 NAVBAR = '''
 <style>
 .navbar{position:fixed;top:0;left:0;right:0;height:56px;background:#1f2937;color:white;display:flex;align-items:center;padding:0 16px;z-index:9999;box-shadow:0 2px 8px rgba(0,0,0,0.2)}
@@ -386,6 +562,7 @@ NAVBAR = '''
 <a href="/" onclick="closeDrawer()">🔍 Email Finder</a>
 <a href="/verify" onclick="closeDrawer()">✅ Verify Emails</a>
 <a href="/scout" onclick="closeDrawer()">📨 Email Scout</a>
+<a href="/audit" onclick="closeDrawer()">📊 Store Audit</a>
 <hr style="border-color:#374151;margin:20px 0">
 <a href="/logout" onclick="closeDrawer()" style="color:#ef4444">🚪 Logout</a>
 </div>
@@ -398,6 +575,9 @@ function closeDrawer(){document.getElementById('drawer').classList.remove('open'
 def render_page(title, body):
     return f'<!DOCTYPE html><html><head><title>{title}</title><meta name="viewport" content="width=device-width,initial-scale=1">{NAVBAR}</head><body style="margin:0;font-family:Arial"><div class="page-content">{body}</div></body></html>'
 
+# ==========================================
+# AUTH
+# ==========================================
 SIGNUP_HTML = '''<!DOCTYPE html><html><head><title>Sign Up</title><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>body{font-family:Arial;background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh;display:flex;justify-content:center;align-items:center;margin:0;padding:20px}.box{background:white;padding:40px;border-radius:15px;box-shadow:0 10px 30px rgba(0,0,0,0.3);width:100%;max-width:400px}h2{text-align:center}input{width:100%;padding:12px;margin:8px 0;border:2px solid #ddd;border-radius:8px;font-size:16px;box-sizing:border-box}button{width:100%;padding:12px;background:#667eea;color:white;border:none;border-radius:8px;font-size:16px;cursor:pointer;margin-top:10px}.error{color:#721c24;background:#f8d7da;padding:10px;border-radius:5px;margin-bottom:15px}.link{text-align:center;margin-top:15px}.link a{color:#667eea}</style></head><body>
 <div class="box"><h2>📧 Sign Up</h2>{% if error %}<div class="error">{{ error }}</div>{% endif %}
@@ -456,6 +636,9 @@ def login():
 def logout():
     session.clear(); return redirect('/login')
 
+# ==========================================
+# PAGES
+# ==========================================
 @app.route('/')
 @login_required
 def home():
@@ -500,10 +683,10 @@ def verify_page():
 </div>
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
 <h3 style="margin-top:0">📋 Last 3 Jobs</h3>
-<div id="jobsList" style="margin-bottom:15px">Loading...</div>
-<button onclick="refreshJobs()" style="background:#3b82f6;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px">🔄 Refresh</button>
+<div id="jobsList">Loading...</div>
+<button onclick="refreshJobs()" style="background:#3b82f6;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px;margin-top:10px">🔄 Refresh</button>
 </div>
-<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1)">
+<div style="background:white;padding:20px;border-radius:10px">
 <h3 style="margin-top:0">🆕 New Verification</h3>
 <textarea id="emailsInput" style="width:100%;height:180px;border:1px solid #ddd;border-radius:5px;padding:10px;font-family:monospace;box-sizing:border-box" placeholder="email1@example.com&#10;email2@example.com"></textarea>
 <div style="border:2px dashed #ddd;padding:15px;text-align:center;margin:10px 0">
@@ -538,15 +721,14 @@ async function startBackgroundVerify(){
     const res=await fetch('/verify-async',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({emails:emails,name:name||'Untitled'})});
     const data=await res.json();
     if(data.success){
-      document.getElementById('startMsg').innerHTML='<p style="color:green">✅ Job #'+data.job_id+' started! You can close this page.</p>';
+      document.getElementById('startMsg').innerHTML='<p style="color:green">✅ Job #'+data.job_id+' started!</p>';
       document.getElementById('emailsInput').value='';
       refreshJobs();
     }
   }catch(e){document.getElementById('startMsg').innerHTML='<p style="color:red">Error: '+e+'</p>'}
 }
 async function refreshJobs(){
-  const res=await fetch('/verify-jobs');
-  const data=await res.json();
+  const res=await fetch('/verify-jobs');const data=await res.json();
   const container=document.getElementById('jobsList');
   if(!data.jobs||data.jobs.length===0){container.innerHTML='<p style="color:#666">No jobs yet.</p>';return}
   let html='';
@@ -556,41 +738,34 @@ async function refreshJobs(){
     const si=job.status==='completed'?'✅':(job.status==='running'?'🔄':'⏹️');
     html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+sc+'">';
     html+='<div style="font-weight:bold">'+si+' '+job.name+' <span style="color:#666;font-weight:normal;font-size:13px">#'+job.id+'</span></div>';
-    html+='<div style="font-size:13px;color:#666;margin-top:4px">'+job.created_at+'</div>';
     html+='<div style="margin-top:8px;background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+percent+'%;height:16px;background:'+sc+';text-align:center;color:white;font-size:11px;line-height:16px">'+percent+'%</div></div>';
     html+='<div style="font-size:13px;margin-top:6px">Processed: '+job.processed+' / '+job.total+' | ✅ '+job.valid+' | ❌ '+job.invalid+'</div>';
     html+='<button onclick="loadResults('+job.id+')" style="background:#3b82f6;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:13px;margin-top:8px">View Results</button>';
-    html+='<div id="result-'+job.id+'" style="margin-top:10px"></div>';
-    html+='</div>';
+    html+='<div id="result-'+job.id+'" style="margin-top:10px"></div></div>';
   });
   container.innerHTML=html;
 }
 async function loadResults(jobId){
-  const res=await fetch('/verify-results/'+jobId);
-  const data=await res.json();
+  const res=await fetch('/verify-results/'+jobId);const data=await res.json();
   const container=document.getElementById('result-'+jobId);
   let html='<h4 style="margin:8px 0 4px 0">✅ Valid: '+data.valid.length+'</h4>';
   html+='<div style="max-height:120px;overflow-y:auto;background:white;padding:8px;border-radius:5px;font-size:12px;word-break:break-all">';
   data.valid.slice(0,50).forEach(e=>{html+='<div style="color:#155724">'+e+'</div>'});
-  html+='</div>';
-  html+='<h4 style="margin:8px 0 4px 0">❌ Invalid: '+data.invalid.length+'</h4>';
+  html+='</div><h4 style="margin:8px 0 4px 0">❌ Invalid: '+data.invalid.length+'</h4>';
   html+='<div style="max-height:80px;overflow-y:auto;background:white;padding:8px;border-radius:5px;font-size:12px;word-break:break-all">';
   data.invalid.slice(0,30).forEach(e=>{html+='<div style="color:#721c24">'+e+'</div>'});
-  html+='</div>';
-  html+='<div style="margin-top:10px"><button onclick="downloadJob('+jobId+')" style="background:#0d9488;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px;margin-right:5px">⬇️ Download</button>';
+  html+='</div><div style="margin-top:10px"><button onclick="downloadJob('+jobId+')" style="background:#0d9488;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px;margin-right:5px">⬇️ Download</button>';
   html+='<button onclick="sendJobToScout('+jobId+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">📨 Send to Scout</button></div>';
   container.innerHTML=html;
 }
 async function downloadJob(jobId){
-  const res=await fetch('/verify-results/'+jobId);
-  const data=await res.json();
+  const res=await fetch('/verify-results/'+jobId);const data=await res.json();
   const csv='Email\\n'+data.valid.join('\\n');
   const b=new Blob([csv],{type:'text/csv'});const u=URL.createObjectURL(b);
   const a=document.createElement('a');a.href=u;a.download='valid_job_'+jobId+'.csv';a.click();
 }
 async function sendJobToScout(jobId){
-  const res=await fetch('/verify-results/'+jobId);
-  const data=await res.json();
+  const res=await fetch('/verify-results/'+jobId);const data=await res.json();
   await fetch('/save-scout-recipients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients:data.valid})});
   window.location.href='/scout';
 }
@@ -641,13 +816,10 @@ def scout():
 </div></div>
 <script>
 let recipients=[],scoutedEmails=0,isRunning=false;
-
-// NEW: sync recipients from textarea whenever it changes
 function syncRecipients(){
   const val=document.getElementById('emailsInput').value;
   recipients=val.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);
-  updateUI();
-  saveState();
+  updateUI();saveState();
 }
 window.onload=async function(){
   try{
@@ -657,7 +829,6 @@ window.onload=async function(){
     if(data.message)document.getElementById('messageBody').value=data.message;
     if(data.count)scoutedEmails=data.count;
   }catch(e){}
-  // If server state was empty, sync from textarea (in case user pasted before)
   syncRecipients();
 };
 function updateUI(){
@@ -704,6 +875,233 @@ function openBulk(){
 }
 </script>'''
     return render_page("Scout", body)
+
+# ==========================================
+# STORE AUDIT PAGE
+# ==========================================
+@app.route('/audit')
+@login_required
+def audit_page():
+    body = '''<div style="max-width:900px;margin:20px auto;padding:20px">
+<div style="background:#65a30d;color:white;padding:20px;border-radius:10px;margin-bottom:20px">
+<h1 style="margin:0">📊 Store Audit</h1>
+<p style="margin:5px 0 0 0">Real analysis of any Shopify store — no fake numbers</p>
+</div>
+<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
+<label style="font-weight:bold">Store URL</label>
+<input type="text" id="auditUrl" placeholder="e.g. golfsociety.shop" style="width:100%;padding:12px;border:2px solid #ddd;border-radius:8px;font-size:16px;margin:10px 0;box-sizing:border-box">
+<button onclick="runAudit()" style="background:#65a30d;color:white;padding:12px 30px;border:none;border-radius:8px;cursor:pointer;font-size:16px;width:100%">🔍 Run Audit</button>
+<div id="auditStatus" style="margin-top:10px"></div>
+</div>
+<div id="auditResult"></div>
+</div>
+<script>
+async function runAudit(){
+  const url=document.getElementById('auditUrl').value.trim();
+  if(!url){alert('Enter a store URL');return}
+  const status=document.getElementById('auditStatus');
+  const result=document.getElementById('auditResult');
+  status.innerHTML='<p style="color:#666">Analyzing '+url+'... (takes 10-20 seconds)</p>';
+  result.innerHTML='';
+  try{
+    const res=await fetch('/run-audit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:url})});
+    const data=await res.json();
+    if(data.error){status.innerHTML='<p style="color:red">Error: '+data.error+'</p>';return}
+    status.innerHTML='<p style="color:green">✅ Audit complete</p>';
+    renderReport(data);
+  }catch(e){status.innerHTML='<p style="color:red">Error: '+e+'</p>'}
+}
+function scoreColor(score){
+  if(score>=75)return '#16a34a';
+  if(score>=50)return '#f59e0b';
+  return '#ef4444';
+}
+function scoreBar(label,score){
+  const color=scoreColor(score);
+  return '<div style="margin:10px 0">'
+    +'<div style="display:flex;justify-content:space-between;margin-bottom:4px"><b>'+label+'</b><span style="color:'+color+';font-weight:bold">'+score+'%</span></div>'
+    +'<div style="background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+score+'%;height:12px;background:'+color+'"></div></div>'
+    +'</div>';
+}
+function renderReport(r){
+  const checks=r.checks||{};
+  const scores=r.scores||{};
+  let html='';
+  
+  // Header
+  html+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">';
+  html+='<h2 style="margin:0 0 5px 0">'+r.domain+'</h2>';
+  html+='<div style="color:#666;font-size:13px">Audited: '+r.audited_at+'</div>';
+  html+='</div>';
+  
+  // Scores
+  html+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">';
+  html+='<h3 style="margin-top:0">📈 Scores</h3>';
+  html+=scoreBar('Overall',scores.overall_score||0);
+  html+=scoreBar('Trust',scores.trust_score||0);
+  html+=scoreBar('Technical',scores.technical_score||0);
+  html+=scoreBar('Marketing',scores.marketing_score||0);
+  html+='</div>';
+  
+  // Warnings
+  if(r.warnings&&r.warnings.length>0){
+    html+='<div style="background:#fef2f2;border-left:4px solid #ef4444;padding:15px;border-radius:8px;margin-bottom:20px">';
+    html+='<h3 style="margin-top:0;color:#991b1b">⚠️ Issues Found</h3>';
+    r.warnings.forEach(w=>{html+='<div style="margin:6px 0;color:#7f1d1d">⚠️ '+w+'</div>'});
+    html+='</div>';
+  }
+  
+  // Positives
+  if(r.positives&&r.positives.length>0){
+    html+='<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:15px;border-radius:8px;margin-bottom:20px">';
+    html+='<h3 style="margin-top:0;color:#166534">✅ What Works Well</h3>';
+    r.positives.forEach(p=>{html+='<div style="margin:6px 0;color:#14532d">✅ '+p+'</div>'});
+    html+='</div>';
+  }
+  
+  // Detailed checks
+  html+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">';
+  html+='<h3 style="margin-top:0">🔍 Detailed Checks</h3>';
+  html+='<table style="width:100%;border-collapse:collapse;font-size:14px">';
+  
+  function row(label,val){
+    return '<tr><td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold">'+label+'</td><td style="padding:8px;border-bottom:1px solid #eee">'+val+'</td></tr>';
+  }
+  
+  html+=row('Is Shopify Store', checks.is_shopify?'✅ Yes':'❌ Not detected');
+  html+=row('HTTPS', checks.https?'✅ Enabled':'❌ Disabled');
+  html+=row('HTTP Status', checks.http_status||'N/A');
+  html+=row('Load Time', checks.load_time_seconds?checks.load_time_seconds+'s':'N/A');
+  html+=row('Product Count', checks.product_count!==null?checks.product_count+(checks.product_count_capped?'+':''):'N/A');
+  html+=row('Theme', checks.theme||'Unknown');
+  html+=row('Mobile Responsive', checks.mobile_responsive?'✅ Yes':'❌ No');
+  html+=row('Currency', checks.currency||'Unknown');
+  html+=row('Contact Page', checks.has_contact_page?'✅ Found':'❌ Not found');
+  html+=row('Email Link', checks.has_email_link?'✅ Found':'❌ Not found');
+  html+=row('Phone Link', checks.has_phone_link?'✅ Found':'❌ Not found');
+  html+=row('Policy Pages', checks.policy_pages_found||'0/4');
+  html+=row('Social Links', (checks.social_links&&checks.social_links.length>0)?checks.social_links.join(', '):'None found');
+  html+=row('Detected Apps', (checks.detected_apps&&checks.detected_apps.length>0)?checks.detected_apps.join(', '):'None detected');
+  
+  html+='</table></div>';
+  
+  // Disclaimer
+  html+='<div style="background:#eff6ff;border-left:4px solid #3b82f6;padding:15px;border-radius:8px;font-size:13px;color:#1e40af">';
+  html+='<b>ℹ️ Note:</b> This audit uses only publicly available data. Sales, customer counts, and checkout abandonment cannot be measured from outside a store — they require the owner\'s private access. Any tool claiming to show those numbers is fabricating them.';
+  html+='</div>';
+  
+  document.getElementById('auditResult').innerHTML=html;
+}
+</script>'''
+    return render_page("Store Audit", body)
+
+# ==========================================
+# API ROUTES
+# ==========================================
+@app.route('/run-audit', methods=['POST'])
+@login_required
+def run_audit():
+    data = request.json
+    url = data.get('url', '').strip()
+    if not url:
+        return jsonify({'error': 'No URL provided'})
+    try:
+        report = audit_store(url)
+        return jsonify(report)
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+@app.route('/verify-async', methods=['POST'])
+@login_required
+def verify_async():
+    user_email = session.get('user_id')
+    data = request.json
+    emails = data.get('emails', [])
+    job_name = data.get('name', f"Job {int(time.time())}")
+    if not emails: return jsonify({'error': 'No emails'}), 400
+    conn = get_db()
+    if not conn: return jsonify({'error': 'No DB'}), 500
+    try:
+        cur = conn.cursor()
+        cur.execute("""INSERT INTO verify_jobs (user_email, job_name, total, remaining_emails, valid_emails, invalid_emails, status)
+            VALUES (%s, %s, %s, %s, '', '', 'pending') RETURNING id""",
+            (user_email, job_name, len(emails), '|||'.join(emails)))
+        job_id = cur.fetchone()[0]
+        conn.commit(); cur.close()
+    finally:
+        release_db(conn)
+    thread = threading.Thread(target=background_verify_worker, args=(job_id,), daemon=True)
+    thread.start()
+    return jsonify({'success': True, 'job_id': job_id, 'total': len(emails)})
+
+@app.route('/verify-status/<int:job_id>')
+@login_required
+def verify_status(job_id):
+    conn = get_db()
+    if not conn: return jsonify({'error': 'No DB'}), 500
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, job_name, total, processed, status, valid_emails, invalid_emails, created_at FROM verify_jobs WHERE id = %s", (job_id,))
+        row = cur.fetchone(); cur.close()
+        if not row: return jsonify({'error': 'Not found'}), 404
+        return jsonify({
+            'id': row[0], 'name': row[1], 'total': row[2], 'processed': row[3],
+            'status': row[4],
+            'valid': len(row[5].split('|||')) if row[5] else 0,
+            'invalid': len(row[6].split('|||')) if row[6] else 0,
+            'created_at': str(row[7])
+        })
+    finally: release_db(conn)
+
+@app.route('/verify-results/<int:job_id>')
+@login_required
+def verify_results(job_id):
+    conn = get_db()
+    if not conn: return jsonify({'error': 'No DB'}), 500
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT valid_emails, invalid_emails FROM verify_jobs WHERE id = %s", (job_id,))
+        row = cur.fetchone(); cur.close()
+        if not row: return jsonify({'error': 'Not found'}), 404
+        return jsonify({
+            'valid': row[0].split('|||') if row[0] else [],
+            'invalid': row[1].split('|||') if row[1] else []
+        })
+    finally: release_db(conn)
+
+@app.route('/verify-jobs')
+@login_required
+def verify_jobs_list():
+    user_email = session.get('user_id')
+    conn = get_db()
+    if not conn: return jsonify({'jobs': []})
+    try:
+        cur = conn.cursor()
+        cur.execute("""SELECT id, job_name, total, processed, status, created_at, valid_emails, invalid_emails
+            FROM verify_jobs WHERE user_email = %s ORDER BY created_at DESC LIMIT 3""", (user_email,))
+        rows = cur.fetchall(); cur.close()
+        jobs = []
+        for r in rows:
+            jobs.append({
+                'id': r[0], 'name': r[1], 'total': r[2], 'processed': r[3],
+                'status': r[4], 'created_at': str(r[5]),
+                'valid': len(r[6].split('|||')) if r[6] else 0,
+                'invalid': len(r[7].split('|||')) if r[7] else 0
+            })
+        return jsonify({'jobs': jobs})
+    finally: release_db(conn)
+
+@app.route('/verify-cancel/<int:job_id>', methods=['POST'])
+@login_required
+def verify_cancel(job_id):
+    conn = get_db()
+    if not conn: return jsonify({'error': 'No DB'}), 500
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE verify_jobs SET status='cancelled' WHERE id=%s AND user_email=%s", (job_id, session.get('user_id')))
+        conn.commit(); cur.close()
+        return jsonify({'success': True})
+    finally: release_db(conn)
 
 @app.route('/bulk-email', methods=['POST'])
 @login_required
