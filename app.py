@@ -27,6 +27,8 @@ SHOPIFY_IPS = [
     "23.227.39.20"
 ]
 
+KNOWN_FREE_EMAILS = ['gmail.com','yahoo.com','hotmail.com','outlook.com','aol.com','protonmail.com']
+
 # ==========================================
 # DB POOL
 # ==========================================
@@ -100,7 +102,6 @@ def init_db():
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             domain VARCHAR(255) NOT NULL, source VARCHAR(50),
             has_email BOOLEAN DEFAULT FALSE,
-            is_saved BOOLEAN DEFAULT TRUE,
             discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_email, domain))""")
         conn.commit(); cur.close()
@@ -123,6 +124,19 @@ def login_required(f):
 
 def generate_case_id():
     return "ESS" + str(random.randint(10000, 99999))
+
+def root_domain(hostname):
+    """Extract root domain from hostname like 88mega.poopourri.com → poopourri.com"""
+    hostname = hostname.strip().lower()
+    hostname = hostname.replace("https://", "").replace("http://", "").split("/")[0]
+    parts = hostname.split('.')
+    if len(parts) <= 2:
+        return hostname
+    # Check common two-part TLDs
+    if parts[-2] in ['co', 'com', 'net', 'org', 'ac', 'gov'] and len(parts) >= 3:
+        if parts[-1] in ['uk', 'au', 'nz', 'in', 'za', 'br', 'mx']:
+            return '.'.join(parts[-3:])
+    return '.'.join(parts[-2:])
 
 def get_cached_emails(domain):
     conn = get_db()
@@ -246,8 +260,7 @@ def background_verify_worker(job_id):
             release_db(conn)
 
 def find_emails(domain):
-    domain = domain.strip().lower().replace("https://", "").replace("http://", "").replace("www.", "")
-    domain = domain.split("/")[0]
+    domain = domain.strip().lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
     if not domain or '.' not in domain: return []
     cached = get_cached_emails(domain)
     if cached is not None: return cached
@@ -283,10 +296,9 @@ def find_emails(domain):
     return final
 
 # ==========================================
-# STORE DISCOVERY METHODS
+# DISCOVERY METHODS
 # ==========================================
 def is_shopify(domain):
-    """Verify a domain is a Shopify store"""
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         r = requests.get(f"https://{domain}", headers=headers, timeout=6, allow_redirects=True)
@@ -296,67 +308,141 @@ def is_shopify(domain):
     except: pass
     return False
 
-def discover_via_shodan(ip_list, limit=10):
-    """Query Shodan for domains on Shopify IPs"""
+def discover_via_shodan(limit=5):
+    """Query Shodan for domains on Shopify IPs (with subdomain filtering)"""
     discovered = []
-    for ip in ip_list[:limit]:
+    seen_roots = set()
+    for ip in SHOPIFY_IPS[:limit]:
         try:
             url = f"https://api.shodan.io/shodan/host/{ip}?key={SHODAN_API_KEY}"
             r = requests.get(url, timeout=15)
             if r.status_code == 200:
                 data = r.json()
                 for hostname in data.get('hostnames', []):
-                    domain = hostname.strip().lower()
-                    if "shopify" not in domain and '.' in domain and len(domain) > 5:
-                        discovered.append({'domain': domain, 'source': 'shodan'})
+                    root = root_domain(hostname)
+                    if "shopify" in root: continue
+                    if '.' not in root or len(root) < 5: continue
+                    if root in seen_roots: continue
+                    seen_roots.add(root)
+                    discovered.append({'domain': root, 'source': 'shodan'})
             elif r.status_code == 403:
-                print(f"Shodan rate limit hit at {ip}")
+                print(f"Shodan rate limit at {ip}")
                 break
             time.sleep(1)
         except Exception as e:
-            print(f"Shodan error on {ip}: {e}")
+            print(f"Shodan error {ip}: {e}")
     return discovered
 
-def discover_via_sitemap(candidate_domains):
-    """Check candidate domains to see if they are Shopify stores"""
+def discover_via_theme_showcase():
+    """Scrape Shopify's public theme showcase for demo stores"""
     discovered = []
-    def check(d):
+    seen = set()
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    theme_pages = [
+        "https://themes.shopify.com/themes?sort_by=most_recent",
+        "https://themes.shopify.com/themes?sort_by=popular",
+    ]
+    for page in theme_pages:
         try:
-            r = requests.get(f"https://{d}/sitemap.xml", timeout=5, headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code == 200 and 'shopify' in r.text.lower():
-                return {'domain': d, 'source': 'sitemap'}
-        except: pass
-        return None
-    with ThreadPoolExecutor(max_workers=20) as ex:
-        results = list(ex.map(check, candidate_domains[:50]))
-    for r in results:
-        if r: discovered.append(r)
+            r = requests.get(page, headers=headers, timeout=15)
+            if r.status_code == 200:
+                # Look for demo store links like https://theme-name.myshopify.com
+                matches = re.findall(r'https://([a-z0-9\-]+)\.myshopify\.com', r.text, re.IGNORECASE)
+                for m in matches:
+                    if m in seen: continue
+                    if m in ['www','cdn','checkout','account','admin']: continue
+                    seen.add(m)
+                    discovered.append({'domain': f"{m}.myshopify.com", 'source': 'theme_showcase'})
+        except Exception as e:
+            print(f"Theme error: {e}")
     return discovered
 
-def discover_via_google(keyword, limit=20):
-    """Search Google for Shopify stores. Uses DuckDuckGo as fallback."""
+def discover_via_search(keyword=''):
+    """Search via DuckDuckGo with better headers and Bing fallback"""
     discovered = []
+    seen_roots = set()
+    
+    # Try DuckDuckGo first
     try:
-        query = f'"Powered by Shopify" {keyword}'
+        query = f'"Powered by Shopify" {keyword}'.strip()
         url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.5"
+        }
         r = requests.post(url, headers=headers, timeout=15)
         if r.status_code == 200:
             links = re.findall(r'class="result__a" href="(.*?)"', r.text)
-            for link in links[:limit]:
+            for link in links[:30]:
                 if "uddg=" in link:
                     import urllib.parse
                     parsed = urllib.parse.parse_qs(urllib.parse.urlparse(link).query)
                     if 'uddg' in parsed: link = parsed['uddg'][0]
                 clean = link.replace("https://", "").replace("http://", "").split("/")[0]
-                if "shopify.com" not in clean and '.' in clean and len(clean) > 5:
-                    discovered.append({'domain': clean, 'source': 'google'})
+                root = root_domain(clean)
+                if "shopify.com" in root or "duckduckgo" in root: continue
+                if root in seen_roots: continue
+                seen_roots.add(root)
+                discovered.append({'domain': root, 'source': 'search'})
     except Exception as e:
         print(f"DDG error: {e}")
+    
+    # If DDG failed, try Bing
+    if not discovered:
+        try:
+            query = f'"Powered by Shopify" {keyword}'.strip()
+            url = f"https://www.bing.com/search?q={requests.utils.quote(query)}"
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            r = requests.get(url, headers=headers, timeout=15)
+            if r.status_code == 200:
+                links = re.findall(r'<a href="(https?://[^"]+)"', r.text)
+                for link in links[:30]:
+                    clean = link.replace("https://", "").replace("http://", "").split("/")[0]
+                    root = root_domain(clean)
+                    if "bing.com" in root or "microsoft" in root: continue
+                    if "shopify.com" in root: continue
+                    if root in seen_roots: continue
+                    seen_roots.add(root)
+                    discovered.append({'domain': root, 'source': 'search'})
+        except Exception as e:
+            print(f"Bing error: {e}")
+    
+    return discovered
+
+def discover_via_related(user_email):
+    """Find related stores from saved stores' footers"""
+    discovered = []
+    seen_roots = set()
+    # Get a few of user's saved stores
+    conn = get_db()
+    if not conn: return discovered
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT domain FROM discovered_stores WHERE user_email = %s LIMIT 5", (user_email,))
+        seeds = [r[0] for r in cur.fetchall()]
+        cur.close()
+    finally:
+        release_db(conn)
+    
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    for seed in seeds:
+        try:
+            r = requests.get(f"https://{seed}", headers=headers, timeout=8)
+            if r.status_code == 200:
+                # Look for external shopify-like links
+                external = re.findall(r'href="https?://([a-zA-Z0-9\.\-]+)"', r.text)
+                for ext in external[:20]:
+                    root = root_domain(ext)
+                    if root == seed: continue
+                    if root in seen_roots: continue
+                    if any(skip in root for skip in ['shopify','facebook','instagram','twitter','youtube','tiktok','pinterest','google','apple']): continue
+                    if '.' not in root or len(root) < 5: continue
+                    seen_roots.add(root)
+                    discovered.append({'domain': root, 'source': 'related'})
+        except: continue
     return discovered
 
 def save_discovered(user_email, stores):
-    """Save discovered stores to database"""
     conn = get_db()
     if not conn: return 0
     saved = 0
@@ -377,41 +463,27 @@ def save_discovered(user_email, stores):
     return saved
 
 # ==========================================
-# STORE AUDIT ENGINE
+# AUDIT ENGINE (same as before)
 # ==========================================
 def audit_store(domain, case_id):
     raw = domain.strip().lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
-    report = {
-        "domain": raw, "case_id": case_id,
-        "audited_at": datetime.now().isoformat(),
-        "checks": {}, "scores": {}, "issues": [], "positives": []
-    }
+    report = {"domain": raw, "case_id": case_id, "audited_at": datetime.now().isoformat(), "checks": {}, "scores": {}, "issues": [], "positives": []}
     if not raw or '.' not in raw:
         report['error'] = "Invalid domain"
         return report
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept-Language": "en-US,en;q=0.5"
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept-Language": "en-US,en;q=0.5"}
     base_url = f"https://{raw}"
     try:
         start = time.time()
         r = requests.get(base_url, headers=headers, timeout=10, allow_redirects=True)
-        load_time = round(time.time() - start, 2)
+        lt = round(time.time() - start, 2)
         report["checks"]["https"] = True
         report["checks"]["http_status"] = r.status_code
-        report["checks"]["load_time_seconds"] = load_time
+        report["checks"]["load_time_seconds"] = lt
         report["checks"]["final_url"] = r.url
         html = r.text
-        if load_time < 1.5:
-            report["positives"].append(f"Fast load time ({load_time}s)")
-        elif load_time > 3:
-            report["issues"].append({
-                "title": "Slow Load Time",
-                "description": f"Store took {load_time}s to load.",
-                "recommendation": "Optimize images, remove unused apps.",
-                "severity": "medium"
-            })
+        if lt < 1.5: report["positives"].append(f"Fast load time ({lt}s)")
+        elif lt > 3: report["issues"].append({"title": "Slow Load Time", "description": f"Store took {lt}s to load.", "recommendation": "Optimize images, remove unused apps.", "severity": "medium"})
     except Exception as e:
         report["checks"]["https"] = False
         report["error"] = f"Could not reach store: {str(e)[:100]}"
@@ -425,61 +497,50 @@ def audit_store(domain, case_id):
             pc = len(r2.json().get('products', []))
             report["checks"]["product_count"] = pc
             report["checks"]["product_count_capped"] = (pc == 250)
-            if pc == 0:
-                report["issues"].append({"title": "No Products Visible", "description": "Store has no products.", "recommendation": "Add products immediately.", "severity": "high"})
-            elif pc < 10:
-                report["issues"].append({"title": f"Only {pc} Products", "description": f"Only {pc} products listed.", "recommendation": "Add more products (aim for 20+).", "severity": "medium"})
-            else:
-                report["positives"].append(f"{pc}+ products listed")
+            if pc == 0: report["issues"].append({"title": "No Products Visible", "description": "No products.", "recommendation": "Add products.", "severity": "high"})
+            elif pc < 10: report["issues"].append({"title": f"Only {pc} Products", "description": "Few products.", "recommendation": "Aim for 20+.", "severity": "medium"})
+            else: report["positives"].append(f"{pc}+ products")
     except: report["checks"]["product_count"] = None
     tm = re.search(r'"theme_name"\s*:\s*"([^"]+)"', html)
     report["checks"]["theme"] = tm.group(1) if tm else "Unknown"
-    has_viewport = 'name="viewport"' in html.lower()
-    report["checks"]["mobile_responsive"] = has_viewport
-    if has_viewport: report["positives"].append("Mobile responsive")
-    else: report["issues"].append({"title": "Not Mobile Responsive", "description": "Missing viewport meta.", "recommendation": "Use mobile-first theme.", "severity": "high"})
-    has_email = bool(re.search(r'mailto:[^"\']+', html))
-    has_phone = bool(re.search(r'tel:[^"\']+', html))
-    report["checks"]["has_email_link"] = has_email
-    report["checks"]["has_phone_link"] = has_phone
+    hv = 'name="viewport"' in html.lower()
+    report["checks"]["mobile_responsive"] = hv
+    if hv: report["positives"].append("Mobile responsive")
+    else: report["issues"].append({"title": "Not Mobile Responsive", "description": "Missing viewport.", "recommendation": "Use mobile theme.", "severity": "high"})
+    he = bool(re.search(r'mailto:[^"\']+', html))
+    hp = bool(re.search(r'tel:[^"\']+', html))
+    report["checks"]["has_email_link"] = he
+    report["checks"]["has_phone_link"] = hp
     report["checks"]["has_contact_page"] = 'contact' in html.lower()
-    if has_email or has_phone: report["positives"].append("Contact info present")
-    else: report["issues"].append({"title": "No Contact Info", "description": "No email or phone.", "recommendation": "Add Contact page.", "severity": "high"})
+    if he or hp: report["positives"].append("Contact info present")
+    else: report["issues"].append({"title": "No Contact Info", "description": "No email/phone.", "recommendation": "Add Contact page.", "severity": "high"})
     socials = [p.split('.')[0] for p in ['facebook.com','instagram.com','twitter.com','tiktok.com','youtube.com','pinterest.com'] if p in html.lower()]
     report["checks"]["social_links"] = socials
-    if len(socials) >= 2: report["positives"].append(f"Active on {len(socials)} socials")
-    elif len(socials) == 0: report["issues"].append({"title": "No Social Media", "description": "No social links found.", "recommendation": "Add social profiles.", "severity": "medium"})
-    policies = ['/policies/refund-policy', '/policies/privacy-policy', '/policies/terms-of-service', '/policies/shipping-policy']
+    if len(socials) >= 2: report["positives"].append(f"{len(socials)} socials")
+    elif len(socials) == 0: report["issues"].append({"title": "No Social Media", "description": "None found.", "recommendation": "Add social profiles.", "severity": "medium"})
+    pols = ['/policies/refund-policy','/policies/privacy-policy','/policies/terms-of-service','/policies/shipping-policy']
     pf = [0]
-    def check_p(p):
+    def cp(p):
         try:
             r3 = requests.get(f"{base_url}{p}", headers=headers, timeout=5)
             if r3.status_code == 200: pf[0] += 1
         except: pass
-    with ThreadPoolExecutor(max_workers=4) as ex: list(ex.map(check_p, policies))
+    with ThreadPoolExecutor(max_workers=4) as ex: list(ex.map(cp, pols))
     report["checks"]["policy_pages_found"] = f"{pf[0]}/4"
-    if pf[0] == 4: report["positives"].append("All policy pages present")
-    elif pf[0] < 2: report["issues"].append({"title": f"Missing {4-pf[0]} Policy Pages", "description": f"Only {pf[0]}/4 policies.", "recommendation": "Add policies in Settings.", "severity": "high"})
+    if pf[0] == 4: report["positives"].append("All policies present")
+    elif pf[0] < 2: report["issues"].append({"title": f"Missing {4-pf[0]} Policies", "description": f"Only {pf[0]}/4.", "recommendation": "Add in Settings.", "severity": "high"})
     cm = re.search(r'"currency"\s*:\s*"([A-Z]{3})"', html)
     report["checks"]["currency"] = cm.group(1) if cm else "Unknown"
     apps = []
-    for name, sigs in {
-        "Klaviyo": ["klaviyo"], "Judge.me": ["judge.me"], "Yotpo": ["yotpo"],
-        "Loox": ["loox.io"], "ReConvert": ["reconvert"], "Recharge": ["rechargepayments"],
-        "Tidio": ["tidio"], "Gorgias": ["gorgias"],
-        "Facebook Pixel": ["connect.facebook.net", "fbq("],
-        "Google Analytics": ["google-analytics.com", "gtag("],
-        "TikTok Pixel": ["analytics.tiktok.com"]
-    }.items():
+    for name, sigs in {"Klaviyo":["klaviyo"],"Judge.me":["judge.me"],"Yotpo":["yotpo"],"Loox":["loox.io"],"ReConvert":["reconvert"],"Recharge":["rechargepayments"],"Tidio":["tidio"],"Gorgias":["gorgias"],"Facebook Pixel":["connect.facebook.net","fbq("],"Google Analytics":["google-analytics.com","gtag("],"TikTok Pixel":["analytics.tiktok.com"]}.items():
         for s in sigs:
             if s in html.lower(): apps.append(name); break
     report["checks"]["detected_apps"] = apps
-    has_analytics = any('Pixel' in a or 'Analytics' in a for a in apps)
-    if not has_analytics:
-        report["issues"].append({"title": "No Tracking Pixel", "description": "No Facebook/Google Analytics.", "recommendation": "Install tracking via Shopify App Store.", "severity": "high"})
+    ha = any('Pixel' in a or 'Analytics' in a for a in apps)
+    if not ha: report["issues"].append({"title": "No Tracking Pixel", "description": "No pixel.", "recommendation": "Install tracking.", "severity": "high"})
     trust = 0
-    if has_email or has_phone: trust += 30
-    trust += int((pf[0] / 4) * 40)
+    if he or hp: trust += 30
+    trust += int((pf[0]/4)*40)
     if len(socials) >= 2: trust += 20
     elif len(socials) == 1: trust += 10
     if is_shop: trust += 10
@@ -487,19 +548,19 @@ def audit_store(domain, case_id):
     tech = 0
     if report["checks"].get("https"): tech += 25
     if report["checks"].get("http_status") == 200: tech += 25
-    if has_viewport: tech += 25
+    if hv: tech += 25
     lt = report["checks"].get("load_time_seconds", 5)
     if lt < 1.5: tech += 25
     elif lt < 3: tech += 15
     elif lt < 5: tech += 5
     report["scores"]["technical_score"] = tech
-    mkt = min(len(apps) * 8, 40)
+    mkt = min(len(apps)*8, 40)
     if len(socials) >= 3: mkt += 30
     elif len(socials) >= 1: mkt += 15
     pc = report["checks"].get("product_count") or 0
     if pc >= 10: mkt += 20
     elif pc >= 5: mkt += 10
-    if has_analytics: mkt += 10
+    if ha: mkt += 10
     report["scores"]["marketing_score"] = min(mkt, 100)
     report["scores"]["overall_score"] = int((report["scores"]["trust_score"] + report["scores"]["technical_score"] + report["scores"]["marketing_score"]) / 3)
     return report
@@ -653,15 +714,17 @@ def discover_page():
     body = '''<div style="max-width:900px;margin:20px auto;padding:20px">
 <div style="background:#8b5cf6;color:white;padding:20px;border-radius:10px;margin-bottom:20px">
 <h1 style="margin:0">🎯 Store Discovery</h1>
-<p style="margin:5px 0 0 0">Find new Shopify stores using multiple methods</p>
+<p style="margin:5px 0 0 0">4 methods to find new Shopify stores</p>
 </div>
 
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
 <h3 style="margin-top:0">🔎 Discovery Methods</h3>
-<p style="color:#666;font-size:14px">All methods combine and deduplicate results. Saved to your database automatically.</p>
+<p style="color:#666;font-size:14px">Each method is independent. Run them one by one or use "Run All".</p>
 <button onclick="runDiscovery('shodan')" style="background:#8b5cf6;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">🔍 Shodan IP Scan</button>
-<button onclick="runDiscovery('google')" style="background:#3b82f6;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">🌐 Search Engine</button>
-<button onclick="runDiscovery('all')" style="background:#0d9488;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">⚡ Run All</button>
+<button onclick="runDiscovery('theme')" style="background:#ec4899;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">🎨 Theme Showcase</button>
+<button onclick="runDiscovery('search')" style="background:#3b82f6;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">🌐 Search Engine</button>
+<button onclick="runDiscovery('related')" style="background:#f59e0b;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">📚 Related Stores</button>
+<button onclick="runDiscovery('all')" style="background:#0d9488;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">⚡ Run All 4</button>
 <div id="discoveryStatus" style="margin-top:12px"></div>
 </div>
 
@@ -670,6 +733,7 @@ def discover_page():
 <div id="storeList" style="margin-top:10px">Loading...</div>
 <button onclick="loadStores()" style="background:#3b82f6;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px;margin-top:10px">🔄 Refresh</button>
 <button onclick="clearStores()" style="background:#ef4444;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px;margin-top:10px;margin-left:8px">🗑️ Clear All</button>
+<button onclick="exportStores()" style="background:#0d9488;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px;margin-top:10px;margin-left:8px">⬇️ Export CSV</button>
 </div>
 </div>
 <script>
@@ -680,10 +744,12 @@ async function runDiscovery(method){
     const res=await fetch('/run-discovery',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({method:method})});
     const data=await res.json();
     if(data.success){
-      status.innerHTML='<p style="color:green">✅ Found '+data.found+' new stores (saved: '+data.saved+')</p>';
+      let details='';
+      if(data.by_method){for(const[k,v]of Object.entries(data.by_method)){if(v>0)details+=' · '+k+': '+v}}
+      status.innerHTML='<p style="color:green">✅ Found '+data.found+' stores (saved: '+data.saved+')'+details+'</p>';
       loadStores();
     } else {
-      status.innerHTML='<p style="color:red">Error: '+(data.error||'Unknown error')+'</p>';
+      status.innerHTML='<p style="color:red">Error: '+(data.error||'Unknown')+'</p>';
     }
   }catch(e){status.innerHTML='<p style="color:red">Error: '+e+'</p>'}
 }
@@ -692,33 +758,28 @@ async function loadStores(){
   const data=await res.json();
   document.getElementById('storeCount').textContent=data.stores.length;
   const c=document.getElementById('storeList');
-  if(data.stores.length===0){c.innerHTML='<p style="color:#666">No stores discovered yet. Run a discovery method above.</p>';return}
+  if(data.stores.length===0){c.innerHTML='<p style="color:#666">No stores yet. Run a discovery method above.</p>';return}
   let html='';
   data.stores.forEach(s=>{
     html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid #8b5cf6;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
-    html+='<div><b>'+s.domain+'</b><br><span style="font-size:12px;color:#666">Source: '+s.source+' · '+s.discovered_at+'</span></div>';
+    html+='<div><b>'+s.domain+'</b><br><span style="font-size:12px;color:#666">'+s.source+' · '+s.discovered_at+'</span></div>';
     html+='<div style="display:flex;gap:6px;flex-wrap:wrap">';
-    html+='<button onclick="actFindEmail(\\''+s.domain+'\\')" style="background:#667eea;color:white;padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">📧 Email</button>';
-    html+='<button onclick="actAudit(\\''+s.domain+'\\')" style="background:#65a30d;color:white;padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">🛡️ Audit</button>';
-    html+='<button onclick="actScout(\\''+s.domain+'\\')" style="background:#0d9488;color:white;padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">📨 Scout</button>';
+    html+='<button onclick="actFindEmail(\\''+s.domain+'\\')" style="background:#667eea;color:white;padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">📧</button>';
+    html+='<button onclick="actAudit(\\''+s.domain+'\\')" style="background:#65a30d;color:white;padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">🛡️</button>';
+    html+='<button onclick="actScout(\\''+s.domain+'\\')" style="background:#0d9488;color:white;padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">📨</button>';
     html+='</div></div>';
   });
   c.innerHTML=html;
 }
-function actFindEmail(d){
-  window.location.href='/';
-  setTimeout(()=>{const ta=document.getElementById('urls');if(ta)ta.value=d},500);
-}
-function actAudit(d){
-  window.location.href='/audit?url='+encodeURIComponent(d);
-}
-function actScout(d){
-  window.location.href='/scout?add='+encodeURIComponent(d);
-}
-async function clearStores(){
-  if(!confirm('Delete all discovered stores?'))return;
-  await fetch('/clear-discovered',{method:'POST'});
-  loadStores();
+function actFindEmail(d){window.location.href='/?url='+encodeURIComponent(d)}
+function actAudit(d){window.location.href='/audit?url='+encodeURIComponent(d)}
+function actScout(d){window.location.href='/scout?add='+encodeURIComponent(d)}
+async function clearStores(){if(!confirm('Delete all discovered stores?'))return;await fetch('/clear-discovered',{method:'POST'});loadStores()}
+async function exportStores(){
+  const res=await fetch('/get-discovered');const data=await res.json();
+  const csv='domain,source,discovered_at\\n'+data.stores.map(s=>s.domain+','+s.source+','+s.discovered_at).join('\\n');
+  const b=new Blob([csv],{type:'text/csv'});const u=URL.createObjectURL(b);
+  const a=document.createElement('a');a.href=u;a.download='discovered_stores.csv';a.click();
 }
 window.onload=loadStores;
 </script>'''
@@ -732,21 +793,32 @@ window.onload=loadStores;
 def run_discovery():
     user_email = session.get('user_id')
     method = request.json.get('method', 'all')
+    by_method = {}
     all_found = []
     try:
         if method in ['shodan', 'all']:
-            shodan_results = discover_via_shodan(SHOPIFY_IPS, limit=5)
-            all_found.extend(shodan_results)
-        if method in ['google', 'all']:
-            google_results = discover_via_google('', limit=20)
-            all_found.extend(google_results)
+            r = discover_via_shodan(limit=5)
+            by_method['shodan'] = len(r)
+            all_found.extend(r)
+        if method in ['theme', 'all']:
+            r = discover_via_theme_showcase()
+            by_method['theme'] = len(r)
+            all_found.extend(r)
+        if method in ['search', 'all']:
+            r = discover_via_search('')
+            by_method['search'] = len(r)
+            all_found.extend(r)
+        if method in ['related', 'all']:
+            r = discover_via_related(user_email)
+            by_method['related'] = len(r)
+            all_found.extend(r)
         # Deduplicate by domain
         unique = {}
         for s in all_found:
             unique[s['domain']] = s
         found_list = list(unique.values())
         saved = save_discovered(user_email, found_list) if found_list else 0
-        return jsonify({'success': True, 'found': len(found_list), 'saved': saved})
+        return jsonify({'success': True, 'found': len(found_list), 'saved': saved, 'by_method': by_method})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
@@ -759,7 +831,7 @@ def get_discovered():
     try:
         cur = conn.cursor()
         cur.execute("""SELECT domain, source, discovered_at FROM discovered_stores
-            WHERE user_email = %s ORDER BY discovered_at DESC LIMIT 200""", (user_email,))
+            WHERE user_email = %s ORDER BY discovered_at DESC LIMIT 500""", (user_email,))
         rows = cur.fetchall(); cur.close()
         stores = [{'domain': r[0], 'source': r[1], 'discovered_at': str(r[2])[:16]} for r in rows]
         return jsonify({'stores': stores})
@@ -781,7 +853,7 @@ def clear_discovered():
     finally: release_db(conn)
 
 # ==========================================
-# VERIFY
+# VERIFY PAGE
 # ==========================================
 @app.route('/verify')
 @login_required
@@ -808,83 +880,19 @@ def verify_page():
 <div id="startMsg" style="margin-top:10px"></div>
 </div></div>
 <script>
-async function loadFromFinder(){
-  const res=await fetch('/get-stored-emails');const data=await res.json();
-  if(data.emails&&data.emails.length>0){document.getElementById('emailsInput').value=data.emails.join('\\n');alert('Loaded '+data.emails.length)}
-}
-function readFile(){
-  const f=document.getElementById('emailFile').files[0];if(!f){alert('Select file');return}
-  const r=new FileReader();
-  r.onload=function(e){
-    const lines=e.target.result.split('\\n');const emails=[];
-    lines.forEach(l=>{l=l.trim();if(l.includes(','))l=l.split(',')[0].trim();if(l.includes('@'))emails.push(l)});
-    document.getElementById('emailsInput').value=emails.join('\\n');
-    alert('Loaded '+emails.length+' emails');
-  };r.readAsText(f);
-}
-async function startBackgroundVerify(){
-  const emails=document.getElementById('emailsInput').value.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);
-  if(emails.length===0){alert('Enter emails');return}
-  const name=prompt('Name this job:','Job '+new Date().toLocaleString());
-  document.getElementById('startMsg').innerHTML='<p style="color:#666">Starting...</p>';
-  try{
-    const res=await fetch('/verify-async',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({emails:emails,name:name||'Untitled'})});
-    const data=await res.json();
-    if(data.success){
-      document.getElementById('startMsg').innerHTML='<p style="color:green">✅ Job #'+data.job_id+' started!</p>';
-      document.getElementById('emailsInput').value='';
-      refreshJobs();
-    }
-  }catch(e){document.getElementById('startMsg').innerHTML='<p style="color:red">Error: '+e+'</p>'}
-}
-async function refreshJobs(){
-  const res=await fetch('/verify-jobs');const data=await res.json();
-  const container=document.getElementById('jobsList');
-  if(!data.jobs||data.jobs.length===0){container.innerHTML='<p style="color:#666">No jobs yet.</p>';return}
-  let html='';
-  data.jobs.forEach(job=>{
-    const percent=job.total>0?Math.round((job.processed/job.total)*100):0;
-    const sc=job.status==='completed'?'#0d9488':(job.status==='running'?'#f59e0b':'#ef4444');
-    const si=job.status==='completed'?'✅':(job.status==='running'?'🔄':'⏹️');
-    html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+sc+'">';
-    html+='<div style="font-weight:bold">'+si+' '+job.name+' <span style="color:#666;font-weight:normal;font-size:13px">#'+job.id+'</span></div>';
-    html+='<div style="margin-top:8px;background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+percent+'%;height:16px;background:'+sc+';text-align:center;color:white;font-size:11px;line-height:16px">'+percent+'%</div></div>';
-    html+='<div style="font-size:13px;margin-top:6px">Processed: '+job.processed+' / '+job.total+' | ✅ '+job.valid+' | ❌ '+job.invalid+'</div>';
-    html+='<button onclick="loadResults('+job.id+')" style="background:#3b82f6;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:13px;margin-top:8px">View Results</button>';
-    html+='<div id="result-'+job.id+'" style="margin-top:10px"></div></div>';
-  });
-  container.innerHTML=html;
-}
-async function loadResults(jobId){
-  const res=await fetch('/verify-results/'+jobId);const data=await res.json();
-  const container=document.getElementById('result-'+jobId);
-  let html='<h4 style="margin:8px 0 4px 0">✅ Valid: '+data.valid.length+'</h4>';
-  html+='<div style="max-height:120px;overflow-y:auto;background:white;padding:8px;border-radius:5px;font-size:12px;word-break:break-all">';
-  data.valid.slice(0,50).forEach(e=>{html+='<div style="color:#155724">'+e+'</div>'});
-  html+='</div><h4 style="margin:8px 0 4px 0">❌ Invalid: '+data.invalid.length+'</h4>';
-  html+='<div style="max-height:80px;overflow-y:auto;background:white;padding:8px;border-radius:5px;font-size:12px;word-break:break-all">';
-  data.invalid.slice(0,30).forEach(e=>{html+='<div style="color:#721c24">'+e+'</div>'});
-  html+='</div><div style="margin-top:10px"><button onclick="downloadJob('+jobId+')" style="background:#0d9488;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px;margin-right:5px">⬇️ Download</button>';
-  html+='<button onclick="sendJobToScout('+jobId+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">📨 Send to Scout</button></div>';
-  container.innerHTML=html;
-}
-async function downloadJob(jobId){
-  const res=await fetch('/verify-results/'+jobId);const data=await res.json();
-  const csv='Email\\n'+data.valid.join('\\n');
-  const b=new Blob([csv],{type:'text/csv'});const u=URL.createObjectURL(b);
-  const a=document.createElement('a');a.href=u;a.download='valid_job_'+jobId+'.csv';a.click();
-}
-async function sendJobToScout(jobId){
-  const res=await fetch('/verify-results/'+jobId);const data=await res.json();
-  await fetch('/save-scout-recipients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients:data.valid})});
-  window.location.href='/scout';
-}
+async function loadFromFinder(){const res=await fetch('/get-stored-emails');const data=await res.json();if(data.emails&&data.emails.length>0){document.getElementById('emailsInput').value=data.emails.join('\\n');alert('Loaded '+data.emails.length)}}
+function readFile(){const f=document.getElementById('emailFile').files[0];if(!f){alert('Select file');return}const r=new FileReader();r.onload=function(e){const lines=e.target.result.split('\\n');const emails=[];lines.forEach(l=>{l=l.trim();if(l.includes(','))l=l.split(',')[0].trim();if(l.includes('@'))emails.push(l)});document.getElementById('emailsInput').value=emails.join('\\n');alert('Loaded '+emails.length+' emails')};r.readAsText(f)}
+async function startBackgroundVerify(){const emails=document.getElementById('emailsInput').value.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);if(emails.length===0){alert('Enter emails');return}const name=prompt('Name this job:','Job '+new Date().toLocaleString());document.getElementById('startMsg').innerHTML='<p style="color:#666">Starting...</p>';try{const res=await fetch('/verify-async',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({emails:emails,name:name||'Untitled'})});const data=await res.json();if(data.success){document.getElementById('startMsg').innerHTML='<p style="color:green">✅ Job #'+data.job_id+' started!</p>';document.getElementById('emailsInput').value='';refreshJobs()}}catch(e){document.getElementById('startMsg').innerHTML='<p style="color:red">Error: '+e+'</p>'}}
+async function refreshJobs(){const res=await fetch('/verify-jobs');const data=await res.json();const container=document.getElementById('jobsList');if(!data.jobs||data.jobs.length===0){container.innerHTML='<p style="color:#666">No jobs yet.</p>';return}let html='';data.jobs.forEach(job=>{const percent=job.total>0?Math.round((job.processed/job.total)*100):0;const sc=job.status==='completed'?'#0d9488':(job.status==='running'?'#f59e0b':'#ef4444');const si=job.status==='completed'?'✅':(job.status==='running'?'🔄':'⏹️');html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+sc+'"><div style="font-weight:bold">'+si+' '+job.name+' <span style="color:#666;font-weight:normal;font-size:13px">#'+job.id+'</span></div><div style="margin-top:8px;background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+percent+'%;height:16px;background:'+sc+';text-align:center;color:white;font-size:11px;line-height:16px">'+percent+'%</div></div><div style="font-size:13px;margin-top:6px">Processed: '+job.processed+' / '+job.total+' | ✅ '+job.valid+' | ❌ '+job.invalid+'</div><button onclick="loadResults('+job.id+')" style="background:#3b82f6;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:13px;margin-top:8px">View Results</button><div id="result-'+job.id+'" style="margin-top:10px"></div></div>'});container.innerHTML=html}
+async function loadResults(jobId){const res=await fetch('/verify-results/'+jobId);const data=await res.json();const container=document.getElementById('result-'+jobId);let html='<h4 style="margin:8px 0 4px 0">✅ Valid: '+data.valid.length+'</h4><div style="max-height:120px;overflow-y:auto;background:white;padding:8px;border-radius:5px;font-size:12px;word-break:break-all">';data.valid.slice(0,50).forEach(e=>{html+='<div style="color:#155724">'+e+'</div>'});html+='</div><h4 style="margin:8px 0 4px 0">❌ Invalid: '+data.invalid.length+'</h4><div style="max-height:80px;overflow-y:auto;background:white;padding:8px;border-radius:5px;font-size:12px;word-break:break-all">';data.invalid.slice(0,30).forEach(e=>{html+='<div style="color:#721c24">'+e+'</div>'});html+='</div><div style="margin-top:10px"><button onclick="downloadJob('+jobId+')" style="background:#0d9488;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px;margin-right:5px">⬇️ Download</button><button onclick="sendJobToScout('+jobId+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">📨 Send to Scout</button></div>';container.innerHTML=html}
+async function downloadJob(jobId){const res=await fetch('/verify-results/'+jobId);const data=await res.json();const csv='Email\\n'+data.valid.join('\\n');const b=new Blob([csv],{type:'text/csv'});const u=URL.createObjectURL(b);const a=document.createElement('a');a.href=u;a.download='valid_job_'+jobId+'.csv';a.click()}
+async function sendJobToScout(jobId){const res=await fetch('/verify-results/'+jobId);const data=await res.json();await fetch('/save-scout-recipients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients:data.valid})});window.location.href='/scout'}
 window.onload=function(){refreshJobs();setInterval(refreshJobs,10000)};
 </script>'''
     return render_page("Verify", body)
 
 # ==========================================
-# SCOUT
+# SCOUT PAGE
 # ==========================================
 @app.route('/scout')
 @login_required
@@ -930,70 +938,26 @@ def scout():
 </div></div>
 <script>
 let recipients=[],scoutedEmails=0,isRunning=false;
-function syncRecipients(){
-  const val=document.getElementById('emailsInput').value;
-  recipients=val.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);
-  updateUI();saveState();
-}
-window.onload=async function(){
-  try{
-    const res=await fetch('/load-scout-state');const data=await res.json();
-    if(data.recipients&&data.recipients.length>0){recipients=data.recipients;document.getElementById('emailsInput').value=recipients.join('\\n')}
-    if(data.subject)document.getElementById('subjectLine').value=data.subject;
-    if(data.message)document.getElementById('messageBody').value=data.message;
-    if(data.count)scoutedEmails=data.count;
-  }catch(e){}
-  const preload="''' + preload.replace('"','') + '''";
-  if(preload){const ta=document.getElementById('emailsInput');if(!ta.value)ta.value=preload;}
-  syncRecipients();
-};
-function updateUI(){
-  document.getElementById('emailCount').textContent=recipients.length+' recipients';
-  document.getElementById('totalScouted').textContent=scoutedEmails;
-  document.getElementById('todayScouted').textContent=scoutedEmails;
-  document.getElementById('workingRate').textContent=(recipients.length>0?Math.round((scoutedEmails/recipients.length)*100):0)+'%';
-}
-async function saveState(){
-  try{await fetch('/save-scout-state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients:recipients,subject:document.getElementById('subjectLine').value,message:document.getElementById('messageBody').value,count:scoutedEmails})})}catch(e){}
-}
-async function loadFromFinder(){
-  const res=await fetch('/get-stored-emails');const data=await res.json();
-  if(data.emails&&data.emails.length>0){recipients=data.emails;document.getElementById('emailsInput').value=recipients.join('\\n');updateUI();saveState()}
-}
-async function loadFromVerified(){
-  const res=await fetch('/get-verified-emails');const data=await res.json();
-  if(data.valid&&data.valid.length>0){recipients=data.valid;document.getElementById('emailsInput').value=recipients.join('\\n');updateUI();saveState()}
-}
+function syncRecipients(){const val=document.getElementById('emailsInput').value;recipients=val.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);updateUI();saveState()}
+window.onload=async function(){try{const res=await fetch('/load-scout-state');const data=await res.json();if(data.recipients&&data.recipients.length>0){recipients=data.recipients;document.getElementById('emailsInput').value=recipients.join('\\n')}if(data.subject)document.getElementById('subjectLine').value=data.subject;if(data.message)document.getElementById('messageBody').value=data.message;if(data.count)scoutedEmails=data.count}catch(e){}const preload="''' + preload.replace('"','') + '''";if(preload){const ta=document.getElementById('emailsInput');if(!ta.value)ta.value=preload;}syncRecipients()}
+function updateUI(){document.getElementById('emailCount').textContent=recipients.length+' recipients';document.getElementById('totalScouted').textContent=scoutedEmails;document.getElementById('todayScouted').textContent=scoutedEmails;document.getElementById('workingRate').textContent=(recipients.length>0?Math.round((scoutedEmails/recipients.length)*100):0)+'%'}
+async function saveState(){try{await fetch('/save-scout-state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients:recipients,subject:document.getElementById('subjectLine').value,message:document.getElementById('messageBody').value,count:scoutedEmails})})}catch(e){}}
+async function loadFromFinder(){const res=await fetch('/get-stored-emails');const data=await res.json();if(data.emails&&data.emails.length>0){recipients=data.emails;document.getElementById('emailsInput').value=recipients.join('\\n');updateUI();saveState()}}
+async function loadFromVerified(){const res=await fetch('/get-verified-emails');const data=await res.json();if(data.valid&&data.valid.length>0){recipients=data.valid;document.getElementById('emailsInput').value=recipients.join('\\n');updateUI();saveState()}}
 function clearAll(){recipients=[];scoutedEmails=0;document.getElementById('emailsInput').value='';document.getElementById('subjectLine').value='';document.getElementById('messageBody').value='';updateUI();saveState();isRunning=false;document.getElementById('autoClickStatus').textContent='Off'}
 function insertPh(t){document.getElementById('messageBody').value+=t;saveState()}
 function generatePreview(){const s=document.getElementById('subjectLine').value;const m=document.getElementById('messageBody').value;const p=document.getElementById('preview');p.innerHTML='<b>Subject:</b> '+s+'<br><br><b>Message:</b><br>'+m.replace('{name}','John Doe').replace('{email}','john@store.com');p.style.display='block'}
 function startCampaign(){if(recipients.length===0){alert('Add recipients first');return}isRunning=true;document.getElementById('autoClickStatus').textContent='On';document.getElementById('launchStatus').innerHTML='<p style="color:green">🚀 Started</p>';openNextEmail()}
 function stopCampaign(){isRunning=false;document.getElementById('autoClickStatus').textContent='Off';document.getElementById('launchStatus').innerHTML='<p style="color:red">⏹️ Stopped</p>';saveState()}
-function openNextEmail(){
-  if(!isRunning)return;
-  if(scoutedEmails>=recipients.length){isRunning=false;document.getElementById('autoClickStatus').textContent='Off';document.getElementById('launchStatus').innerHTML='<p style="color:blue">🎉 Complete</p>';saveState();return}
-  const email=recipients[scoutedEmails];const subj=document.getElementById('subjectLine').value;const msg=document.getElementById('messageBody').value;
-  const body=msg.replace('{name}','Store Owner').replace('{email}',email);
-  window.location.href='mailto:'+email+'?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(body);
-  const log=document.getElementById('log');log.innerHTML+='<div>📨 '+email+'</div>';log.scrollTop=log.scrollHeight;
-  scoutedEmails++;updateUI();saveState();
-}
+function openNextEmail(){if(!isRunning)return;if(scoutedEmails>=recipients.length){isRunning=false;document.getElementById('autoClickStatus').textContent='Off';document.getElementById('launchStatus').innerHTML='<p style="color:blue">🎉 Complete</p>';saveState();return}const email=recipients[scoutedEmails];const subj=document.getElementById('subjectLine').value;const msg=document.getElementById('messageBody').value;const body=msg.replace('{name}','Store Owner').replace('{email}',email);window.location.href='mailto:'+email+'?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(body);const log=document.getElementById('log');log.innerHTML+='<div>📨 '+email+'</div>';log.scrollTop=log.scrollHeight;scoutedEmails++;updateUI();saveState()}
 document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible'&&isRunning)setTimeout(openNextEmail,2000)});
 document.addEventListener('click',function(e){if(isRunning&&scoutedEmails<recipients.length&&!e.target.closest('button'))setTimeout(openNextEmail,2000)});
-function openBulk(){
-  const subj=document.getElementById('subjectLine').value;const msg=document.getElementById('messageBody').value;
-  for(let i=0;i<Math.min(10,recipients.length-scoutedEmails);i++){
-    const email=recipients[scoutedEmails+i];
-    const body=msg.replace('{name}','Store Owner').replace('{email}',email);
-    window.open('mailto:'+email+'?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(body),'_blank');
-  }
-  scoutedEmails+=Math.min(10,recipients.length-scoutedEmails);updateUI();saveState();
-}
+function openBulk(){const subj=document.getElementById('subjectLine').value;const msg=document.getElementById('messageBody').value;for(let i=0;i<Math.min(10,recipients.length-scoutedEmails);i++){const email=recipients[scoutedEmails+i];const body=msg.replace('{name}','Store Owner').replace('{email}',email);window.open('mailto:'+email+'?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(body),'_blank')}scoutedEmails+=Math.min(10,recipients.length-scoutedEmails);updateUI();saveState()}
 </script>'''
     return render_page("Scout", body)
 
 # ==========================================
-# STORE AUDIT PAGE
+# AUDIT PAGE
 # ==========================================
 @app.route('/audit')
 @login_required
@@ -1007,79 +971,16 @@ def audit_page():
 <div id="auditStatus" style="margin-top:10px"></div>
 </div>
 <div style="background:#65a30d;color:white;padding:20px;border-radius:10px;margin-bottom:20px;display:flex;align-items:center;gap:16px">
-<svg width="56" height="56" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" style="flex-shrink:0">
-<path d="M32 4L8 14V30C8 45 19 57 32 60C45 57 56 45 56 30V14L32 4Z" fill="white" opacity="0.25" stroke="white" stroke-width="2" stroke-linejoin="round"/>
-<path d="M22 32L29 39L43 25" stroke="white" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
-</svg>
-<div>
-<h1 style="margin:0;font-size:24px">Security Analysis</h1>
-<p style="margin:4px 0 0 0;font-size:14px;opacity:0.9">Real audit of any Shopify store</p>
-</div>
+<svg width="56" height="56" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" style="flex-shrink:0"><path d="M32 4L8 14V30C8 45 19 57 32 60C45 57 56 45 56 30V14L32 4Z" fill="white" opacity="0.25" stroke="white" stroke-width="2" stroke-linejoin="round"/><path d="M22 32L29 39L43 25" stroke="white" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+<div><h1 style="margin:0;font-size:24px">Security Analysis</h1><p style="margin:4px 0 0 0;font-size:14px;opacity:0.9">Real audit of any Shopify store</p></div>
 </div>
 <div id="auditResult"></div>
 </div>
 <script>
-async function runAudit(){
-  const url=document.getElementById('auditUrl').value.trim();
-  if(!url){alert('Enter a store URL');return}
-  const status=document.getElementById('auditStatus');
-  const result=document.getElementById('auditResult');
-  status.innerHTML='<p style="color:#666">⏳ Analyzing '+url+'... (10-30 seconds)</p>';
-  result.innerHTML='<p style="color:#666;text-align:center;padding:30px">Please wait...</p>';
-  const controller=new AbortController();
-  const timeoutId=setTimeout(()=>controller.abort(),90000);
-  try{
-    const res=await fetch('/run-audit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:url}),signal:controller.signal});
-    clearTimeout(timeoutId);
-    if(!res.ok){status.innerHTML='<p style="color:red">Server error: HTTP '+res.status+'</p>';result.innerHTML='';return}
-    const data=await res.json();
-    if(data.error){status.innerHTML='<p style="color:red">Error: '+data.error+'</p>';result.innerHTML='';return}
-    status.innerHTML='<p style="color:green">✅ Audit complete</p>';
-    renderReport(data);
-  }catch(e){
-    clearTimeout(timeoutId);
-    status.innerHTML='<p style="color:red">'+(e.name==='AbortError'?'Timeout after 90s':'Error: '+e.message)+'</p>';
-    result.innerHTML='';
-  }
-}
-function scoreColor(score){if(score>=75)return '#16a34a';if(score>=50)return '#f59e0b';return '#ef4444'}
-function scoreBar(label,score){
-  const c=scoreColor(score);
-  return '<div style="margin:10px 0"><div style="display:flex;justify-content:space-between;margin-bottom:4px"><b>'+label+'</b><span style="color:'+c+';font-weight:bold">'+score+'%</span></div><div style="background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+score+'%;height:12px;background:'+c+'"></div></div></div>';
-}
-function renderReport(r){
-  const checks=r.checks||{};const scores=r.scores||{};const issues=r.issues||[];
-  let html='';
-  html+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px"><div><h2 style="margin:0">Store Audit Overview</h2><div style="color:#666;font-size:13px;margin-top:6px">Store: <b>https://'+r.domain+'/</b></div></div>'+(r.case_id?'<div style="background:#f3f4f6;padding:6px 12px;border-radius:6px;font-size:13px;color:#374151">Case ID: <b>'+r.case_id+'</b></div>':'')+'</div></div>';
-  html+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><h3 style="margin-top:0">📈 Scores</h3>'+scoreBar('Overall',scores.overall_score||0)+scoreBar('Trust',scores.trust_score||0)+scoreBar('Technical',scores.technical_score||0)+scoreBar('Marketing',scores.marketing_score||0)+'</div>';
-  const hi=issues.filter(i=>i.severity==='high');
-  if(hi.length>0)html+='<div style="background:#fef2f2;border-left:4px solid #ef4444;padding:15px;border-radius:8px;margin-bottom:20px"><div style="color:#991b1b;font-weight:bold;font-size:16px;margin-bottom:6px">⚠️ Critical issues detected! Possible consequences: lost sales, fines, or trust damage.</div><div style="color:#7f1d1d;font-size:13px">'+hi.length+' high-priority issue(s) found.</div></div>';
-  if(issues.length>0){
-    html+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><h3 style="margin-top:0;color:#991b1b">⚠️ Issues Found ('+issues.length+')</h3>';
-    issues.forEach(i=>{const c=i.severity==='high'?'#ef4444':(i.severity==='medium'?'#f59e0b':'#6b7280');html+='<div style="background:#fef2f2;border-left:4px solid '+c+';padding:15px;border-radius:8px;margin:10px 0"><div style="font-weight:bold;font-size:15px;margin-bottom:6px">⚠️ '+i.title+'</div><div style="color:#374151;font-size:14px;margin-bottom:8px">'+i.description+'</div><div style="background:#fef3c7;padding:10px;border-radius:6px;font-size:13px;color:#78350f"><b>💡 Recommendation:</b> '+i.recommendation+'</div></div>'});
-    html+='</div>';
-  } else html+='<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:15px;border-radius:8px;margin-bottom:20px"><div style="color:#166534;font-weight:bold">✅ No critical issues detected</div></div>';
-  if(r.positives&&r.positives.length>0){html+='<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:15px;border-radius:8px;margin-bottom:20px"><h3 style="margin-top:0;color:#166534">✅ What Works Well</h3>';r.positives.forEach(p=>{html+='<div style="margin:6px 0;color:#14532d">✅ '+p+'</div>'});html+='</div>'}
-  html+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><h3 style="margin-top:0">🔍 Detailed Checks</h3><table style="width:100%;border-collapse:collapse;font-size:14px">';
-  function row(l,v){return '<tr><td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold">'+l+'</td><td style="padding:8px;border-bottom:1px solid #eee">'+v+'</td></tr>'}
-  html+=row('Is Shopify Store',checks.is_shopify?'✅ Yes':'❌ Not detected');
-  html+=row('HTTPS',checks.https?'✅ Enabled':'❌ Disabled');
-  html+=row('HTTP Status',checks.http_status||'N/A');
-  html+=row('Load Time',checks.load_time_seconds?checks.load_time_seconds+'s':'N/A');
-  html+=row('Product Count',(checks.product_count!==null&&checks.product_count!==undefined)?checks.product_count+(checks.product_count_capped?'+':''):'N/A');
-  html+=row('Theme',checks.theme||'Unknown');
-  html+=row('Mobile Responsive',checks.mobile_responsive?'✅ Yes':'❌ No');
-  html+=row('Currency',checks.currency||'Unknown');
-  html+=row('Contact Page',checks.has_contact_page?'✅ Found':'❌ Not found');
-  html+=row('Email Link',checks.has_email_link?'✅ Found':'❌ Not found');
-  html+=row('Phone Link',checks.has_phone_link?'✅ Found':'❌ Not found');
-  html+=row('Policy Pages',checks.policy_pages_found||'0/4');
-  html+=row('Social Links',(checks.social_links&&checks.social_links.length>0)?checks.social_links.join(', '):'None found');
-  html+=row('Detected Apps',(checks.detected_apps&&checks.detected_apps.length>0)?checks.detected_apps.join(', '):'None detected');
-  html+='</table></div>';
-  html+='<div style="background:#eff6ff;border-left:4px solid #3b82f6;padding:15px;border-radius:8px;font-size:13px;color:#1e40af"><b>ℹ️ Note:</b> This audit uses only publicly available data. Sales, customer counts, and checkout abandonment cannot be measured from outside a store.</div>';
-  document.getElementById('auditResult').innerHTML=html;
-}
+async function runAudit(){const url=document.getElementById('auditUrl').value.trim();if(!url){alert('Enter URL');return}const status=document.getElementById('auditStatus');const result=document.getElementById('auditResult');status.innerHTML='<p style="color:#666">⏳ Analyzing...</p>';result.innerHTML='<p style="color:#666;text-align:center;padding:30px">Please wait...</p>';const c=new AbortController();const t=setTimeout(()=>c.abort(),90000);try{const res=await fetch('/run-audit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:url}),signal:c.signal});clearTimeout(t);if(!res.ok){status.innerHTML='<p style="color:red">HTTP '+res.status+'</p>';result.innerHTML='';return}const data=await res.json();if(data.error){status.innerHTML='<p style="color:red">'+data.error+'</p>';result.innerHTML='';return}status.innerHTML='<p style="color:green">✅ Complete</p>';renderReport(data)}catch(e){clearTimeout(t);status.innerHTML='<p style="color:red">'+(e.name==='AbortError'?'Timeout':'Error: '+e.message)+'</p>';result.innerHTML=''}}
+function scoreColor(s){if(s>=75)return '#16a34a';if(s>=50)return '#f59e0b';return '#ef4444'}
+function scoreBar(l,s){const c=scoreColor(s);return '<div style="margin:10px 0"><div style="display:flex;justify-content:space-between;margin-bottom:4px"><b>'+l+'</b><span style="color:'+c+';font-weight:bold">'+s+'%</span></div><div style="background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+s+'%;height:12px;background:'+c+'"></div></div></div>'}
+function renderReport(r){const ch=r.checks||{};const sc=r.scores||{};const iss=r.issues||[];let h='';h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px"><div><h2 style="margin:0">Store Audit Overview</h2><div style="color:#666;font-size:13px;margin-top:6px">Store: <b>https://'+r.domain+'/</b></div></div>'+(r.case_id?'<div style="background:#f3f4f6;padding:6px 12px;border-radius:6px;font-size:13px;color:#374151">Case ID: <b>'+r.case_id+'</b></div>':'')+'</div></div>';h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><h3 style="margin-top:0">📈 Scores</h3>'+scoreBar('Overall',sc.overall_score||0)+scoreBar('Trust',sc.trust_score||0)+scoreBar('Technical',sc.technical_score||0)+scoreBar('Marketing',sc.marketing_score||0)+'</div>';const hi=iss.filter(i=>i.severity==='high');if(hi.length>0)h+='<div style="background:#fef2f2;border-left:4px solid #ef4444;padding:15px;border-radius:8px;margin-bottom:20px"><div style="color:#991b1b;font-weight:bold;font-size:16px;margin-bottom:6px">⚠️ Critical issues detected!</div><div style="color:#7f1d1d;font-size:13px">'+hi.length+' high-priority issue(s)</div></div>';if(iss.length>0){h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><h3 style="margin-top:0;color:#991b1b">⚠️ Issues Found ('+iss.length+')</h3>';iss.forEach(i=>{const c=i.severity==='high'?'#ef4444':(i.severity==='medium'?'#f59e0b':'#6b7280');h+='<div style="background:#fef2f2;border-left:4px solid '+c+';padding:15px;border-radius:8px;margin:10px 0"><div style="font-weight:bold;font-size:15px;margin-bottom:6px">⚠️ '+i.title+'</div><div style="color:#374151;font-size:14px;margin-bottom:8px">'+i.description+'</div><div style="background:#fef3c7;padding:10px;border-radius:6px;font-size:13px;color:#78350f"><b>💡 Recommendation:</b> '+i.recommendation+'</div></div>'});h+='</div>'}else{h+='<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:15px;border-radius:8px;margin-bottom:20px"><div style="color:#166534;font-weight:bold">✅ No critical issues detected</div></div>'}if(r.positives&&r.positives.length>0){h+='<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:15px;border-radius:8px;margin-bottom:20px"><h3 style="margin-top:0;color:#166534">✅ What Works Well</h3>';r.positives.forEach(p=>{h+='<div style="margin:6px 0;color:#14532d">✅ '+p+'</div>'});h+='</div>'}h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><h3 style="margin-top:0">🔍 Detailed Checks</h3><table style="width:100%;border-collapse:collapse;font-size:14px">';function row(l,v){return '<tr><td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold">'+l+'</td><td style="padding:8px;border-bottom:1px solid #eee">'+v+'</td></tr>'}h+=row('Is Shopify Store',ch.is_shopify?'✅ Yes':'❌ Not detected');h+=row('HTTPS',ch.https?'✅ Enabled':'❌ Disabled');h+=row('HTTP Status',ch.http_status||'N/A');h+=row('Load Time',ch.load_time_seconds?ch.load_time_seconds+'s':'N/A');h+=row('Product Count',(ch.product_count!==null&&ch.product_count!==undefined)?ch.product_count+(ch.product_count_capped?'+':''):'N/A');h+=row('Theme',ch.theme||'Unknown');h+=row('Mobile Responsive',ch.mobile_responsive?'✅ Yes':'❌ No');h+=row('Currency',ch.currency||'Unknown');h+=row('Contact Page',ch.has_contact_page?'✅ Found':'❌ Not found');h+=row('Email Link',ch.has_email_link?'✅ Found':'❌ Not found');h+=row('Phone Link',ch.has_phone_link?'✅ Found':'❌ Not found');h+=row('Policy Pages',ch.policy_pages_found||'0/4');h+=row('Social Links',(ch.social_links&&ch.social_links.length>0)?ch.social_links.join(', '):'None found');h+=row('Detected Apps',(ch.detected_apps&&ch.detected_apps.length>0)?ch.detected_apps.join(', '):'None detected');h+='</table></div>';h+='<div style="background:#eff6ff;border-left:4px solid #3b82f6;padding:15px;border-radius:8px;font-size:13px;color:#1e40af"><b>ℹ️ Note:</b> This audit uses only publicly available data.</div>';document.getElementById('auditResult').innerHTML=h}
 window.onload=function(){if(document.getElementById('auditUrl').value.trim())runAudit()};
 </script>'''
     return render_page("Security Analysis", body)
@@ -1133,19 +1034,6 @@ def verify_async():
     thread = threading.Thread(target=background_verify_worker, args=(job_id,), daemon=True)
     thread.start()
     return jsonify({'success': True, 'job_id': job_id, 'total': len(emails)})
-
-@app.route('/verify-status/<int:job_id>')
-@login_required
-def verify_status(job_id):
-    conn = get_db()
-    if not conn: return jsonify({'error': 'No DB'}), 500
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT id, job_name, total, processed, status, valid_emails, invalid_emails, created_at FROM verify_jobs WHERE id = %s", (job_id,))
-        row = cur.fetchone(); cur.close()
-        if not row: return jsonify({'error': 'Not found'}), 404
-        return jsonify({'id': row[0], 'name': row[1], 'total': row[2], 'processed': row[3], 'status': row[4], 'valid': len(row[5].split('|||')) if row[5] else 0, 'invalid': len(row[6].split('|||')) if row[6] else 0, 'created_at': str(row[7])})
-    finally: release_db(conn)
 
 @app.route('/verify-results/<int:job_id>')
 @login_required
