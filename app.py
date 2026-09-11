@@ -105,7 +105,6 @@ def init_db():
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             domain VARCHAR(255) NOT NULL, report JSONB,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        # NEW: Audit Queue table
         cur.execute("""CREATE TABLE IF NOT EXISTS audit_queue (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             email VARCHAR(255) NOT NULL,
@@ -115,7 +114,6 @@ def init_db():
             added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_email, email))""")
-        # NEW: Sent Log (dedupe)
         cur.execute("""CREATE TABLE IF NOT EXISTS sent_log (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             email VARCHAR(255) NOT NULL,
@@ -238,7 +236,6 @@ def load_user_state(user_email):
 # AUDIT QUEUE HELPERS
 # ==========================================
 def add_to_queue(user_email, emails):
-    """Add emails to audit queue. Returns (added_count, skipped_count)."""
     conn = get_db()
     if not conn: return 0, 0
     added = 0
@@ -250,7 +247,6 @@ def add_to_queue(user_email, emails):
             if not email or '@' not in email: continue
             domain = domain_from_email(email)
             if not domain: continue
-            # Check if already in sent_log (dedupe)
             cur.execute("SELECT id FROM sent_log WHERE user_email = %s AND email = %s", (user_email, email))
             if cur.fetchone():
                 skipped += 1
@@ -453,20 +449,6 @@ def get_audit_history(user_email):
     except: return []
     finally: release_db(conn)
 
-def get_audit_detail(audit_id, user_email):
-    conn = get_db()
-    if not conn: return None
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT report FROM audit_history WHERE id = %s AND user_email = %s", (audit_id, user_email))
-        row = cur.fetchone(); cur.close()
-        if row and row[0]:
-            try: return json.loads(row[0]) if isinstance(row[0], str) else row[0]
-            except: return None
-        return None
-    except: return None
-    finally: release_db(conn)
-
 # ==========================================
 # VERIFY
 # ==========================================
@@ -568,121 +550,6 @@ def find_emails(domain):
     final = [e for e in set(emails) if len(e) > 5 and '.' in e and not any(x in e for x in skip)]
     cache_emails(domain, final)
     return final
-
-# ==========================================
-# DISCOVERY
-# ==========================================
-def discover_via_shodan(limit=5):
-    discovered = []; seen_roots = set()
-    for ip in SHOPIFY_IPS[:limit]:
-        try:
-            url = f"https://api.shodan.io/shodan/host/{ip}?key={SHODAN_API_KEY}"
-            r = requests.get(url, timeout=15)
-            if r.status_code == 200:
-                for hn in r.json().get('hostnames', []):
-                    root = root_domain(hn)
-                    if "shopify" in root: continue
-                    if '.' not in root or len(root) < 5: continue
-                    if root in seen_roots: continue
-                    seen_roots.add(root)
-                    discovered.append({'domain': root, 'source': 'shodan'})
-            elif r.status_code == 403: break
-            time.sleep(1)
-        except: continue
-    return discovered
-
-def discover_via_theme_showcase():
-    discovered = []; seen = set()
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    for page in ["https://themes.shopify.com/themes?sort_by=most_recent","https://themes.shopify.com/themes?sort_by=popular"]:
-        try:
-            r = requests.get(page, headers=headers, timeout=15)
-            if r.status_code == 200:
-                for m in re.findall(r'https://([a-z0-9\-]+)\.myshopify\.com', r.text, re.IGNORECASE):
-                    if m in seen or m in ['www','cdn','checkout','account','admin']: continue
-                    seen.add(m)
-                    discovered.append({'domain': f"{m}.myshopify.com", 'source': 'theme_showcase'})
-        except: continue
-    return discovered
-
-def discover_via_search(keyword=''):
-    discovered = []; seen_roots = set()
-    try:
-        query = f'"Powered by Shopify" {keyword}'.strip()
-        url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36","Accept-Language": "en-US,en;q=0.5"}
-        r = requests.post(url, headers=headers, timeout=15)
-        if r.status_code == 200:
-            for link in re.findall(r'class="result__a" href="(.*?)"', r.text)[:30]:
-                if "uddg=" in link:
-                    import urllib.parse
-                    parsed = urllib.parse.parse_qs(urllib.parse.urlparse(link).query)
-                    if 'uddg' in parsed: link = parsed['uddg'][0]
-                clean = link.replace("https://", "").replace("http://", "").split("/")[0]
-                root = root_domain(clean)
-                if "shopify.com" in root or "duckduckgo" in root: continue
-                if root in seen_roots: continue
-                seen_roots.add(root)
-                discovered.append({'domain': root, 'source': 'search'})
-    except: pass
-    if not discovered:
-        try:
-            query = f'"Powered by Shopify" {keyword}'.strip()
-            url = f"https://www.bing.com/search?q={requests.utils.quote(query)}"
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-            r = requests.get(url, headers=headers, timeout=15)
-            if r.status_code == 200:
-                for link in re.findall(r'<a href="(https?://[^"]+)"', r.text)[:30]:
-                    clean = link.replace("https://", "").replace("http://", "").split("/")[0]
-                    root = root_domain(clean)
-                    if "bing.com" in root or "microsoft" in root or "shopify.com" in root: continue
-                    if root in seen_roots: continue
-                    seen_roots.add(root)
-                    discovered.append({'domain': root, 'source': 'search'})
-        except: pass
-    return discovered
-
-def discover_via_related(user_email):
-    discovered = []; seen_roots = set()
-    conn = get_db()
-    if not conn: return discovered
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT domain FROM discovered_stores WHERE user_email = %s LIMIT 5", (user_email,))
-        seeds = [r[0] for r in cur.fetchall()]; cur.close()
-    finally: release_db(conn)
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    for seed in seeds:
-        try:
-            r = requests.get(f"https://{seed}", headers=headers, timeout=8)
-            if r.status_code == 200:
-                for ext in re.findall(r'href="https?://([a-zA-Z0-9\.\-]+)"', r.text)[:20]:
-                    root = root_domain(ext)
-                    if root == seed or root in seen_roots: continue
-                    if any(s in root for s in ['shopify','facebook','instagram','twitter','youtube','tiktok','pinterest','google','apple']): continue
-                    if '.' not in root or len(root) < 5: continue
-                    seen_roots.add(root)
-                    discovered.append({'domain': root, 'source': 'related'})
-        except: continue
-    return discovered
-
-def save_discovered(user_email, stores):
-    conn = get_db()
-    if not conn: return 0
-    saved = 0
-    try:
-        cur = conn.cursor()
-        for store in stores:
-            try:
-                cur.execute("""INSERT INTO discovered_stores (user_email, domain, source)
-                    VALUES (%s, %s, %s) ON CONFLICT (user_email, domain) DO NOTHING""",
-                    (user_email, store['domain'], store.get('source', 'unknown')))
-                if cur.rowcount > 0: saved += 1
-            except: pass
-        conn.commit(); cur.close()
-    except: pass
-    finally: release_db(conn)
-    return saved
 
 # ==========================================
 # AUDIT
@@ -907,7 +774,7 @@ Top 3 issues I found:
     for b in issue_bullets:
         body += f"• {b}\n"
     signature = sender_name.strip() if sender_name and sender_name.strip() else "[Your name]"
-    body += f"\nOverall score: {overall}/100. Most are fixable in a day or two.\n\n{closer}\n\n{signoff}\n\nBest,\n{signature}"
+    body += f"\nOverall score: {overall}/100. Most are fixable in a day or two.\n\n{closer}\n\n{signoff}\n\nBest regards,\n{signature}"
     return {'subject': subject, 'body': body, 'tone': tone}
 
 # ==========================================
@@ -1040,7 +907,7 @@ def settings():
     return render_page("Settings", body)
 
 # ==========================================
-# HOME (Email Finder)
+# HOME
 # ==========================================
 @app.route('/')
 @login_required
@@ -1119,31 +986,27 @@ def discover_page():
     body = '''<div style="max-width:900px;margin:20px auto;padding:20px">
 <div style="background:#8b5cf6;color:white;padding:20px;border-radius:10px;margin-bottom:20px"><h1 style="margin:0">🎯 Store Discovery</h1></div>
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
-<h3 style="margin-top:0">🔎 Discovery Methods</h3>
 <button onclick="runDiscovery('shodan')" style="background:#8b5cf6;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">🔍 Shodan</button>
-<button onclick="runDiscovery('theme')" style="background:#ec4899;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">🎨 Theme Showcase</button>
+<button onclick="runDiscovery('theme')" style="background:#ec4899;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">🎨 Theme</button>
 <button onclick="runDiscovery('search')" style="background:#3b82f6;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">🌐 Search</button>
 <button onclick="runDiscovery('related')" style="background:#f59e0b;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">📚 Related</button>
 <button onclick="runDiscovery('all')" style="background:#0d9488;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">⚡ All</button>
 <div id="discoveryStatus" style="margin-top:12px"></div>
 </div>
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1)">
-<h3 style="margin-top:0">📋 Discovered Stores (<span id="storeCount">0</span>)</h3>
+<h3 style="margin-top:0">📋 Discovered (<span id="storeCount">0</span>)</h3>
 <div id="storeList">Loading...</div>
-<button onclick="loadStores()" style="background:#3b82f6;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px;margin-top:10px">🔄 Refresh</button>
-<button onclick="clearStores()" style="background:#ef4444;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px;margin-top:10px;margin-left:8px">🗑️ Clear</button>
+<button onclick="clearStores()" style="background:#ef4444;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px;margin-top:10px">🗑️ Clear</button>
 </div></div>
 <script>
 async function runDiscovery(method){
   const status=document.getElementById('discoveryStatus');
-  status.innerHTML='<p style="color:#666">⏳ Running '+method+'... 30-60 seconds</p>';
+  status.innerHTML='<p style="color:#666">⏳ Running '+method+'...</p>';
   try{
     const res=await fetch('/run-discovery',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({method:method})});
     const data=await res.json();
     if(data.success){
-      let details='';
-      if(data.by_method){for(const[k,v]of Object.entries(data.by_method)){if(v>0)details+=' · '+k+': '+v}}
-      status.innerHTML='<p style="color:green">✅ Found '+data.found+' (saved: '+data.saved+')'+details+'</p>';
+      status.innerHTML='<p style="color:green">✅ Found '+data.found+' (saved: '+data.saved+')</p>';
       loadStores();
     } else { status.innerHTML='<p style="color:red">Error: '+(data.error||'Unknown')+'</p>'; }
   }catch(e){status.innerHTML='<p style="color:red">Error: '+e+'</p>'}
@@ -1157,9 +1020,7 @@ async function loadStores(){
   data.stores.forEach(s=>{
     html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid #8b5cf6;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
     html+='<div><b><a href="https://'+s.domain+'" target="_blank" style="color:#3b82f6">'+s.domain+'</a></b><br><span style="font-size:12px;color:#666">'+s.source+' · '+s.discovered_at+'</span></div>';
-    html+='<div style="display:flex;gap:6px">';
-    html+='<button onclick="actAudit(\\''+s.domain+'\\')" style="background:#65a30d;color:white;padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">🛡️</button>';
-    html+='</div></div>';
+    html+='<div><button onclick="actAudit(\\''+s.domain+'\\')" style="background:#65a30d;color:white;padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">🛡️</button></div></div>';
   });
   c.innerHTML=html;
 }
@@ -1220,6 +1081,118 @@ def clear_discovered():
     except: return jsonify({'success': False})
     finally: release_db(conn)
 
+def discover_via_shodan(limit=5):
+    discovered = []; seen_roots = set()
+    for ip in SHOPIFY_IPS[:limit]:
+        try:
+            url = f"https://api.shodan.io/shodan/host/{ip}?key={SHODAN_API_KEY}"
+            r = requests.get(url, timeout=15)
+            if r.status_code == 200:
+                for hn in r.json().get('hostnames', []):
+                    root = root_domain(hn)
+                    if "shopify" in root: continue
+                    if '.' not in root or len(root) < 5: continue
+                    if root in seen_roots: continue
+                    seen_roots.add(root)
+                    discovered.append({'domain': root, 'source': 'shodan'})
+            elif r.status_code == 403: break
+            time.sleep(1)
+        except: continue
+    return discovered
+
+def discover_via_theme_showcase():
+    discovered = []; seen = set()
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    for page in ["https://themes.shopify.com/themes?sort_by=most_recent","https://themes.shopify.com/themes?sort_by=popular"]:
+        try:
+            r = requests.get(page, headers=headers, timeout=15)
+            if r.status_code == 200:
+                for m in re.findall(r'https://([a-z0-9\-]+)\.myshopify\.com', r.text, re.IGNORECASE):
+                    if m in seen or m in ['www','cdn','checkout','account','admin']: continue
+                    seen.add(m)
+                    discovered.append({'domain': f"{m}.myshopify.com", 'source': 'theme_showcase'})
+        except: continue
+    return discovered
+
+def discover_via_search(keyword=''):
+    discovered = []; seen_roots = set()
+    try:
+        query = f'"Powered by Shopify" {keyword}'.strip()
+        url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+        r = requests.post(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            for link in re.findall(r'class="result__a" href="(.*?)"', r.text)[:30]:
+                if "uddg=" in link:
+                    import urllib.parse
+                    parsed = urllib.parse.parse_qs(urllib.parse.urlparse(link).query)
+                    if 'uddg' in parsed: link = parsed['uddg'][0]
+                clean = link.replace("https://", "").replace("http://", "").split("/")[0]
+                root = root_domain(clean)
+                if "shopify.com" in root or "duckduckgo" in root: continue
+                if root in seen_roots: continue
+                seen_roots.add(root)
+                discovered.append({'domain': root, 'source': 'search'})
+    except: pass
+    if not discovered:
+        try:
+            query = f'"Powered by Shopify" {keyword}'.strip()
+            url = f"https://www.bing.com/search?q={requests.utils.quote(query)}"
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            r = requests.get(url, headers=headers, timeout=15)
+            if r.status_code == 200:
+                for link in re.findall(r'<a href="(https?://[^"]+)"', r.text)[:30]:
+                    clean = link.replace("https://", "").replace("http://", "").split("/")[0]
+                    root = root_domain(clean)
+                    if "bing.com" in root or "microsoft" in root or "shopify.com" in root: continue
+                    if root in seen_roots: continue
+                    seen_roots.add(root)
+                    discovered.append({'domain': root, 'source': 'search'})
+        except: pass
+    return discovered
+
+def discover_via_related(user_email):
+    discovered = []; seen_roots = set()
+    conn = get_db()
+    if not conn: return discovered
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT domain FROM discovered_stores WHERE user_email = %s LIMIT 5", (user_email,))
+        seeds = [r[0] for r in cur.fetchall()]; cur.close()
+    finally: release_db(conn)
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    for seed in seeds:
+        try:
+            r = requests.get(f"https://{seed}", headers=headers, timeout=8)
+            if r.status_code == 200:
+                for ext in re.findall(r'href="https?://([a-zA-Z0-9\.\-]+)"', r.text)[:20]:
+                    root = root_domain(ext)
+                    if root == seed or root in seen_roots: continue
+                    if any(s in root for s in ['shopify','facebook','instagram','twitter','youtube','tiktok','pinterest','google','apple']): continue
+                    if '.' not in root or len(root) < 5: continue
+                    seen_roots.add(root)
+                    discovered.append({'domain': root, 'source': 'related'})
+        except: continue
+    return discovered
+
+def save_discovered(user_email, stores):
+    conn = get_db()
+    if not conn: return 0
+    saved = 0
+    try:
+        cur = conn.cursor()
+        for store in stores:
+            try:
+                cur.execute("""INSERT INTO discovered_stores (user_email, domain, source)
+                    VALUES (%s, %s, %s) ON CONFLICT (user_email, domain) DO NOTHING""",
+                    (user_email, store['domain'], store.get('source', 'unknown')))
+                if cur.rowcount > 0: saved += 1
+            except: pass
+        conn.commit(); cur.close()
+    except: pass
+    finally: release_db(conn)
+    return saved
+
 # ==========================================
 # EMAIL SCAN API
 # ==========================================
@@ -1246,30 +1219,23 @@ def verify_page():
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
 <h3 style="margin-top:0">📋 Last 3 Jobs</h3>
 <div id="jobsList">Loading...</div>
-<button onclick="refreshJobs()" style="background:#3b82f6;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px;margin-top:10px">🔄 Refresh</button>
 </div>
 <div style="background:white;padding:20px;border-radius:10px">
-<h3 style="margin-top:0">🆕 New Verification</h3>
 <textarea id="emailsInput" style="width:100%;height:180px;border:1px solid #ddd;border-radius:5px;padding:10px;font-family:monospace;box-sizing:border-box"></textarea>
-<div style="border:2px dashed #ddd;padding:15px;text-align:center;margin:10px 0">
-<input type="file" id="emailFile" accept=".csv,.txt">
-<button onclick="readFile()" style="background:#f59e0b;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;margin-left:10px">Upload</button>
-</div>
-<button onclick="loadFromFinder()" style="background:#f59e0b;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-right:8px;margin-bottom:8px">📥 From Finder</button>
-<button onclick="startBackgroundVerify()" style="background:#0d9488;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-bottom:8px">▶️ Start Verify</button>
+<button onclick="loadFromFinder()" style="background:#f59e0b;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-right:8px;margin-top:8px">📥 From Finder</button>
+<button onclick="startBackgroundVerify()" style="background:#0d9488;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-top:8px">▶️ Start Verify</button>
 <div id="startMsg" style="margin-top:10px"></div>
 </div></div>
 <script>
 async function loadFromFinder(){const res=await fetch('/get-stored-emails');const data=await res.json();if(data.emails&&data.emails.length>0){document.getElementById('emailsInput').value=data.emails.join('\\n');alert('Loaded '+data.emails.length)}}
-function readFile(){const f=document.getElementById('emailFile').files[0];if(!f){alert('Select file');return}const r=new FileReader();r.onload=function(e){const lines=e.target.result.split('\\n');const emails=[];lines.forEach(l=>{l=l.trim();if(l.includes(','))l=l.split(',')[0].trim();if(l.includes('@'))emails.push(l)});document.getElementById('emailsInput').value=emails.join('\\n');alert('Loaded '+emails.length)}};r.readAsText(f)}
 async function startBackgroundVerify(){const emails=document.getElementById('emailsInput').value.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);if(emails.length===0){alert('Enter emails');return}const name=prompt('Job name:','Job '+new Date().toLocaleString());document.getElementById('startMsg').innerHTML='<p style="color:#666">Starting...</p>';try{const res=await fetch('/verify-async',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({emails:emails,name:name||'Untitled'})});const data=await res.json();if(data.success){document.getElementById('startMsg').innerHTML='<p style="color:green">✅ Job #'+data.job_id+' started!</p>';document.getElementById('emailsInput').value='';refreshJobs()}}catch(e){document.getElementById('startMsg').innerHTML='<p style="color:red">Error: '+e+'</p>'}}
-async function refreshJobs(){const res=await fetch('/verify-jobs');const data=await res.json();const container=document.getElementById('jobsList');if(!data.jobs||data.jobs.length===0){container.innerHTML='<p style="color:#666">No jobs yet.</p>';return}let html='';data.jobs.forEach(job=>{const percent=job.total>0?Math.round((job.processed/job.total)*100):0;const sc=job.status==='completed'?'#0d9488':(job.status==='running'?'#f59e0b':'#ef4444');const si=job.status==='completed'?'✅':(job.status==='running'?'🔄':'⏹️');html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+sc+'"><div style="font-weight:bold">'+si+' '+job.name+' <span style="color:#666;font-weight:normal">#'+job.id+'</span></div><div style="margin-top:8px;background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+percent+'%;height:16px;background:'+sc+';text-align:center;color:white;font-size:11px;line-height:16px">'+percent+'%</div></div><div style="font-size:13px;margin-top:6px">Processed: '+job.processed+' / '+job.total+' | ✅ '+job.valid+' | ❌ '+job.invalid+'</div></div>'});container.innerHTML=html}
+async function refreshJobs(){const res=await fetch('/verify-jobs');const data=await res.json();const container=document.getElementById('jobsList');if(!data.jobs||data.jobs.length===0){container.innerHTML='<p style="color:#666">No jobs yet.</p>';return}let html='';data.jobs.forEach(job=>{const percent=job.total>0?Math.round((job.processed/job.total)*100):0;const sc=job.status==='completed'?'#0d9488':(job.status==='running'?'#f59e0b':'#ef4444');const si=job.status==='completed'?'✅':(job.status==='running'?'🔄':'⏹️');html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+sc+'"><div style="font-weight:bold">'+si+' '+job.name+'</div><div style="margin-top:8px;background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+percent+'%;height:16px;background:'+sc+';text-align:center;color:white;font-size:11px;line-height:16px">'+percent+'%</div></div><div style="font-size:13px;margin-top:6px">'+job.processed+' / '+job.total+' | ✅ '+job.valid+' | ❌ '+job.invalid+'</div></div>'});container.innerHTML=html}
 window.onload=function(){refreshJobs();setInterval(refreshJobs,10000)};
 </script>'''
     return render_page("Verify", body)
 
 # ==========================================
-# SCOUT PAGE
+# SCOUT
 # ==========================================
 @app.route('/scout')
 @login_required
@@ -1279,54 +1245,36 @@ def scout():
 <div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
 <h3 style="margin-top:0">📥 Recipients</h3>
 <textarea id="emailsInput" oninput="syncRecipients()" style="width:100%;height:160px;border:1px solid #ddd;border-radius:5px;padding:10px;font-family:monospace;box-sizing:border-box"></textarea>
-<button onclick="clearAll()" style="background:#ef4444;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;margin:8px 4px 0 0">Clear</button>
 <div id="emailCount" style="margin-top:10px;font-weight:bold">0 recipients</div>
 </div>
 <div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
 <h3 style="margin-top:0">✍️ Template</h3>
-<label>Subject</label>
-<input type="text" id="subjectLine" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;margin-bottom:10px;box-sizing:border-box">
-<label>Message</label>
-<textarea id="messageBody" rows="5" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;margin-bottom:10px;box-sizing:border-box"></textarea>
-<button onclick="generatePreview()" style="background:#0d9488;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer">👁️ Preview</button>
-<div id="preview" style="margin-top:10px;background:#f9f9f9;padding:10px;border-radius:5px;display:none;font-size:13px"></div>
+<input type="text" id="subjectLine" placeholder="Subject" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;margin-bottom:10px;box-sizing:border-box">
+<textarea id="messageBody" rows="5" placeholder="Message" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;box-sizing:border-box"></textarea>
 </div>
 <div style="background:white;padding:20px;border-radius:10px">
-<h3 style="margin-top:0">🚀 Send</h3>
 <button onclick="startCampaign()" style="background:#0d9488;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-right:8px">▶️ Start</button>
 <button onclick="stopCampaign()" style="background:#ef4444;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer">⏹️ Stop</button>
 <div id="launchStatus" style="margin-top:10px"></div>
-</div>
-<div style="background:white;padding:20px;border-radius:10px;margin-top:20px">
-<h3 style="margin-top:0">📊 Log</h3>
-<div id="log" style="max-height:150px;overflow-y:auto;background:#f9f9f9;padding:10px;border-radius:5px;font-size:13px"></div>
 </div></div>
 <script>
 let recipients=[],scoutedEmails=0,isRunning=false;
 function syncRecipients(){const val=document.getElementById('emailsInput').value;recipients=val.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);document.getElementById('emailCount').textContent=recipients.length+' recipients';saveState()}
-window.onload=async function(){
-  try{const res=await fetch('/load-scout-state');const data=await res.json();
-    if(data.recipients && data.recipients.length > 0){recipients = data.recipients;document.getElementById('emailsInput').value = recipients.join('\\n');}
-    if(data.subject) document.getElementById('subjectLine').value = data.subject;
-    if(data.message) document.getElementById('messageBody').value = data.message;
-  }catch(e){}
-  const currentValue = document.getElementById('emailsInput').value.trim();
-  if(currentValue){recipients = currentValue.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);}
-  document.getElementById('emailCount').textContent=recipients.length+' recipients';
-};
+window.onload=async function(){try{const res=await fetch('/load-scout-state');const data=await res.json();
+  if(data.recipients) {recipients = data.recipients;document.getElementById('emailsInput').value = recipients.join('\\n');}
+  if(data.subject) document.getElementById('subjectLine').value = data.subject;
+  if(data.message) document.getElementById('messageBody').value = data.message;
+}catch(e){};document.getElementById('emailCount').textContent=recipients.length+' recipients';};
 async function saveState(){try{await fetch('/save-scout-state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients:recipients,subject:document.getElementById('subjectLine').value,message:document.getElementById('messageBody').value,count:scoutedEmails})})}catch(e){}}
-function clearAll(){recipients=[];scoutedEmails=0;document.getElementById('emailsInput').value='';document.getElementById('subjectLine').value='';document.getElementById('messageBody').value='';document.getElementById('emailCount').textContent='0 recipients';saveState();isRunning=false}
-function generatePreview(){const s=document.getElementById('subjectLine').value;const m=document.getElementById('messageBody').value;const p=document.getElementById('preview');p.innerHTML='<b>Subject:</b> '+s+'<br><br><b>Message:</b><br>'+m.replace('{name}','John Doe').replace('{email}','john@store.com');p.style.display='block'}
-function startCampaign(){if(recipients.length===0){alert('Add recipients first');return}isRunning=true;document.getElementById('launchStatus').innerHTML='<p style="color:green">🚀 Started</p>';openNextEmail()}
-function stopCampaign(){isRunning=false;document.getElementById('launchStatus').innerHTML='<p style="color:red">⏹️ Stopped</p>';saveState()}
-function openNextEmail(){if(!isRunning)return;if(scoutedEmails>=recipients.length){isRunning=false;document.getElementById('launchStatus').innerHTML='<p style="color:blue">🎉 Complete</p>';saveState();return}const email=recipients[scoutedEmails];const subj=document.getElementById('subjectLine').value;const msg=document.getElementById('messageBody').value;const body=msg.replace('{name}','Store Owner').replace('{email}',email);window.location.href='mailto:'+email+'?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(body);const log=document.getElementById('log');log.innerHTML+='<div>📨 '+email+'</div>';log.scrollTop=log.scrollHeight;scoutedEmails++;saveState()}
+function startCampaign(){if(recipients.length===0){alert('Add recipients');return}isRunning=true;openNextEmail()}
+function stopCampaign(){isRunning=false}
+function openNextEmail(){if(!isRunning)return;if(scoutedEmails>=recipients.length){isRunning=false;return}const email=recipients[scoutedEmails];const subj=document.getElementById('subjectLine').value;const msg=document.getElementById('messageBody').value;const body=msg.replace('{name}','Store Owner').replace('{email}',email);window.location.href='mailto:'+email+'?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(body);scoutedEmails++;saveState()}
 document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible'&&isRunning)setTimeout(openNextEmail,2000)});
-document.addEventListener('click',function(e){if(isRunning&&scoutedEmails<recipients.length&&!e.target.closest('button'))setTimeout(openNextEmail,2000)});
 </script>'''
     return render_page("Scout", body)
 
 # ==========================================
-# ANALYZE & SEND (Main Page)
+# ANALYZE & SEND (with FIXED Auto mode)
 # ==========================================
 @app.route('/audit')
 @login_required
@@ -1344,7 +1292,6 @@ def audit_page():
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
 <h3 style="margin-top:0">📥 Import Emails</h3>
 <button onclick="importFrom('finder')" style="background:#667eea;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:13px">🔍 From Finder</button>
-<button onclick="importFrom('discovery')" style="background:#8b5cf6;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:13px">🎯 From Discovery</button>
 <button onclick="importFrom('verified')" style="background:#f59e0b;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:13px">✅ From Verified</button>
 <button onclick="toggleManual()" style="background:#0d9488;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:13px">✍️ Paste Manual</button>
 <div id="manualPaste" style="display:none;margin-top:10px">
@@ -1367,6 +1314,10 @@ def audit_page():
 
 <div id="modeButtons" style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
 <h3 style="margin-top:0">🚀 Start Processing</h3>
+<div style="margin-bottom:10px">
+<label style="font-weight:bold;font-size:13px">Your name:</label>
+<input type="text" id="senderName" value="''' + sender_name.replace('"','') + '''" placeholder="e.g. Daniel Phillips" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:5px;margin:5px 0;box-sizing:border-box;font-size:14px">
+</div>
 <button onclick="startManualMode()" style="background:#3b82f6;color:white;padding:14px 24px;border:none;border-radius:8px;cursor:pointer;font-size:16px;margin-right:10px;margin-bottom:10px">▶️ Start Manual</button>
 <button onclick="startAutoMode()" style="background:#0d9488;color:white;padding:14px 24px;border:none;border-radius:8px;cursor:pointer;font-size:16px;margin-bottom:10px">⚡ Start Auto</button>
 <button onclick="stopAutoMode()" id="stopBtn" style="background:#ef4444;color:white;padding:14px 24px;border:none;border-radius:8px;cursor:pointer;font-size:16px;display:none;margin-left:10px">⏹️ Stop Auto</button>
@@ -1379,12 +1330,10 @@ def audit_page():
 
 <div id="outreachSection" style="display:none;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-top:20px">
 <h3 style="margin-top:0">✉️ Outreach Email</h3>
-<label style="font-weight:bold;font-size:13px">Your name:</label>
-<input type="text" id="senderName" value="''' + sender_name.replace('"','') + '''" placeholder="e.g. Daniel Phillips" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:5px;margin:5px 0 10px 0;box-sizing:border-box;font-size:14px">
 <div style="margin-bottom:10px">
-<button onclick="generateEmail('friendly')" style="background:#0d9488;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;margin-right:5px">😊 Friendly</button>
-<button onclick="generateEmail('professional')" style="background:#3b82f6;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;margin-right:5px">💼 Professional</button>
-<button onclick="generateEmail('casual')" style="background:#f59e0b;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px">😎 Casual</button>
+<button onclick="regenerateEmail('friendly')" style="background:#0d9488;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;margin-right:5px">😊 Friendly</button>
+<button onclick="regenerateEmail('professional')" style="background:#3b82f6;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;margin-right:5px">💼 Professional</button>
+<button onclick="regenerateEmail('casual')" style="background:#f59e0b;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px">😎 Casual</button>
 </div>
 <div id="emailPreview" style="display:none">
 <label style="font-weight:bold;font-size:13px">Subject:</label>
@@ -1403,10 +1352,11 @@ def audit_page():
 let currentItem = null;
 let currentAuditReport = null;
 let autoMode = false;
-let currentMode = null;
+let autoTone = 'friendly';
+let pendingAction = false; // Guard against double-processing
 
 // ============================================
-// QUEUE MANAGEMENT
+// QUEUE
 // ============================================
 async function loadQueue(){
   try{
@@ -1414,7 +1364,6 @@ async function loadQueue(){
     const data = await res.json();
     const c = document.getElementById('queueList');
     document.getElementById('queueCount').textContent = data.items.length;
-    // Progress
     const total = data.items.length;
     const done = data.items.filter(i=>i.status==='done'||i.status==='skipped').length;
     if(total > 0){
@@ -1423,11 +1372,10 @@ async function loadQueue(){
       document.getElementById('progressFill').style.width = pct + '%';
       document.getElementById('progressFill').textContent = pct + '% (' + done + '/' + total + ')';
     }
-    if(total === 0){ c.innerHTML='<p style="color:#666">Queue empty. Import emails above to start.</p>'; return; }
+    if(total === 0){ c.innerHTML='<p style="color:#666">Queue empty. Import emails above.</p>'; return; }
     let html='';
     data.items.forEach(i=>{
-      let icon = '⏳';
-      let color = '#f59e0b';
+      let icon = '⏳'; let color = '#f59e0b';
       if(i.status==='done'){ icon='✅'; color='#16a34a'; }
       else if(i.status==='current'){ icon='▶️'; color='#3b82f6'; }
       else if(i.status==='skipped'){ icon='⏭️'; color='#6b7280'; }
@@ -1437,7 +1385,7 @@ async function loadQueue(){
       if(i.status === 'pending' || i.status === 'current'){
         html += '<button onclick="analyzeItem('+i.id+')" style="background:#3b82f6;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">Analyze</button>';
         html += '<button onclick="skipItem('+i.id+')" style="background:#6b7280;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">Skip</button>';
-      } else if(i.status==='done' || i.status==='skipped'){
+      } else {
         html += '<button onclick="resetItem('+i.id+')" style="background:#f59e0b;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">Undo</button>';
       }
       html += '</div></div>';
@@ -1448,7 +1396,7 @@ async function loadQueue(){
 
 async function importFrom(source){
   const status = document.getElementById('importStatus');
-  status.innerHTML = '<p style="color:#666">⏳ Importing from '+source+'...</p>';
+  status.innerHTML = '<p style="color:#666">⏳ Importing...</p>';
   try{
     const res = await fetch('/import-to-queue', {
       method:'POST', headers:{'Content-Type':'application/json'},
@@ -1456,7 +1404,7 @@ async function importFrom(source){
     });
     const data = await res.json();
     if(data.success){
-      status.innerHTML = '<p style="color:green">✅ Added '+data.added+' (skipped '+data.skipped+' duplicates)</p>';
+      status.innerHTML = '<p style="color:green">✅ Added '+data.added+' (skipped '+data.skipped+')</p>';
       loadQueue();
     } else { status.innerHTML = '<p style="color:red">Error: '+(data.error||'Unknown')+'</p>'; }
   }catch(e){ status.innerHTML = '<p style="color:red">Error: '+e.message+'</p>'; }
@@ -1488,6 +1436,7 @@ async function clearQueue(){
 async function skipItem(id){
   await fetch('/update-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id, status:'skipped'})});
   loadQueue();
+  if(autoMode) nextAuto();
 }
 
 async function resetItem(id){
@@ -1503,7 +1452,6 @@ async function analyzeItem(id){
   document.getElementById('auditResult').innerHTML = '<p style="color:#666;padding:20px;text-align:center">⏳ Running audit... 30-45 seconds</p>';
   document.getElementById('outreachSection').style.display = 'none';
   document.getElementById('currentEmailLabel').textContent = '🔍 Loading...';
-  // Mark as current
   await fetch('/update-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id, status:'current'})});
   try{
     const res = await fetch('/analyze-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})});
@@ -1514,14 +1462,24 @@ async function analyzeItem(id){
       document.getElementById('currentEmailLabel').textContent = '📧 ' + currentItem.email + '  →  ' + currentItem.domain;
       renderReport(data.item.report);
       document.getElementById('outreachSection').style.display = 'block';
-      // auto-generate friendly email
-      generateEmail('friendly');
+      // Auto-generate email with the chosen tone
+      await generateEmail(autoTone);
       loadQueue();
+      // If in auto mode, auto-proceed after a short delay
+      if(autoMode && !pendingAction){
+        pendingAction = true;
+        setTimeout(async()=>{
+          pendingAction = false;
+          await autoSend();
+        }, 1500);
+      }
     } else {
       document.getElementById('auditResult').innerHTML = '<p style="color:red">Error: '+(data.error||'Unknown')+'</p>';
+      if(autoMode) setTimeout(nextAuto, 3000);
     }
   }catch(e){
     document.getElementById('auditResult').innerHTML = '<p style="color:red">Error: '+e.message+'</p>';
+    if(autoMode) setTimeout(nextAuto, 3000);
   }
 }
 
@@ -1534,17 +1492,17 @@ function renderReport(r){
   h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:15px"><h2 style="margin:0">Store Audit Overview</h2><div style="color:#666;font-size:13px;margin-top:6px">Store: <a href="https://'+r.domain+'" target="_blank" style="color:#3b82f6">https://'+r.domain+'/</a></div>'+(r.case_id?'<div style="background:#f3f4f6;padding:6px 12px;border-radius:6px;font-size:13px;color:#374151;margin-top:8px;display:inline-block">Case ID: <b>'+r.case_id+'</b></div>':'')+'</div>';
   h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:15px"><h3 style="margin-top:0">📈 Scores</h3>'+scoreBar('Overall',sc.overall_score||0)+scoreBar('Trust',sc.trust_score||0)+scoreBar('Technical',sc.technical_score||0)+scoreBar('Marketing',sc.marketing_score||0)+'</div>';
   const hi=iss.filter(i=>i.severity==='high');
-  if(hi.length>0)h+='<div style="background:#fef2f2;border-left:4px solid #ef4444;padding:15px;border-radius:8px;margin-bottom:15px"><div style="color:#991b1b;font-weight:bold">⚠️ '+hi.length+' critical issue(s) found</div></div>';
+  if(hi.length>0)h+='<div style="background:#fef2f2;border-left:4px solid #ef4444;padding:15px;border-radius:8px;margin-bottom:15px"><div style="color:#991b1b;font-weight:bold">⚠️ '+hi.length+' critical issue(s)</div></div>';
   if(iss.length>0){h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:15px"><h3 style="margin-top:0;color:#991b1b">⚠️ Issues ('+iss.length+')</h3>';iss.forEach(i=>{const c=i.severity==='high'?'#ef4444':(i.severity==='medium'?'#f59e0b':'#6b7280');h+='<div style="background:#fef2f2;border-left:4px solid '+c+';padding:12px;border-radius:6px;margin:8px 0"><div style="font-weight:bold;font-size:14px">⚠️ '+i.title+'</div><div style="color:#374151;font-size:13px;margin:4px 0">'+i.description+'</div><div style="background:#fef3c7;padding:8px;border-radius:5px;font-size:12px;color:#78350f"><b>💡</b> '+i.recommendation+'</div></div>'});h+='</div>'}
-  if(r.positives&&r.positives.length>0){h+='<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:12px;border-radius:6px;margin-bottom:15px"><b style="color:#166534">✅ What Works Well</b>';r.positives.forEach(p=>{h+='<div style="margin:4px 0;color:#14532d;font-size:13px">✅ '+p+'</div>'});h+='</div>'}
+  if(r.positives&&r.positives.length>0){h+='<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:12px;border-radius:6px;margin-bottom:15px"><b style="color:#166534">✅ Works Well</b>';r.positives.forEach(p=>{h+='<div style="margin:4px 0;color:#14532d;font-size:13px">✅ '+p+'</div>'});h+='</div>'}
   document.getElementById('auditResult').innerHTML=h;
 }
 
 // ============================================
-// EMAIL GENERATION
+// EMAIL GEN
 // ============================================
 async function generateEmail(tone){
-  if(!currentAuditReport){ alert('No audit yet'); return; }
+  if(!currentAuditReport){ return; }
   const senderName = document.getElementById('senderName').value.trim();
   try{
     const res = await fetch('/generate-email', {
@@ -1560,7 +1518,12 @@ async function generateEmail(tone){
         fetch('/save-sender-name',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sender_name:senderName})});
       }
     }
-  }catch(e){ alert('Error: '+e.message); }
+  }catch(e){ console.error(e); }
+}
+
+async function regenerateEmail(tone){
+  autoTone = tone;
+  await generateEmail(tone);
 }
 
 async function sendToScoutAndOpen(){
@@ -1568,33 +1531,17 @@ async function sendToScoutAndOpen(){
   const subj = document.getElementById('genSubject').value;
   const body = document.getElementById('genBody').value;
   if(!subj || !body){ alert('Generate email first'); return; }
-  // Save subject + message to current item
-  await fetch('/update-queue-item', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({id:currentItem.id, subject:subj, message:body})
-  });
-  // Add to scout
-  await fetch('/save-scout-recipients', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({recipients: [currentItem.email]})
-  });
-  await fetch('/save-scout-state', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({recipients: [currentItem.email], subject:subj, message:body, count:0})
-  });
-  // Mark as done
-  await fetch('/update-queue-item', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({id:currentItem.id, status:'done'})
-  });
-  await fetch('/mark-sent', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({email: currentItem.email})
-  });
+  // Save subject + message
+  await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentItem.id, subject:subj, message:body})});
+  // Add to Scout
+  await fetch('/save-scout-recipients', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [currentItem.email]})});
+  await fetch('/save-scout-state', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [currentItem.email], subject:subj, message:body, count:0})});
+  // Mark done + sent
+  await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentItem.id, status:'done'})});
+  await fetch('/mark-sent', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({email: currentItem.email})});
   // Open Gmail
   const mailto = 'mailto:' + currentItem.email + '?subject=' + encodeURIComponent(subj) + '&body=' + encodeURIComponent(body);
   window.location.href = mailto;
-  // In auto mode, will advance when user returns
 }
 
 async function skipCurrent(){
@@ -1603,29 +1550,32 @@ async function skipCurrent(){
   currentItem = null;
   document.getElementById('auditSection').style.display = 'none';
   loadQueue();
-  if(autoMode){ nextAuto(); }
+  if(autoMode) nextAuto();
 }
 
 // ============================================
-// AUTO MODE
+// AUTO MODE (FULLY AUTOMATED)
 // ============================================
 async function startManualMode(){
-  currentMode = 'manual';
+  autoMode = false;
   document.getElementById('modeStatus').innerHTML = '<p style="color:blue">▶️ Manual mode: click each email to analyze</p>';
   document.getElementById('stopBtn').style.display = 'none';
 }
 
 async function startAutoMode(){
-  currentMode = 'auto';
+  const tone = prompt('Choose tone:\\n1 = Friendly\\n2 = Professional\\n3 = Casual\\n\\nEnter 1, 2, or 3 (default 1)', '1');
+  if(tone === '2') autoTone = 'professional';
+  else if(tone === '3') autoTone = 'casual';
+  else autoTone = 'friendly';
   autoMode = true;
-  document.getElementById('modeStatus').innerHTML = '<p style="color:green">⚡ Auto mode ON — processing queue automatically</p>';
+  document.getElementById('modeStatus').innerHTML = '<p style="color:green">⚡ Auto mode ON ('+autoTone+') — processing queue</p>';
   document.getElementById('stopBtn').style.display = 'inline-block';
   nextAuto();
 }
 
-async function stopAutoMode(){
+function stopAutoMode(){
   autoMode = false;
-  currentMode = null;
+  pendingAction = false;
   document.getElementById('modeStatus').innerHTML = '<p style="color:red">⏹️ Auto mode stopped</p>';
   document.getElementById('stopBtn').style.display = 'none';
 }
@@ -1643,14 +1593,45 @@ async function nextAuto(){
       document.getElementById('modeStatus').innerHTML = '<p style="color:blue">🎉 Auto complete! All emails processed.</p>';
       document.getElementById('stopBtn').style.display = 'none';
     }
-  }catch(e){ console.error(e); }
+  }catch(e){ console.error(e); if(autoMode) setTimeout(nextAuto, 3000); }
 }
 
-// Resume auto mode when user returns
+// The KEY fix: autoSend for auto mode
+async function autoSend(){
+  if(!autoMode) return;
+  if(!currentItem) { nextAuto(); return; }
+  const subj = document.getElementById('genSubject').value;
+  const body = document.getElementById('genBody').value;
+  if(!subj || !body){
+    // Skip on failure
+    await fetch('/update-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentItem.id, status:'skipped'})});
+    nextAuto();
+    return;
+  }
+  // Save + mark done + open Gmail
+  await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentItem.id, subject:subj, message:body})});
+  await fetch('/save-scout-recipients', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [currentItem.email]})});
+  await fetch('/save-scout-state', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [currentItem.email], subject:subj, message:body, count:0})});
+  await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentItem.id, status:'done'})});
+  await fetch('/mark-sent', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({email: currentItem.email})});
+  loadQueue();
+  // Open Gmail
+  const mailto = 'mailto:' + currentItem.email + '?subject=' + encodeURIComponent(subj) + '&body=' + encodeURIComponent(body);
+  // Store the id we just sent so we know when user comes back
+  localStorage.setItem('lastAutoSentId', currentItem.id.toString());
+  window.location.href = mailto;
+}
+
+// When user returns to the app after Gmail, advance to next email
 document.addEventListener('visibilitychange', function(){
-  if(document.visibilityState === 'visible' && autoMode && currentItem){
-    // The previous email was opened; mark done already happened. Advance to next.
-    setTimeout(nextAuto, 2000);
+  if(document.visibilityState === 'visible' && autoMode){
+    const lastSent = localStorage.getItem('lastAutoSentId');
+    if(lastSent){
+      localStorage.removeItem('lastAutoSentId');
+      // User came back from Gmail — advance to next
+      currentItem = null;
+      setTimeout(nextAuto, 1500);
+    }
   }
 });
 
@@ -1659,7 +1640,7 @@ window.onload = function(){ loadQueue(); };
     return render_page("Analyze & Send", body)
 
 # ==========================================
-# QUEUE API ROUTES
+# QUEUE API
 # ==========================================
 @app.route('/get-audit-queue')
 @login_required
@@ -1681,7 +1662,6 @@ def import_to_queue():
             state = load_user_state(user_email)
             emails = state.get('verified_emails', [])
             if not emails:
-                # fall back to most recent completed verify job
                 conn = get_db()
                 if conn:
                     try:
@@ -1691,13 +1671,10 @@ def import_to_queue():
                         if row and row[0]: emails = row[0].split('|||')
                     except: pass
                     finally: release_db(conn)
-        elif source == 'discovery':
-            # Discovery stores don't have emails yet - skip
-            return jsonify({'success': False, 'error': 'Discovery only has store URLs, not emails. Run Email Finder first.'})
         else:
             return jsonify({'success': False, 'error': 'Unknown source'})
         if not emails:
-            return jsonify({'success': False, 'error': 'No emails available from this source'})
+            return jsonify({'success': False, 'error': 'No emails available'})
         added, skipped = add_to_queue(user_email, emails)
         return jsonify({'success': True, 'added': added, 'skipped': skipped})
     except Exception as e:
@@ -1750,10 +1727,8 @@ def analyze_queue_item():
     item_id = request.json.get('id')
     item = get_queue_item(item_id, user_email)
     if not item: return jsonify({'success': False, 'error': 'Item not found'})
-    # If already has report, return cached
     if item.get('report'):
         return jsonify({'success': True, 'item': item})
-    # Run audit
     case_id = generate_case_id()
     report = audit_store(item['domain'], case_id)
     update_queue_item(item_id, user_email, report=report, status='current')
@@ -1761,9 +1736,6 @@ def analyze_queue_item():
     item = get_queue_item(item_id, user_email)
     return jsonify({'success': True, 'item': item})
 
-# ==========================================
-# OTHER API ROUTES
-# ==========================================
 @app.route('/save-sender-name', methods=['POST'])
 @login_required
 def save_sender_name():
@@ -1782,7 +1754,7 @@ def generate_email_route():
     sender_name = data.get('sender_name', '').strip()
     if not sender_name:
         sender_name = get_user_sender_name(session.get('user_id')) or ''
-    if not report: return jsonify({'success': False, 'error': 'No report data'})
+    if not report: return jsonify({'success': False, 'error': 'No report'})
     try:
         result = generate_outreach_email(report, tone, sender_name)
         return jsonify({'success': True, 'subject': result['subject'], 'body': result['body']})
@@ -1849,13 +1821,6 @@ def get_stored_emails():
     user_email = session.get('user_id')
     state = load_user_state(user_email) if user_email else {}
     return jsonify({'emails': state.get('found_emails', [])})
-
-@app.route('/get-verified-emails')
-@login_required
-def get_verified_emails():
-    user_email = session.get('user_id')
-    state = load_user_state(user_email) if user_email else {}
-    return jsonify({'valid': state.get('verified_emails', [])})
 
 @app.route('/save-scout-recipients', methods=['POST'])
 @login_required
