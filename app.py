@@ -194,7 +194,7 @@ def load_user_state(user_email):
     finally: release_db(conn)
 
 # ==========================================
-# EMAIL SCAN HISTORY (last 3)
+# EMAIL SCAN HISTORY
 # ==========================================
 def save_email_scan(user_email, emails, store_count):
     conn = get_db()
@@ -202,13 +202,12 @@ def save_email_scan(user_email, emails, store_count):
     try:
         cur = conn.cursor()
         cur.execute("""INSERT INTO email_scans (user_email, emails, email_count, store_count)
-            VALUES (%s, %s, %s, %s)""",
-            (user_email, '|||'.join(emails), len(emails), store_count))
+            VALUES (%s, %s, %s, %s)""", (user_email, '|||'.join(emails), len(emails), store_count))
         cur.execute("""DELETE FROM email_scans WHERE user_email = %s
             AND id NOT IN (SELECT id FROM email_scans WHERE user_email = %s
             ORDER BY created_at DESC LIMIT 3)""", (user_email, user_email))
         conn.commit(); cur.close()
-    except Exception as e: print(f"save_email_scan: {e}")
+    except: pass
     finally: release_db(conn)
 
 def get_email_scans(user_email):
@@ -235,20 +234,19 @@ def get_email_scan_detail(scan_id, user_email):
     finally: release_db(conn)
 
 # ==========================================
-# AUDIT HISTORY (last 3)
+# AUDIT HISTORY
 # ==========================================
 def save_audit_history(user_email, domain, report):
     conn = get_db()
     if not conn: return
     try:
         cur = conn.cursor()
-        cur.execute("""INSERT INTO audit_history (user_email, domain, report)
-            VALUES (%s, %s, %s)""", (user_email, domain, json.dumps(report)))
+        cur.execute("INSERT INTO audit_history (user_email, domain, report) VALUES (%s, %s, %s)", (user_email, domain, json.dumps(report)))
         cur.execute("""DELETE FROM audit_history WHERE user_email = %s
             AND id NOT IN (SELECT id FROM audit_history WHERE user_email = %s
             ORDER BY created_at DESC LIMIT 3)""", (user_email, user_email))
         conn.commit(); cur.close()
-    except Exception as e: print(f"save_audit: {e}")
+    except: pass
     finally: release_db(conn)
 
 def get_audit_history(user_email):
@@ -256,13 +254,11 @@ def get_audit_history(user_email):
     if not conn: return []
     try:
         cur = conn.cursor()
-        cur.execute("""SELECT id, domain, report, created_at FROM audit_history
-            WHERE user_email = %s ORDER BY created_at DESC LIMIT 3""", (user_email,))
+        cur.execute("SELECT id, domain, report, created_at FROM audit_history WHERE user_email = %s ORDER BY created_at DESC LIMIT 3", (user_email,))
         rows = cur.fetchall(); cur.close()
         results = []
         for r in rows:
-            try:
-                score = json.loads(r[2]).get('scores', {}).get('overall_score', 0) if r[2] else 0
+            try: score = json.loads(r[2]).get('scores', {}).get('overall_score', 0) if r[2] else 0
             except: score = 0
             results.append({'id': r[0], 'domain': r[1], 'score': score, 'created_at': str(r[3])[:16]})
         return results
@@ -306,12 +302,13 @@ def background_verify_worker(job_id):
     if not conn: return
     try:
         cur = conn.cursor()
-        cur.execute("SELECT remaining_emails, valid_emails, invalid_emails FROM verify_jobs WHERE id = %s", (job_id,))
+        cur.execute("SELECT remaining_emails, valid_emails, invalid_emails, user_email FROM verify_jobs WHERE id = %s", (job_id,))
         row = cur.fetchone(); cur.close()
         if not row: return
         remaining = row[0].split('|||') if row[0] else []
         valid = row[1].split('|||') if row[1] else []
         invalid = row[2].split('|||') if row[2] else []
+        user_email = row[3]
     finally: release_db(conn)
     CHUNK_SIZE = 100
     while remaining:
@@ -342,6 +339,9 @@ def background_verify_worker(job_id):
                  '|||'.join(remaining), new_status, job_id))
             conn.commit(); cur.close()
         finally: release_db(conn)
+    # Save completed job's results to user_state so "From Verified" works
+    if user_email and valid:
+        save_user_state(user_email, verified_emails='|||'.join(valid))
 
 def find_emails(domain):
     domain = domain.strip().lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
@@ -693,7 +693,7 @@ def logout():
     session.clear(); return redirect('/login')
 
 # ==========================================
-# HOME (Email Finder with Last 3 Results)
+# HOME (Email Finder)
 # ==========================================
 @app.route('/')
 @login_required
@@ -939,7 +939,7 @@ async function downloadJob(jobId){const res=await fetch('/verify-results/'+jobId
 async function sendJobToScout(jobId){
   const res=await fetch('/verify-results/'+jobId);
   const data=await res.json();
-  if(!data.valid||data.valid.length===0){alert('No valid emails to send.');return}
+  if(!data.valid||data.valid.length===0){alert('No valid emails');return}
   await fetch('/save-scout-recipients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients:data.valid})});
   localStorage.setItem('scoutRecipients', JSON.stringify(data.valid));
   window.location.href='/scout';
@@ -949,7 +949,7 @@ window.onload=function(){refreshJobs();setInterval(refreshJobs,10000)};
     return render_page("Verify", body)
 
 # ==========================================
-# SCOUT PAGE (fixed loading)
+# SCOUT PAGE (with FIXED From Verified)
 # ==========================================
 @app.route('/scout')
 @login_required
@@ -1002,7 +1002,6 @@ function syncRecipients(){
   saveState();
 }
 window.onload=async function(){
-  // 1) Load from server FIRST
   try{
     const res=await fetch('/load-scout-state');
     const data=await res.json();
@@ -1014,15 +1013,11 @@ window.onload=async function(){
     if(data.message) document.getElementById('messageBody').value = data.message;
     if(data.count) scoutedEmails = data.count;
   }catch(e){}
-  
-  // 2) Handle preload from URL param
   const preload = new URLSearchParams(window.location.search).get('add');
   if(preload){
     const ta = document.getElementById('emailsInput');
     if(ta && !ta.value) ta.value = preload;
   }
-  
-  // 3) Fallback: load from localStorage if still empty
   if(!recipients || recipients.length === 0){
     try{
       const saved = localStorage.getItem('scoutRecipients');
@@ -1035,13 +1030,10 @@ window.onload=async function(){
       }
     }catch(e){}
   }
-  
-  // 4) Sync recipients from textarea as last step
   const currentValue = document.getElementById('emailsInput').value.trim();
   if(currentValue){
     recipients = currentValue.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);
   }
-  
   updateUI();
 };
 function updateUI(){
@@ -1056,12 +1048,7 @@ async function saveState(){
     await fetch('/save-scout-state',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({
-        recipients:recipients,
-        subject:document.getElementById('subjectLine').value,
-        message:document.getElementById('messageBody').value,
-        count:scoutedEmails
-      })
+      body:JSON.stringify({recipients:recipients,subject:document.getElementById('subjectLine').value,message:document.getElementById('messageBody').value,count:scoutedEmails})
     });
   }catch(e){}
 }
@@ -1074,12 +1061,38 @@ async function loadFromFinder(){
   } else { alert('No emails in Finder. Run a scan first.'); }
 }
 async function loadFromVerified(){
-  const res=await fetch('/get-verified-emails');const data=await res.json();
-  if(data.valid&&data.valid.length>0){
-    recipients=data.valid;
-    document.getElementById('emailsInput').value=recipients.join('\\n');
+  // Try user_state first
+  let res=await fetch('/get-verified-emails');
+  let data=await res.json();
+  let emails = (data.valid && data.valid.length > 0) ? data.valid : [];
+  
+  // If empty, fetch from the most recent completed verify job
+  if(emails.length === 0){
+    try{
+      const jobsRes = await fetch('/verify-jobs');
+      const jobsData = await jobsRes.json();
+      if(jobsData.jobs && jobsData.jobs.length > 0){
+        for(const job of jobsData.jobs){
+          if(job.status === 'completed' && job.valid > 0){
+            const jobRes = await fetch('/verify-results/' + job.id);
+            const jobData = await jobRes.json();
+            if(jobData.valid && jobData.valid.length > 0){
+              emails = jobData.valid;
+              break;
+            }
+          }
+        }
+      }
+    }catch(e){}
+  }
+  
+  if(emails.length > 0){
+    recipients = emails;
+    document.getElementById('emailsInput').value = recipients.join('\\n');
     updateUI();saveState();
-  } else { alert('No verified emails yet.'); }
+  } else {
+    alert('No verified emails yet. Run a verification first.');
+  }
 }
 function clearAll(){
   recipients=[];scoutedEmails=0;
