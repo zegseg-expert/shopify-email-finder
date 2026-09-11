@@ -97,10 +97,15 @@ def init_db():
             has_email BOOLEAN DEFAULT FALSE,
             discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_email, domain))""")
+        # NEW: email_scans with results JSON (store+email pairs)
         cur.execute("""CREATE TABLE IF NOT EXISTS email_scans (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
-            emails TEXT, email_count INTEGER DEFAULT 0, store_count INTEGER DEFAULT 0,
+            results JSONB, email_count INTEGER DEFAULT 0, store_count INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        # Backward compatibility: add column if not exists (for old table)
+        try:
+            cur.execute("ALTER TABLE email_scans ADD COLUMN IF NOT EXISTS results JSONB")
+        except: pass
         cur.execute("""CREATE TABLE IF NOT EXISTS audit_history (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             domain VARCHAR(255) NOT NULL, report JSONB,
@@ -194,20 +199,23 @@ def load_user_state(user_email):
     finally: release_db(conn)
 
 # ==========================================
-# EMAIL SCAN HISTORY
+# EMAIL SCAN HISTORY (with store+email pairs)
 # ==========================================
-def save_email_scan(user_email, emails, store_count):
+def save_email_scan(user_email, results, store_count):
+    """results = [{'store': 'x.com', 'emails': ['a@x.com','b@x.com']}, ...]"""
     conn = get_db()
     if not conn: return
     try:
+        total_emails = sum(len(r.get('emails', [])) for r in results)
         cur = conn.cursor()
-        cur.execute("""INSERT INTO email_scans (user_email, emails, email_count, store_count)
-            VALUES (%s, %s, %s, %s)""", (user_email, '|||'.join(emails), len(emails), store_count))
+        cur.execute("""INSERT INTO email_scans (user_email, results, email_count, store_count)
+            VALUES (%s, %s, %s, %s)""",
+            (user_email, json.dumps(results), total_emails, store_count))
         cur.execute("""DELETE FROM email_scans WHERE user_email = %s
             AND id NOT IN (SELECT id FROM email_scans WHERE user_email = %s
             ORDER BY created_at DESC LIMIT 3)""", (user_email, user_email))
         conn.commit(); cur.close()
-    except: pass
+    except Exception as e: print(f"save_email_scan: {e}")
     finally: release_db(conn)
 
 def get_email_scans(user_email):
@@ -227,9 +235,12 @@ def get_email_scan_detail(scan_id, user_email):
     if not conn: return []
     try:
         cur = conn.cursor()
-        cur.execute("SELECT emails FROM email_scans WHERE id = %s AND user_email = %s", (scan_id, user_email))
+        cur.execute("SELECT results FROM email_scans WHERE id = %s AND user_email = %s", (scan_id, user_email))
         row = cur.fetchone(); cur.close()
-        return row[0].split('|||') if row and row[0] else []
+        if row and row[0]:
+            try: return json.loads(row[0])
+            except: return []
+        return []
     except: return []
     finally: release_db(conn)
 
@@ -339,7 +350,6 @@ def background_verify_worker(job_id):
                  '|||'.join(remaining), new_status, job_id))
             conn.commit(); cur.close()
         finally: release_db(conn)
-    # Save completed job's results to user_state so "From Verified" works
     if user_email and valid:
         save_user_state(user_email, verified_emails='|||'.join(valid))
 
@@ -495,8 +505,21 @@ def save_discovered(user_email, stores):
     return saved
 
 # ==========================================
-# AUDIT
+# AUDIT (Enhanced with 8 new checks)
 # ==========================================
+def whois_lookup_age(domain):
+    """Get domain age in months"""
+    try:
+        import whois
+        w = whois.whois(domain)
+        if w.creation_date:
+            cd = w.creation_date
+            if isinstance(cd, list): cd = cd[0]
+            delta = datetime.now() - cd
+            return int(delta.days / 30)
+    except: pass
+    return None
+
 def audit_store(domain, case_id):
     raw = domain.strip().lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
     report = {"domain": raw, "case_id": case_id, "audited_at": datetime.now().isoformat(), "checks": {}, "scores": {}, "issues": [], "positives": []}
@@ -504,6 +527,8 @@ def audit_store(domain, case_id):
         report['error'] = "Invalid domain"; return report
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept-Language": "en-US,en;q=0.5"}
     base_url = f"https://{raw}"
+
+    # CHECK 1: HTTPS + speed
     try:
         start = time.time()
         r = requests.get(base_url, headers=headers, timeout=10, allow_redirects=True)
@@ -516,33 +541,68 @@ def audit_store(domain, case_id):
     except Exception as e:
         report["checks"]["https"] = False
         report["error"] = f"Could not reach store: {str(e)[:100]}"; return report
+
+    # CHECK 2: Shopify
     is_shop = any(x in html.lower() for x in ['cdn.shopify.com', 'shopify.theme', 'shopify-section', 'myshopify.com'])
     report["checks"]["is_shopify"] = is_shop
     if is_shop: report["positives"].append("Confirmed Shopify store")
+
+    # CHECK 3: Products
     try:
         r2 = requests.get(f"{base_url}/products.json?limit=250", headers=headers, timeout=10)
         if r2.status_code == 200:
-            pc = len(r2.json().get('products', []))
+            products_data = r2.json().get('products', [])
+            pc = len(products_data)
             report["checks"]["product_count"] = pc; report["checks"]["product_count_capped"] = (pc == 250)
             if pc == 0: report["issues"].append({"title": "No Products Visible", "description": "No products.", "recommendation": "Add products.", "severity": "high"})
             elif pc < 10: report["issues"].append({"title": f"Only {pc} Products", "description": "Few products.", "recommendation": "Aim for 20+.", "severity": "medium"})
             else: report["positives"].append(f"{pc}+ products")
+
+            # CHECK 11: Image size (largest image)
+            max_img_kb = 0
+            for p in products_data[:10]:
+                for img in p.get('images', [])[:3]:
+                    src = img.get('src', '')
+                    if src:
+                        try:
+                            hr = requests.head(src, headers=headers, timeout=5, allow_redirects=True)
+                            cl = hr.headers.get('content-length')
+                            if cl:
+                                kb = int(cl) / 1024
+                                if kb > max_img_kb: max_img_kb = kb
+                        except: pass
+            if max_img_kb > 0:
+                report["checks"]["max_image_kb"] = round(max_img_kb, 1)
+                if max_img_kb > 1000:
+                    report["issues"].append({"title": "Images Too Large", "description": f"Largest product image is {round(max_img_kb)}KB.", "recommendation": "Compress to under 300KB.", "severity": "medium"})
+                else:
+                    report["positives"].append("Images optimized")
     except: report["checks"]["product_count"] = None
+
+    # CHECK 4: Theme
     tm = re.search(r'"theme_name"\s*:\s*"([^"]+)"', html)
     report["checks"]["theme"] = tm.group(1) if tm else "Unknown"
+
+    # CHECK 5: Mobile
     hv = 'name="viewport"' in html.lower()
     report["checks"]["mobile_responsive"] = hv
     if hv: report["positives"].append("Mobile responsive")
     else: report["issues"].append({"title": "Not Mobile Responsive", "description": "Missing viewport.", "recommendation": "Use mobile theme.", "severity": "high"})
+
+    # CHECK 6: Contact
     he = bool(re.search(r'mailto:[^"\']+', html)); hp = bool(re.search(r'tel:[^"\']+', html))
     report["checks"]["has_email_link"] = he; report["checks"]["has_phone_link"] = hp
     report["checks"]["has_contact_page"] = 'contact' in html.lower()
     if he or hp: report["positives"].append("Contact info present")
     else: report["issues"].append({"title": "No Contact Info", "description": "No email/phone.", "recommendation": "Add Contact page.", "severity": "high"})
+
+    # CHECK 7: Socials
     socials = [p.split('.')[0] for p in ['facebook.com','instagram.com','twitter.com','tiktok.com','youtube.com','pinterest.com'] if p in html.lower()]
     report["checks"]["social_links"] = socials
     if len(socials) >= 2: report["positives"].append(f"{len(socials)} socials")
     elif len(socials) == 0: report["issues"].append({"title": "No Social Media", "description": "None found.", "recommendation": "Add social profiles.", "severity": "medium"})
+
+    # CHECK 8: Policies
     pols = ['/policies/refund-policy','/policies/privacy-policy','/policies/terms-of-service','/policies/shipping-policy']
     pf = [0]
     def cp(p):
@@ -554,8 +614,12 @@ def audit_store(domain, case_id):
     report["checks"]["policy_pages_found"] = f"{pf[0]}/4"
     if pf[0] == 4: report["positives"].append("All policies present")
     elif pf[0] < 2: report["issues"].append({"title": f"Missing {4-pf[0]} Policies", "description": f"Only {pf[0]}/4.", "recommendation": "Add in Settings.", "severity": "high"})
+
+    # CHECK 9: Currency
     cm = re.search(r'"currency"\s*:\s*"([A-Z]{3})"', html)
     report["checks"]["currency"] = cm.group(1) if cm else "Unknown"
+
+    # CHECK 10: Apps
     apps = []
     for name, sigs in {"Klaviyo":["klaviyo"],"Judge.me":["judge.me"],"Yotpo":["yotpo"],"Loox":["loox.io"],"ReConvert":["reconvert"],"Recharge":["rechargepayments"],"Tidio":["tidio"],"Gorgias":["gorgias"],"Facebook Pixel":["connect.facebook.net","fbq("],"Google Analytics":["google-analytics.com","gtag("],"TikTok Pixel":["analytics.tiktok.com"]}.items():
         for s in sigs:
@@ -563,30 +627,173 @@ def audit_store(domain, case_id):
     report["checks"]["detected_apps"] = apps
     ha = any('Pixel' in a or 'Analytics' in a for a in apps)
     if not ha: report["issues"].append({"title": "No Tracking Pixel", "description": "No pixel.", "recommendation": "Install tracking.", "severity": "high"})
+
+    # ==========================================
+    # NEW CHECK 12: Payment methods
+    # ==========================================
+    payments = []
+    html_low = html.lower()
+    payment_sigs = {
+        "PayPal": ["paypal.com/sdk", "paypal-button", "paypalobjects"],
+        "Stripe": ["js.stripe.com", "stripe.com/v3"],
+        "Klarna": ["klarna.com", "klarna-checkout"],
+        "Afterpay": ["afterpay.com", "afterpay"],
+        "Apple Pay": ["apple-pay", "applepay"],
+        "Google Pay": ["google-pay", "googlepay"],
+        "Shop Pay": ["shop-pay", "shop_pay", "shoppay"],
+        "Amazon Pay": ["amazonpay", "amazon-pay"],
+        "Affirm": ["affirm.com", "affirm-"],
+        "Zip": ["zip.co", "zip-payments"]
+    }
+    for name, sigs in payment_sigs.items():
+        for s in sigs:
+            if s in html_low:
+                payments.append(name); break
+    report["checks"]["payment_methods"] = payments
+    if len(payments) >= 2:
+        report["positives"].append(f"{len(payments)} payment options")
+    elif len(payments) <= 1:
+        report["issues"].append({
+            "title": "Limited Payment Options",
+            "description": f"Only {len(payments)} payment method(s) detected." + (" (credit card only)" if not payments else ""),
+            "recommendation": "Add PayPal, Shop Pay, and Apple Pay. Stores with 3+ options convert 20% better.",
+            "severity": "medium"
+        })
+
+    # ==========================================
+    # NEW CHECK 13: Reviews app
+    # ==========================================
+    review_apps = []
+    for name, sigs in {"Judge.me":["judge.me","judgeme"],"Loox":["loox.io"],"Yotpo":["yotpo"],"Okendo":["okendo"],"Stamped":["stamped.io"],"Reviews.io":["reviews.io"],"Trustpilot":["trustpilot"]}.items():
+        for s in sigs:
+            if s in html_low: review_apps.append(name); break
+    report["checks"]["review_apps"] = review_apps
+    if review_apps:
+        report["positives"].append(f"Reviews: {', '.join(review_apps)}")
+    else:
+        report["issues"].append({
+            "title": "No Reviews App",
+            "description": "No customer review system detected.",
+            "recommendation": "Install Judge.me (free) or Loox. Reviews increase conversion by 15-30%.",
+            "severity": "high"
+        })
+
+    # ==========================================
+    # NEW CHECK 14: Shipping info
+    # ==========================================
+    has_free_shipping_banner = any(x in html_low for x in ['free shipping', 'free delivery', 'shipping on us'])
+    has_shipping_page = False
+    try:
+        sr = requests.get(f"{base_url}/policies/shipping-policy", headers=headers, timeout=5)
+        has_shipping_page = (sr.status_code == 200)
+    except: pass
+    report["checks"]["free_shipping_advertised"] = has_free_shipping_banner
+    report["checks"]["shipping_page_exists"] = has_shipping_page
+    if has_free_shipping_banner:
+        report["positives"].append("Free shipping advertised")
+    else:
+        report["issues"].append({
+            "title": "No Free Shipping Banner",
+            "description": "Free shipping is the #1 reason customers choose a store.",
+            "recommendation": "Add a free shipping threshold. Even $50+ free shipping boosts AOV.",
+            "severity": "medium"
+        })
+
+    # ==========================================
+    # NEW CHECK 15: Cart type
+    # ==========================================
+    is_drawer_cart = any(x in html_low for x in ['cart-drawer', 'cart__drawer', 'drawer__cart', 'cart-notification'])
+    is_page_cart = '/cart' in html_low and not is_drawer_cart
+    report["checks"]["cart_type"] = "drawer" if is_drawer_cart else ("page" if is_page_cart else "unknown")
+    if is_drawer_cart:
+        report["positives"].append("Modern drawer cart")
+    elif is_page_cart:
+        report["issues"].append({
+            "title": "Page-Based Cart",
+            "description": "Cart opens as a full page instead of a slide-in drawer.",
+            "recommendation": "Switch to a drawer cart. It converts 15-25% better.",
+            "severity": "medium"
+        })
+
+    # ==========================================
+    # NEW CHECK 16: SEO meta
+    # ==========================================
+    title_match = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
+    desc_match = re.search(r'<meta[^>]*name=["\']description["\'][^>]*content=["\'](.*?)["\']', html, re.IGNORECASE | re.DOTALL)
+    page_title = title_match.group(1).strip() if title_match else ""
+    page_desc = desc_match.group(1).strip() if desc_match else ""
+    report["checks"]["meta_title"] = page_title[:100] + ("..." if len(page_title) > 100 else "")
+    report["checks"]["meta_title_length"] = len(page_title)
+    report["checks"]["meta_description_length"] = len(page_desc)
+    if len(page_title) == 0:
+        report["issues"].append({"title": "Missing Page Title", "description": "No `<title>` tag.", "recommendation": "Add SEO title (50-60 chars).", "severity": "high"})
+    elif len(page_title) > 70:
+        report["issues"].append({"title": "Meta Title Too Long", "description": f"Title is {len(page_title)} chars (Google cuts at 60).", "recommendation": "Shorten to 50-60 chars.", "severity": "low"})
+    if len(page_desc) == 0:
+        report["issues"].append({"title": "Missing Meta Description", "description": "No description for search engines.", "recommendation": "Add 150-160 char description.", "severity": "medium"})
+    elif len(page_desc) > 170:
+        report["issues"].append({"title": "Meta Description Too Long", "description": f"Description is {len(page_desc)} chars.", "recommendation": "Keep under 160 chars.", "severity": "low"})
+
+    # ==========================================
+    # NEW CHECK 17: Store age (WHOIS)
+    # ==========================================
+    age_months = None
+    try:
+        import whois
+        w = whois.whois(raw)
+        cd = w.creation_date
+        if isinstance(cd, list): cd = cd[0]
+        if cd:
+            delta = datetime.now() - cd
+            age_months = int(delta.days / 30)
+    except: pass
+    report["checks"]["store_age_months"] = age_months
+    if age_months is not None:
+        if age_months < 6:
+            report["checks"]["store_age_label"] = f"{age_months} months (new)"
+        elif age_months < 12:
+            report["checks"]["store_age_label"] = f"{age_months} months"
+        else:
+            years = age_months // 12
+            report["checks"]["store_age_label"] = f"{years} year{'s' if years > 1 else ''}"
+
+    # ==========================================
+    # SCORES
+    # ==========================================
     trust = 0
-    if he or hp: trust += 30
-    trust += int((pf[0]/4)*40)
-    if len(socials) >= 2: trust += 20
-    elif len(socials) == 1: trust += 10
+    if he or hp: trust += 20
+    trust += int((pf[0]/4)*30)
+    if len(socials) >= 2: trust += 15
+    elif len(socials) == 1: trust += 8
     if is_shop: trust += 10
+    if review_apps: trust += 15
+    if len(payments) >= 2: trust += 10
     report["scores"]["trust_score"] = min(trust, 100)
+
     tech = 0
     if report["checks"].get("https"): tech += 25
-    if report["checks"].get("http_status") == 200: tech += 25
-    if hv: tech += 25
+    if report["checks"].get("http_status") == 200: tech += 15
+    if hv: tech += 20
     lt = report["checks"].get("load_time_seconds", 5)
-    if lt < 1.5: tech += 25
-    elif lt < 3: tech += 15
+    if lt < 1.5: tech += 20
+    elif lt < 3: tech += 12
     elif lt < 5: tech += 5
-    report["scores"]["technical_score"] = tech
-    mkt = min(len(apps)*8, 40)
-    if len(socials) >= 3: mkt += 30
-    elif len(socials) >= 1: mkt += 15
+    if is_drawer_cart: tech += 10
+    if report["checks"].get("max_image_kb") and report["checks"]["max_image_kb"] < 500: tech += 10
+    report["scores"]["technical_score"] = min(tech, 100)
+
+    mkt = 0
+    mkt += min(len(apps)*6, 30)
+    if len(socials) >= 3: mkt += 20
+    elif len(socials) >= 1: mkt += 10
     pc = report["checks"].get("product_count") or 0
-    if pc >= 10: mkt += 20
-    elif pc >= 5: mkt += 10
-    if ha: mkt += 10
+    if pc >= 10: mkt += 15
+    elif pc >= 5: mkt += 8
+    if ha: mkt += 15
+    if has_free_shipping_banner: mkt += 10
+    if len(payments) >= 3: mkt += 10
     report["scores"]["marketing_score"] = min(mkt, 100)
+
     report["scores"]["overall_score"] = int((report["scores"]["trust_score"] + report["scores"]["technical_score"] + report["scores"]["marketing_score"]) / 3)
     return report
 
@@ -693,7 +900,7 @@ def logout():
     session.clear(); return redirect('/login')
 
 # ==========================================
-# HOME (Email Finder)
+# HOME
 # ==========================================
 @app.route('/')
 @login_required
@@ -724,8 +931,8 @@ async function findBulkEmails(){
     if(data.success){
       let html='<h4 style="color:#155724">✅ '+data.results.length+' stores found:</h4>';
       data.results.forEach(item=>{
-        html+='<div style="font-weight:bold;margin-top:15px">📦 '+item.store+':</div>';
-        item.emails.forEach(e=>{html+='<div style="background:white;padding:8px;margin:5px 0;border-radius:5px;border-left:4px solid #667eea;font-weight:bold;word-break:break-all">'+e+'</div>'});
+        html+='<div style="font-weight:bold;margin-top:15px">📦 <a href="https://'+item.store+'" target="_blank" style="color:#333;text-decoration:none">'+item.store+'</a>:</div>';
+        item.emails.forEach(e=>{html+='<div style="background:white;padding:8px;margin:5px 0;border-radius:5px;border-left:4px solid #667eea;font-weight:bold;word-break:break-all">📧 '+e+'</div>'});
       });
       result.innerHTML=html;
       loadHistory();
@@ -753,9 +960,16 @@ async function viewScan(id){
   const res=await fetch('/get-email-scan/'+id);
   const data=await res.json();
   const c=document.getElementById('scan-'+id);
-  if(!data.emails || data.emails.length===0){c.innerHTML='<p style="color:#666">No emails in this scan.</p>';return}
-  let html='<div style="background:white;padding:10px;border-radius:6px;max-height:200px;overflow-y:auto;font-size:13px;word-break:break-all">';
-  data.emails.forEach(e=>{html+='<div style="padding:4px 0;border-bottom:1px solid #eee">📧 '+e+'</div>'});
+  if(!data.results || data.results.length===0){c.innerHTML='<p style="color:#666">No results in this scan.</p>';return}
+  let html='<div style="background:white;padding:10px;border-radius:6px;max-height:300px;overflow-y:auto;font-size:13px">';
+  data.results.forEach(r=>{
+    html+='<div style="padding:8px 0;border-bottom:1px solid #eee">';
+    html+='<div style="font-weight:bold;margin-bottom:4px">📦 <a href="https://'+r.store+'" target="_blank" style="color:#3b82f6;text-decoration:none">'+r.store+'</a></div>';
+    (r.emails||[]).forEach(e=>{
+      html+='<div style="padding-left:16px;color:#333;word-break:break-all">📧 '+e+'</div>';
+    });
+    html+='</div>';
+  });
   html+='</div>';
   c.innerHTML=html;
 }
@@ -815,7 +1029,7 @@ async function loadStores(){
   let html='';
   data.stores.forEach(s=>{
     html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid #8b5cf6;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
-    html+='<div><b>'+s.domain+'</b><br><span style="font-size:12px;color:#666">'+s.source+' · '+s.discovered_at+'</span></div>';
+    html+='<div><b><a href="https://'+s.domain+'" target="_blank" style="color:#3b82f6;text-decoration:none">'+s.domain+'</a></b><br><span style="font-size:12px;color:#666">'+s.source+' · '+s.discovered_at+'</span></div>';
     html+='<div style="display:flex;gap:6px;flex-wrap:wrap">';
     html+='<button onclick="actFindEmail(\\''+s.domain+'\\')" style="background:#667eea;color:white;padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">📧</button>';
     html+='<button onclick="actAudit(\\''+s.domain+'\\')" style="background:#65a30d;color:white;padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">🛡️</button>';
@@ -900,7 +1114,7 @@ def get_email_scans_route():
 @login_required
 def get_email_scan_detail_route(scan_id):
     user_email = session.get('user_id')
-    return jsonify({'emails': get_email_scan_detail(scan_id, user_email)})
+    return jsonify({'results': get_email_scan_detail(scan_id, user_email)})
 
 # ==========================================
 # VERIFY PAGE
@@ -949,7 +1163,7 @@ window.onload=function(){refreshJobs();setInterval(refreshJobs,10000)};
     return render_page("Verify", body)
 
 # ==========================================
-# SCOUT PAGE (with FIXED From Verified)
+# SCOUT PAGE
 # ==========================================
 @app.route('/scout')
 @login_required
@@ -1061,12 +1275,9 @@ async function loadFromFinder(){
   } else { alert('No emails in Finder. Run a scan first.'); }
 }
 async function loadFromVerified(){
-  // Try user_state first
   let res=await fetch('/get-verified-emails');
   let data=await res.json();
   let emails = (data.valid && data.valid.length > 0) ? data.valid : [];
-  
-  // If empty, fetch from the most recent completed verify job
   if(emails.length === 0){
     try{
       const jobsRes = await fetch('/verify-jobs');
@@ -1085,7 +1296,6 @@ async function loadFromVerified(){
       }
     }catch(e){}
   }
-  
   if(emails.length > 0){
     recipients = emails;
     document.getElementById('emailsInput').value = recipients.join('\\n');
@@ -1160,8 +1370,9 @@ async function runAudit(){
   const url=document.getElementById('auditUrl').value.trim();
   if(!url){alert('Enter URL');return}
   const status=document.getElementById('auditStatus');const result=document.getElementById('auditResult');
-  status.innerHTML='<p style="color:#666">⏳ Analyzing...</p>';result.innerHTML='<p style="color:#666;text-align:center;padding:30px">Please wait...</p>';
-  const c=new AbortController();const t=setTimeout(()=>c.abort(),90000);
+  status.innerHTML='<p style="color:#666">⏳ Analyzing... this may take 30-45 seconds</p>';
+  result.innerHTML='<p style="color:#666;text-align:center;padding:30px">Please wait... checking store, products, policies, apps, payments, SEO</p>';
+  const c=new AbortController();const t=setTimeout(()=>c.abort(),120000);
   try{
     const res=await fetch('/run-audit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:url}),signal:c.signal});
     clearTimeout(t);
@@ -1176,7 +1387,7 @@ function scoreBar(l,s){const c=scoreColor(s);return '<div style="margin:10px 0">
 function renderReport(r){
   const ch=r.checks||{};const sc=r.scores||{};const iss=r.issues||[];
   let h='';
-  h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px"><div><h2 style="margin:0">Store Audit Overview</h2><div style="color:#666;font-size:13px;margin-top:6px">Store: <b>https://'+r.domain+'/</b></div></div>'+(r.case_id?'<div style="background:#f3f4f6;padding:6px 12px;border-radius:6px;font-size:13px;color:#374151">Case ID: <b>'+r.case_id+'</b></div>':'')+'</div></div>';
+  h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px"><div><h2 style="margin:0">Store Audit Overview</h2><div style="color:#666;font-size:13px;margin-top:6px">Store: <a href="https://'+r.domain+'" target="_blank" style="color:#3b82f6"><b>https://'+r.domain+'/</b></a></div></div>'+(r.case_id?'<div style="background:#f3f4f6;padding:6px 12px;border-radius:6px;font-size:13px;color:#374151">Case ID: <b>'+r.case_id+'</b></div>':'')+'</div></div>';
   h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><h3 style="margin-top:0">📈 Scores</h3>'+scoreBar('Overall',sc.overall_score||0)+scoreBar('Trust',sc.trust_score||0)+scoreBar('Technical',sc.technical_score||0)+scoreBar('Marketing',sc.marketing_score||0)+'</div>';
   const hi=iss.filter(i=>i.severity==='high');
   if(hi.length>0)h+='<div style="background:#fef2f2;border-left:4px solid #ef4444;padding:15px;border-radius:8px;margin-bottom:20px"><div style="color:#991b1b;font-weight:bold;font-size:16px;margin-bottom:6px">⚠️ Critical issues detected!</div><div style="color:#7f1d1d;font-size:13px">'+hi.length+' high-priority issue(s)</div></div>';
@@ -1186,20 +1397,27 @@ function renderReport(r){
   function row(l,v){return '<tr><td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold">'+l+'</td><td style="padding:8px;border-bottom:1px solid #eee">'+v+'</td></tr>'}
   h+=row('Is Shopify Store',ch.is_shopify?'✅ Yes':'❌ Not detected');
   h+=row('HTTPS',ch.https?'✅ Enabled':'❌ Disabled');
-  h+=row('HTTP Status',ch.http_status||'N/A');
   h+=row('Load Time',ch.load_time_seconds?ch.load_time_seconds+'s':'N/A');
+  h+=row('Store Age',ch.store_age_label||'Unknown');
   h+=row('Product Count',(ch.product_count!==null&&ch.product_count!==undefined)?ch.product_count+(ch.product_count_capped?'+':''):'N/A');
+  h+=row('Max Image Size',ch.max_image_kb?ch.max_image_kb+' KB':'N/A');
   h+=row('Theme',ch.theme||'Unknown');
   h+=row('Mobile Responsive',ch.mobile_responsive?'✅ Yes':'❌ No');
+  h+=row('Cart Type',ch.cart_type||'Unknown');
   h+=row('Currency',ch.currency||'Unknown');
+  h+=row('Payment Options',(ch.payment_methods&&ch.payment_methods.length>0)?ch.payment_methods.join(', '):'None detected');
+  h+=row('Free Shipping',ch.free_shipping_advertised?'✅ Advertised':'❌ Not advertised');
+  h+=row('Reviews App',(ch.review_apps&&ch.review_apps.length>0)?ch.review_apps.join(', '):'None');
   h+=row('Contact Page',ch.has_contact_page?'✅ Found':'❌ Not found');
   h+=row('Email Link',ch.has_email_link?'✅ Found':'❌ Not found');
   h+=row('Phone Link',ch.has_phone_link?'✅ Found':'❌ Not found');
   h+=row('Policy Pages',ch.policy_pages_found||'0/4');
   h+=row('Social Links',(ch.social_links&&ch.social_links.length>0)?ch.social_links.join(', '):'None found');
+  h+=row('Meta Title',(ch.meta_title_length||0)+' chars');
+  h+=row('Meta Description',(ch.meta_description_length||0)+' chars');
   h+=row('Detected Apps',(ch.detected_apps&&ch.detected_apps.length>0)?ch.detected_apps.join(', '):'None detected');
   h+='</table></div>';
-  h+='<div style="background:#eff6ff;border-left:4px solid #3b82f6;padding:15px;border-radius:8px;font-size:13px;color:#1e40af"><b>ℹ️ Note:</b> This audit uses only publicly available data.</div>';
+  h+='<div style="background:#eff6ff;border-left:4px solid #3b82f6;padding:15px;border-radius:8px;font-size:13px;color:#1e40af"><b>ℹ️ Note:</b> This audit uses only publicly available data. Sales, customer counts, and checkout abandonment cannot be measured from outside a store.</div>';
   document.getElementById('auditResult').innerHTML=h;
 }
 async function loadAuditHistory(){
@@ -1211,7 +1429,7 @@ async function loadAuditHistory(){
     const color=scoreColor(a.score);
     html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+color+'">';
     html+='<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
-    html+='<div><b>'+a.domain+'</b> <span style="color:'+color+';font-weight:bold">'+a.score+'%</span><br><span style="font-size:12px;color:#666">'+a.created_at+'</span></div>';
+    html+='<div><b><a href="https://'+a.domain+'" target="_blank" style="color:#3b82f6;text-decoration:none">'+a.domain+'</a></b> <span style="color:'+color+';font-weight:bold">'+a.score+'%</span><br><span style="font-size:12px;color:#666">'+a.created_at+'</span></div>';
     html+='<button onclick="viewAudit('+a.id+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">View</button>';
     html+='</div>';
     html+='<div id="audit-view-'+a.id+'" style="margin-top:10px"></div>';
@@ -1335,7 +1553,7 @@ def bulk_email():
     for r in results: all_found.extend(r['emails'])
     if user_email:
         save_user_state(user_email, found_emails='|||'.join(all_found))
-        save_email_scan(user_email, all_found, len(results))
+        save_email_scan(user_email, results, len(results))
     return jsonify({'success': bool(results), 'results': results})
 
 @app.route('/store-emails', methods=['POST'])
