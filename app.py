@@ -74,8 +74,7 @@ def init_db():
             password_hash VARCHAR(255) NOT NULL,
             sender_name VARCHAR(255) DEFAULT '',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        try:
-            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS sender_name VARCHAR(255) DEFAULT ''")
+        try: cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS sender_name VARCHAR(255) DEFAULT ''")
         except: pass
         cur.execute("""CREATE TABLE IF NOT EXISTS scraped_stores (
             id SERIAL PRIMARY KEY, domain VARCHAR(255) UNIQUE NOT NULL,
@@ -92,10 +91,6 @@ def init_db():
             status VARCHAR(50) DEFAULT 'pending',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS store_audits (
-            id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
-            domain VARCHAR(255) NOT NULL, report JSONB,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
         cur.execute("""CREATE TABLE IF NOT EXISTS discovered_stores (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             domain VARCHAR(255) NOT NULL, source VARCHAR(50),
@@ -106,14 +101,26 @@ def init_db():
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             results JSONB, emails TEXT, email_count INTEGER DEFAULT 0, store_count INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        try:
-            cur.execute("ALTER TABLE email_scans ADD COLUMN IF NOT EXISTS results JSONB")
-            cur.execute("ALTER TABLE email_scans ADD COLUMN IF NOT EXISTS emails TEXT")
-        except: pass
         cur.execute("""CREATE TABLE IF NOT EXISTS audit_history (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             domain VARCHAR(255) NOT NULL, report JSONB,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        # NEW: Audit Queue table
+        cur.execute("""CREATE TABLE IF NOT EXISTS audit_queue (
+            id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
+            email VARCHAR(255) NOT NULL,
+            domain VARCHAR(255) NOT NULL,
+            status VARCHAR(50) DEFAULT 'pending',
+            report JSONB, subject TEXT, message TEXT,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_email, email))""")
+        # NEW: Sent Log (dedupe)
+        cur.execute("""CREATE TABLE IF NOT EXISTS sent_log (
+            id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
+            email VARCHAR(255) NOT NULL,
+            sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_email, email))""")
         conn.commit(); cur.close()
         print("✅ DB ready")
     except Exception as e: print(f"❌ DB: {e}")
@@ -143,6 +150,10 @@ def root_domain(hostname):
         if parts[-1] in ['uk','au','nz','in','za','br','mx']:
             return '.'.join(parts[-3:])
     return '.'.join(parts[-2:])
+
+def domain_from_email(email):
+    try: return email.split('@')[1].strip().lower()
+    except: return ''
 
 def get_user_sender_name(user_email):
     conn = get_db()
@@ -224,6 +235,138 @@ def load_user_state(user_email):
     finally: release_db(conn)
 
 # ==========================================
+# AUDIT QUEUE HELPERS
+# ==========================================
+def add_to_queue(user_email, emails):
+    """Add emails to audit queue. Returns (added_count, skipped_count)."""
+    conn = get_db()
+    if not conn: return 0, 0
+    added = 0
+    skipped = 0
+    try:
+        cur = conn.cursor()
+        for email in emails:
+            email = email.strip().lower()
+            if not email or '@' not in email: continue
+            domain = domain_from_email(email)
+            if not domain: continue
+            # Check if already in sent_log (dedupe)
+            cur.execute("SELECT id FROM sent_log WHERE user_email = %s AND email = %s", (user_email, email))
+            if cur.fetchone():
+                skipped += 1
+                continue
+            try:
+                cur.execute("""INSERT INTO audit_queue (user_email, email, domain, status)
+                    VALUES (%s, %s, %s, 'pending')
+                    ON CONFLICT (user_email, email) DO NOTHING""",
+                    (user_email, email, domain))
+                if cur.rowcount > 0:
+                    added += 1
+            except: pass
+        conn.commit(); cur.close()
+    except Exception as e:
+        print(f"add_to_queue: {e}")
+    finally:
+        release_db(conn)
+    return added, skipped
+
+def get_queue(user_email):
+    conn = get_db()
+    if not conn: return []
+    try:
+        cur = conn.cursor()
+        cur.execute("""SELECT id, email, domain, status, report, subject, message
+            FROM audit_queue WHERE user_email = %s
+            ORDER BY CASE status WHEN 'pending' THEN 1 WHEN 'current' THEN 2 WHEN 'done' THEN 3 WHEN 'skipped' THEN 4 ELSE 5 END, added_at ASC""",
+            (user_email,))
+        rows = cur.fetchall(); cur.close()
+        results = []
+        for r in rows:
+            has_report = bool(r[4])
+            results.append({
+                'id': r[0], 'email': r[1], 'domain': r[2], 'status': r[3],
+                'has_report': has_report,
+                'subject': r[5] or '', 'message': r[6] or ''
+            })
+        return results
+    except: return []
+    finally: release_db(conn)
+
+def update_queue_item(item_id, user_email, **kwargs):
+    conn = get_db()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        for k, v in kwargs.items():
+            if v is not None:
+                if k == 'report':
+                    cur.execute(f"UPDATE audit_queue SET {k}=%s, updated_at=NOW() WHERE id=%s AND user_email=%s", (json.dumps(v), item_id, user_email))
+                else:
+                    cur.execute(f"UPDATE audit_queue SET {k}=%s, updated_at=NOW() WHERE id=%s AND user_email=%s", (v, item_id, user_email))
+        conn.commit(); cur.close()
+    except Exception as e: print(f"update_queue: {e}")
+    finally: release_db(conn)
+
+def get_queue_item(item_id, user_email):
+    conn = get_db()
+    if not conn: return None
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, email, domain, status, report, subject, message FROM audit_queue WHERE id=%s AND user_email=%s", (item_id, user_email))
+        row = cur.fetchone(); cur.close()
+        if not row: return None
+        report = None
+        if row[4]:
+            try: report = json.loads(row[4]) if isinstance(row[4], str) else row[4]
+            except: report = None
+        return {'id': row[0], 'email': row[1], 'domain': row[2], 'status': row[3], 'report': report, 'subject': row[5] or '', 'message': row[6] or ''}
+    except: return None
+    finally: release_db(conn)
+
+def clear_queue(user_email, only_pending=False):
+    conn = get_db()
+    if not conn: return 0
+    try:
+        cur = conn.cursor()
+        if only_pending:
+            cur.execute("DELETE FROM audit_queue WHERE user_email = %s AND status IN ('pending','current')", (user_email,))
+        else:
+            cur.execute("DELETE FROM audit_queue WHERE user_email = %s", (user_email,))
+        n = cur.rowcount
+        conn.commit(); cur.close()
+        return n
+    except: return 0
+    finally: release_db(conn)
+
+def mark_sent(user_email, email):
+    conn = get_db()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO sent_log (user_email, email) VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_email, email))
+        conn.commit(); cur.close()
+    except: pass
+    finally: release_db(conn)
+
+def get_next_pending_item(user_email):
+    conn = get_db()
+    if not conn: return None
+    try:
+        cur = conn.cursor()
+        cur.execute("""SELECT id, email, domain, status, report, subject, message FROM audit_queue
+            WHERE user_email = %s AND status = 'pending'
+            ORDER BY added_at ASC LIMIT 1""", (user_email,))
+        row = cur.fetchone(); cur.close()
+        if not row: return None
+        report = None
+        if row[4]:
+            try: report = json.loads(row[4]) if isinstance(row[4], str) else row[4]
+            except: report = None
+        return {'id': row[0], 'email': row[1], 'domain': row[2], 'status': row[3], 'report': report, 'subject': row[5] or '', 'message': row[6] or ''}
+    except: return None
+    finally: release_db(conn)
+
+# ==========================================
 # EMAIL SCAN HISTORY
 # ==========================================
 def save_email_scan(user_email, results, store_count):
@@ -270,15 +413,12 @@ def get_email_scan_detail(scan_id, user_email):
                 parsed = json.loads(row[0]) if isinstance(row[0], str) else row[0]
                 if parsed and len(parsed) > 0:
                     return parsed
-            except Exception as e:
-                print(f"results parse error: {e}")
+            except: pass
         if row[1]:
             flat = row[1].split(',') if isinstance(row[1], str) else row[1]
             return [{'store': '(old format)', 'emails': [e for e in flat if e.strip()]}]
         return []
-    except Exception as e:
-        print(f"get_email_scan_detail error: {e}")
-        return []
+    except: return []
     finally: release_db(conn)
 
 # ==========================================
@@ -321,8 +461,7 @@ def get_audit_detail(audit_id, user_email):
         cur.execute("SELECT report FROM audit_history WHERE id = %s AND user_email = %s", (audit_id, user_email))
         row = cur.fetchone(); cur.close()
         if row and row[0]:
-            try:
-                return json.loads(row[0]) if isinstance(row[0], str) else row[0]
+            try: return json.loads(row[0]) if isinstance(row[0], str) else row[0]
             except: return None
         return None
     except: return None
@@ -555,7 +694,6 @@ def audit_store(domain, case_id):
         report['error'] = "Invalid domain"; return report
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept-Language": "en-US,en;q=0.5"}
     base_url = f"https://{raw}"
-
     try:
         start = time.time()
         r = requests.get(base_url, headers=headers, timeout=10, allow_redirects=True)
@@ -568,11 +706,9 @@ def audit_store(domain, case_id):
     except Exception as e:
         report["checks"]["https"] = False
         report["error"] = f"Could not reach store: {str(e)[:100]}"; return report
-
     is_shop = any(x in html.lower() for x in ['cdn.shopify.com', 'shopify.theme', 'shopify-section', 'myshopify.com'])
     report["checks"]["is_shopify"] = is_shop
     if is_shop: report["positives"].append("Confirmed Shopify store")
-
     try:
         r2 = requests.get(f"{base_url}/products.json?limit=250", headers=headers, timeout=10)
         if r2.status_code == 200:
@@ -596,31 +732,24 @@ def audit_store(domain, case_id):
                         except: pass
             if max_img_kb > 0:
                 report["checks"]["max_image_kb"] = round(max_img_kb, 1)
-                if max_img_kb > 1000:
-                    report["issues"].append({"title": "Images Too Large", "description": f"Largest product image is {round(max_img_kb)}KB.", "recommendation": "Compress to under 300KB.", "severity": "medium"})
-                else:
-                    report["positives"].append("Images optimized")
+                if max_img_kb > 1000: report["issues"].append({"title": "Images Too Large", "description": f"Largest image {round(max_img_kb)}KB.", "recommendation": "Compress to under 300KB.", "severity": "medium"})
+                else: report["positives"].append("Images optimized")
     except: report["checks"]["product_count"] = None
-
     tm = re.search(r'"theme_name"\s*:\s*"([^"]+)"', html)
     report["checks"]["theme"] = tm.group(1) if tm else "Unknown"
-
     hv = 'name="viewport"' in html.lower()
     report["checks"]["mobile_responsive"] = hv
     if hv: report["positives"].append("Mobile responsive")
     else: report["issues"].append({"title": "Not Mobile Responsive", "description": "Missing viewport.", "recommendation": "Use mobile theme.", "severity": "high"})
-
     he = bool(re.search(r'mailto:[^"\']+', html)); hp = bool(re.search(r'tel:[^"\']+', html))
     report["checks"]["has_email_link"] = he; report["checks"]["has_phone_link"] = hp
     report["checks"]["has_contact_page"] = 'contact' in html.lower()
     if he or hp: report["positives"].append("Contact info present")
     else: report["issues"].append({"title": "No Contact Info", "description": "No email/phone.", "recommendation": "Add Contact page.", "severity": "high"})
-
     socials = [p.split('.')[0] for p in ['facebook.com','instagram.com','twitter.com','tiktok.com','youtube.com','pinterest.com'] if p in html.lower()]
     report["checks"]["social_links"] = socials
     if len(socials) >= 2: report["positives"].append(f"{len(socials)} socials")
     elif len(socials) == 0: report["issues"].append({"title": "No Social Media", "description": "None found.", "recommendation": "Add social profiles.", "severity": "medium"})
-
     pols = ['/policies/refund-policy','/policies/privacy-policy','/policies/terms-of-service','/policies/shipping-policy']
     pf = [0]
     def cp(p):
@@ -632,10 +761,8 @@ def audit_store(domain, case_id):
     report["checks"]["policy_pages_found"] = f"{pf[0]}/4"
     if pf[0] == 4: report["positives"].append("All policies present")
     elif pf[0] < 2: report["issues"].append({"title": f"Missing {4-pf[0]} Policies", "description": f"Only {pf[0]}/4.", "recommendation": "Add in Settings.", "severity": "high"})
-
     cm = re.search(r'"currency"\s*:\s*"([A-Z]{3})"', html)
     report["checks"]["currency"] = cm.group(1) if cm else "Unknown"
-
     apps = []
     for name, sigs in {"Klaviyo":["klaviyo"],"Judge.me":["judge.me"],"Yotpo":["yotpo"],"Loox":["loox.io"],"ReConvert":["reconvert"],"Recharge":["rechargepayments"],"Tidio":["tidio"],"Gorgias":["gorgias"],"Facebook Pixel":["connect.facebook.net","fbq("],"Google Analytics":["google-analytics.com","gtag("],"TikTok Pixel":["analytics.tiktok.com"]}.items():
         for s in sigs:
@@ -643,7 +770,6 @@ def audit_store(domain, case_id):
     report["checks"]["detected_apps"] = apps
     ha = any('Pixel' in a or 'Analytics' in a for a in apps)
     if not ha: report["issues"].append({"title": "No Tracking Pixel", "description": "No pixel.", "recommendation": "Install tracking.", "severity": "high"})
-
     payments = []
     html_low = html.lower()
     payment_sigs = {"PayPal": ["paypal.com/sdk", "paypal-button", "paypalobjects"],"Stripe": ["js.stripe.com", "stripe.com/v3"],"Klarna": ["klarna.com", "klarna-checkout"],"Afterpay": ["afterpay.com", "afterpay"],"Apple Pay": ["apple-pay", "applepay"],"Google Pay": ["google-pay", "googlepay"],"Shop Pay": ["shop-pay", "shop_pay", "shoppay"],"Amazon Pay": ["amazonpay", "amazon-pay"],"Affirm": ["affirm.com", "affirm-"],"Zip": ["zip.co", "zip-payments"]}
@@ -653,27 +779,23 @@ def audit_store(domain, case_id):
                 payments.append(name); break
     report["checks"]["payment_methods"] = payments
     if len(payments) >= 2: report["positives"].append(f"{len(payments)} payment options")
-    elif len(payments) <= 1: report["issues"].append({"title": "Limited Payment Options", "description": f"Only {len(payments)} payment method(s) detected.", "recommendation": "Add PayPal, Shop Pay, and Apple Pay. 3+ options convert 20% better.", "severity": "medium"})
-
+    elif len(payments) <= 1: report["issues"].append({"title": "Limited Payment Options", "description": f"Only {len(payments)} method(s).", "recommendation": "Add PayPal, Shop Pay, Apple Pay.", "severity": "medium"})
     review_apps = []
     for name, sigs in {"Judge.me":["judge.me","judgeme"],"Loox":["loox.io"],"Yotpo":["yotpo"],"Okendo":["okendo"],"Stamped":["stamped.io"],"Reviews.io":["reviews.io"],"Trustpilot":["trustpilot"]}.items():
         for s in sigs:
             if s in html_low: review_apps.append(name); break
     report["checks"]["review_apps"] = review_apps
     if review_apps: report["positives"].append(f"Reviews: {', '.join(review_apps)}")
-    else: report["issues"].append({"title": "No Reviews App", "description": "No customer review system detected.", "recommendation": "Install Judge.me (free) or Loox. Reviews increase conversion 15-30%.", "severity": "high"})
-
+    else: report["issues"].append({"title": "No Reviews App", "description": "No review system.", "recommendation": "Install Judge.me (free) or Loox.", "severity": "high"})
     has_free_shipping_banner = any(x in html_low for x in ['free shipping', 'free delivery', 'shipping on us'])
     report["checks"]["free_shipping_advertised"] = has_free_shipping_banner
     if has_free_shipping_banner: report["positives"].append("Free shipping advertised")
-    else: report["issues"].append({"title": "No Free Shipping Banner", "description": "Free shipping is the #1 reason customers choose a store.", "recommendation": "Add a free shipping threshold. Even $50+ free shipping boosts AOV.", "severity": "medium"})
-
+    else: report["issues"].append({"title": "No Free Shipping Banner", "description": "Top buyer priority.", "recommendation": "Add $50+ free shipping threshold.", "severity": "medium"})
     is_drawer_cart = any(x in html_low for x in ['cart-drawer', 'cart__drawer', 'drawer__cart', 'cart-notification'])
     is_page_cart = '/cart' in html_low and not is_drawer_cart
     report["checks"]["cart_type"] = "drawer" if is_drawer_cart else ("page" if is_page_cart else "unknown")
     if is_drawer_cart: report["positives"].append("Modern drawer cart")
-    elif is_page_cart: report["issues"].append({"title": "Page-Based Cart", "description": "Cart opens as full page instead of slide-in drawer.", "recommendation": "Switch to a drawer cart. Converts 15-25% better.", "severity": "medium"})
-
+    elif is_page_cart: report["issues"].append({"title": "Page-Based Cart", "description": "Cart opens as page.", "recommendation": "Switch to drawer cart.", "severity": "medium"})
     title_match = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
     desc_match = re.search(r'<meta[^>]*name=["\']description["\'][^>]*content=["\'](.*?)["\']', html, re.IGNORECASE | re.DOTALL)
     page_title = title_match.group(1).strip() if title_match else ""
@@ -681,11 +803,10 @@ def audit_store(domain, case_id):
     report["checks"]["meta_title"] = page_title[:100] + ("..." if len(page_title) > 100 else "")
     report["checks"]["meta_title_length"] = len(page_title)
     report["checks"]["meta_description_length"] = len(page_desc)
-    if len(page_title) == 0: report["issues"].append({"title": "Missing Page Title", "description": "No title tag.", "recommendation": "Add SEO title (50-60 chars).", "severity": "high"})
-    elif len(page_title) > 70: report["issues"].append({"title": "Meta Title Too Long", "description": f"Title is {len(page_title)} chars.", "recommendation": "Shorten to 50-60 chars.", "severity": "low"})
-    if len(page_desc) == 0: report["issues"].append({"title": "Missing Meta Description", "description": "No description for search engines.", "recommendation": "Add 150-160 char description.", "severity": "medium"})
-    elif len(page_desc) > 170: report["issues"].append({"title": "Meta Description Too Long", "description": f"Description is {len(page_desc)} chars.", "recommendation": "Keep under 160 chars.", "severity": "low"})
-
+    if len(page_title) == 0: report["issues"].append({"title": "Missing Page Title", "description": "No title tag.", "recommendation": "Add SEO title.", "severity": "high"})
+    elif len(page_title) > 70: report["issues"].append({"title": "Meta Title Too Long", "description": f"{len(page_title)} chars.", "recommendation": "50-60 chars.", "severity": "low"})
+    if len(page_desc) == 0: report["issues"].append({"title": "Missing Meta Description", "description": "No description.", "recommendation": "Add 150-160 chars.", "severity": "medium"})
+    elif len(page_desc) > 170: report["issues"].append({"title": "Meta Description Too Long", "description": f"{len(page_desc)} chars.", "recommendation": "Under 160 chars.", "severity": "low"})
     age_months = None
     try:
         import whois
@@ -703,7 +824,6 @@ def audit_store(domain, case_id):
         else:
             years = age_months // 12
             report["checks"]["store_age_label"] = f"{years} year{'s' if years > 1 else ''}"
-
     trust = 0
     if he or hp: trust += 20
     trust += int((pf[0]/4)*30)
@@ -713,7 +833,6 @@ def audit_store(domain, case_id):
     if review_apps: trust += 15
     if len(payments) >= 2: trust += 10
     report["scores"]["trust_score"] = min(trust, 100)
-
     tech = 0
     if report["checks"].get("https"): tech += 25
     if report["checks"].get("http_status") == 200: tech += 15
@@ -725,7 +844,6 @@ def audit_store(domain, case_id):
     if is_drawer_cart: tech += 10
     if report["checks"].get("max_image_kb") and report["checks"]["max_image_kb"] < 500: tech += 10
     report["scores"]["technical_score"] = min(tech, 100)
-
     mkt = 0
     mkt += min(len(apps)*6, 30)
     if len(socials) >= 3: mkt += 20
@@ -737,12 +855,11 @@ def audit_store(domain, case_id):
     if has_free_shipping_banner: mkt += 10
     if len(payments) >= 3: mkt += 10
     report["scores"]["marketing_score"] = min(mkt, 100)
-
     report["scores"]["overall_score"] = int((report["scores"]["trust_score"] + report["scores"]["technical_score"] + report["scores"]["marketing_score"]) / 3)
     return report
 
 # ==========================================
-# EMAIL GENERATOR (with sender name)
+# EMAIL GENERATOR
 # ==========================================
 def generate_outreach_email(report, tone='friendly', sender_name=''):
     domain = report.get('domain', '')
@@ -751,11 +868,9 @@ def generate_outreach_email(report, tone='friendly', sender_name=''):
     scores = report.get('scores', {})
     checks = report.get('checks', {})
     overall = scores.get('overall_score', 0)
-    
     priority = {'high': 0, 'medium': 1, 'low': 2}
     sorted_issues = sorted(issues, key=lambda x: priority.get(x.get('severity', 'low'), 3))
     top_issues = sorted_issues[:3]
-    
     issue_bullets = []
     for i in top_issues:
         title = i.get('title', '')
@@ -764,14 +879,9 @@ def generate_outreach_email(report, tone='friendly', sender_name=''):
         elif 'Load Time' in title and checks.get('load_time_seconds'):
             title = f"Slow load time ({checks['load_time_seconds']}s)"
         issue_bullets.append(title)
-    
-    if overall < 50:
-        subject = f"Found {len(issues)} issues on {domain}"
-    elif overall < 75:
-        subject = f"Quick idea for {domain}"
-    else:
-        subject = f"Nice store! One thing I noticed on {domain}"
-    
+    if overall < 50: subject = f"Found {len(issues)} issues on {domain}"
+    elif overall < 75: subject = f"Quick idea for {domain}"
+    else: subject = f"Nice store! One thing I noticed on {domain}"
     if tone == 'friendly':
         greeting = f"Hi {brand} team,"
         opener = f"I was looking at {domain} today and noticed a few things that could be costing you sales."
@@ -787,7 +897,6 @@ def generate_outreach_email(report, tone='friendly', sender_name=''):
         opener = f"Took a look at {domain} — cool store! Noticed a few things though."
         closer = "Want me to send a quick checklist of fixes?"
         signoff = "No pressure either way!"
-    
     body = f"""{greeting}
 
 {opener}
@@ -797,10 +906,8 @@ Top 3 issues I found:
 """
     for b in issue_bullets:
         body += f"• {b}\n"
-    
     signature = sender_name.strip() if sender_name and sender_name.strip() else "[Your name]"
     body += f"\nOverall score: {overall}/100. Most are fixable in a day or two.\n\n{closer}\n\n{signoff}\n\nBest,\n{signature}"
-    
     return {'subject': subject, 'body': body, 'tone': tone}
 
 # ==========================================
@@ -832,7 +939,7 @@ NAVBAR = '''
 <a href="/discover" onclick="closeDrawer()">🎯 Store Discovery</a>
 <a href="/verify" onclick="closeDrawer()">✅ Verify Emails</a>
 <a href="/scout" onclick="closeDrawer()">📨 Email Scout</a>
-<a href="/audit" onclick="closeDrawer()">🛡️ Security Analysis</a>
+<a href="/audit" onclick="closeDrawer()">🚀 Analyze & Send</a>
 <a href="/settings" onclick="closeDrawer()">⚙️ Settings</a>
 <hr style="border-color:#374151;margin:20px 0">
 <a href="/logout" onclick="closeDrawer()" style="color:#ef4444">🚪 Logout</a>
@@ -921,10 +1028,7 @@ def settings():
         msg = '✅ Saved!'
     current_name = get_user_sender_name(user_email)
     body = f'''<div style="max-width:600px;margin:20px auto;padding:20px">
-<div style="background:#1f2937;color:white;padding:20px;border-radius:10px;margin-bottom:20px">
-<h1 style="margin:0">⚙️ Settings</h1>
-<p style="margin:5px 0 0 0">Your profile info</p>
-</div>
+<div style="background:#1f2937;color:white;padding:20px;border-radius:10px;margin-bottom:20px"><h1 style="margin:0">⚙️ Settings</h1></div>
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1)">
 <h3 style="margin-top:0">Your Name (used in generated emails)</h3>
 <form method="POST">
@@ -932,13 +1036,11 @@ def settings():
 <button type="submit" style="background:#0d9488;color:white;padding:12px 30px;border:none;border-radius:8px;cursor:pointer;font-size:16px;width:100%">Save</button>
 </form>
 {f'<p style="color:green;margin-top:10px">{msg}</p>' if msg else ''}
-<p style="color:#666;font-size:13px;margin-top:15px">This name appears at the end of every email you generate from the Security Analysis page.</p>
-</div>
-</div>'''
+</div></div>'''
     return render_page("Settings", body)
 
 # ==========================================
-# HOME
+# HOME (Email Finder)
 # ==========================================
 @app.route('/')
 @login_required
@@ -978,34 +1080,27 @@ async function findBulkEmails(){
   }catch(e){result.innerHTML='<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">Error: '+e+'</div>'}
 }
 async function loadHistory(){
-  const res=await fetch('/get-email-scans');
-  const data=await res.json();
+  const res=await fetch('/get-email-scans');const data=await res.json();
   const c=document.getElementById('historyList');
-  if(!data.scans || data.scans.length===0){c.innerHTML='<p style="color:#666">No scans yet. Run a search above.</p>';return}
+  if(!data.scans || data.scans.length===0){c.innerHTML='<p style="color:#666">No scans yet.</p>';return}
   let html='';
   data.scans.forEach(s=>{
     html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid #667eea">';
     html+='<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
     html+='<div><b>'+s.count+' emails</b> from '+s.stores+' stores<br><span style="font-size:12px;color:#666">'+s.created_at+'</span></div>';
     html+='<button onclick="viewScan('+s.id+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">View</button>';
-    html+='</div>';
-    html+='<div id="scan-'+s.id+'" style="margin-top:10px"></div>';
-    html+='</div>';
+    html+='</div><div id="scan-'+s.id+'" style="margin-top:10px"></div></div>';
   });
   c.innerHTML=html;
 }
 async function viewScan(id){
-  const res=await fetch('/get-email-scan/'+id);
-  const data=await res.json();
+  const res=await fetch('/get-email-scan/'+id);const data=await res.json();
   const c=document.getElementById('scan-'+id);
-  if(!data.results || data.results.length===0){c.innerHTML='<p style="color:#666">No results in this scan.</p>';return}
+  if(!data.results || data.results.length===0){c.innerHTML='<p style="color:#666">No results.</p>';return}
   let html='<div style="background:white;padding:10px;border-radius:6px;max-height:300px;overflow-y:auto;font-size:13px">';
   data.results.forEach(r=>{
-    html+='<div style="padding:8px 0;border-bottom:1px solid #eee">';
-    html+='<div style="font-weight:bold;margin-bottom:4px">📦 <a href="https://'+r.store+'" target="_blank" style="color:#3b82f6;text-decoration:none">'+r.store+'</a></div>';
-    (r.emails||[]).forEach(e=>{
-      html+='<div style="padding-left:16px;color:#333;word-break:break-all">📧 '+e+'</div>';
-    });
+    html+='<div style="padding:8px 0;border-bottom:1px solid #eee"><div style="font-weight:bold;margin-bottom:4px">📦 <a href="https://'+r.store+'" target="_blank" style="color:#3b82f6;text-decoration:none">'+r.store+'</a></div>';
+    (r.emails||[]).forEach(e=>{html+='<div style="padding-left:16px;color:#333;word-break:break-all">📧 '+e+'</div>'});
     html+='</div>';
   });
   html+='</div>';
@@ -1016,45 +1111,39 @@ window.onload=loadHistory;
     return render_page("Finder", body)
 
 # ==========================================
-# DISCOVERY PAGE
+# DISCOVERY
 # ==========================================
 @app.route('/discover')
 @login_required
 def discover_page():
     body = '''<div style="max-width:900px;margin:20px auto;padding:20px">
-<div style="background:#8b5cf6;color:white;padding:20px;border-radius:10px;margin-bottom:20px">
-<h1 style="margin:0">🎯 Store Discovery</h1>
-<p style="margin:5px 0 0 0">4 methods to find new Shopify stores</p>
-</div>
+<div style="background:#8b5cf6;color:white;padding:20px;border-radius:10px;margin-bottom:20px"><h1 style="margin:0">🎯 Store Discovery</h1></div>
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
 <h3 style="margin-top:0">🔎 Discovery Methods</h3>
-<p style="color:#666;font-size:14px">Each method is independent. Run them one by one or use "Run All".</p>
-<button onclick="runDiscovery('shodan')" style="background:#8b5cf6;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">🔍 Shodan IP Scan</button>
+<button onclick="runDiscovery('shodan')" style="background:#8b5cf6;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">🔍 Shodan</button>
 <button onclick="runDiscovery('theme')" style="background:#ec4899;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">🎨 Theme Showcase</button>
-<button onclick="runDiscovery('search')" style="background:#3b82f6;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">🌐 Search Engine</button>
-<button onclick="runDiscovery('related')" style="background:#f59e0b;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">📚 Related Stores</button>
-<button onclick="runDiscovery('all')" style="background:#0d9488;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">⚡ Run All 4</button>
+<button onclick="runDiscovery('search')" style="background:#3b82f6;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">🌐 Search</button>
+<button onclick="runDiscovery('related')" style="background:#f59e0b;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">📚 Related</button>
+<button onclick="runDiscovery('all')" style="background:#0d9488;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">⚡ All</button>
 <div id="discoveryStatus" style="margin-top:12px"></div>
 </div>
-<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
+<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1)">
 <h3 style="margin-top:0">📋 Discovered Stores (<span id="storeCount">0</span>)</h3>
-<div id="storeList" style="margin-top:10px">Loading...</div>
+<div id="storeList">Loading...</div>
 <button onclick="loadStores()" style="background:#3b82f6;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px;margin-top:10px">🔄 Refresh</button>
-<button onclick="clearStores()" style="background:#ef4444;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px;margin-top:10px;margin-left:8px">🗑️ Clear All</button>
-<button onclick="exportStores()" style="background:#0d9488;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px;margin-top:10px;margin-left:8px">⬇️ Export CSV</button>
-</div>
-</div>
+<button onclick="clearStores()" style="background:#ef4444;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px;margin-top:10px;margin-left:8px">🗑️ Clear</button>
+</div></div>
 <script>
 async function runDiscovery(method){
   const status=document.getElementById('discoveryStatus');
-  status.innerHTML='<p style="color:#666">⏳ Running '+method+' discovery... this may take 30-60 seconds</p>';
+  status.innerHTML='<p style="color:#666">⏳ Running '+method+'... 30-60 seconds</p>';
   try{
     const res=await fetch('/run-discovery',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({method:method})});
     const data=await res.json();
     if(data.success){
       let details='';
       if(data.by_method){for(const[k,v]of Object.entries(data.by_method)){if(v>0)details+=' · '+k+': '+v}}
-      status.innerHTML='<p style="color:green">✅ Found '+data.found+' stores (saved: '+data.saved+')'+details+'</p>';
+      status.innerHTML='<p style="color:green">✅ Found '+data.found+' (saved: '+data.saved+')'+details+'</p>';
       loadStores();
     } else { status.innerHTML='<p style="color:red">Error: '+(data.error||'Unknown')+'</p>'; }
   }catch(e){status.innerHTML='<p style="color:red">Error: '+e+'</p>'}
@@ -1063,31 +1152,23 @@ async function loadStores(){
   const res=await fetch('/get-discovered');const data=await res.json();
   document.getElementById('storeCount').textContent=data.stores.length;
   const c=document.getElementById('storeList');
-  if(data.stores.length===0){c.innerHTML='<p style="color:#666">No stores yet. Run a discovery method above.</p>';return}
+  if(data.stores.length===0){c.innerHTML='<p style="color:#666">No stores yet.</p>';return}
   let html='';
   data.stores.forEach(s=>{
     html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid #8b5cf6;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
-    html+='<div><b><a href="https://'+s.domain+'" target="_blank" style="color:#3b82f6;text-decoration:none">'+s.domain+'</a></b><br><span style="font-size:12px;color:#666">'+s.source+' · '+s.discovered_at+'</span></div>';
-    html+='<div style="display:flex;gap:6px;flex-wrap:wrap">';
-    html+='<button onclick="actFindEmail(\\''+s.domain+'\\')" style="background:#667eea;color:white;padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">📧</button>';
+    html+='<div><b><a href="https://'+s.domain+'" target="_blank" style="color:#3b82f6">'+s.domain+'</a></b><br><span style="font-size:12px;color:#666">'+s.source+' · '+s.discovered_at+'</span></div>';
+    html+='<div style="display:flex;gap:6px">';
     html+='<button onclick="actAudit(\\''+s.domain+'\\')" style="background:#65a30d;color:white;padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">🛡️</button>';
-    html+='<button onclick="actScout(\\''+s.domain+'\\')" style="background:#0d9488;color:white;padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">📨</button>';
     html+='</div></div>';
   });
   c.innerHTML=html;
 }
-function actFindEmail(d){window.location.href='/?url='+encodeURIComponent(d)}
 function actAudit(d){window.location.href='/audit?url='+encodeURIComponent(d)}
-function actScout(d){window.location.href='/scout?add='+encodeURIComponent(d)}
-async function clearStores(){if(!confirm('Delete all discovered stores?'))return;await fetch('/clear-discovered',{method:'POST'});loadStores()}
-async function exportStores(){const res=await fetch('/get-discovered');const data=await res.json();const csv='domain,source,discovered_at\\n'+data.stores.map(s=>s.domain+','+s.source+','+s.discovered_at).join('\\n');const b=new Blob([csv],{type:'text/csv'});const u=URL.createObjectURL(b);const a=document.createElement('a');a.href=u;a.download='discovered_stores.csv';a.click()}
+async function clearStores(){if(!confirm('Delete all?'))return;await fetch('/clear-discovered',{method:'POST'});loadStores()}
 window.onload=loadStores;
 </script>'''
     return render_page("Store Discovery", body)
 
-# ==========================================
-# DISCOVERY API
-# ==========================================
 @app.route('/run-discovery', methods=['POST'])
 @login_required
 def run_discovery():
@@ -1161,10 +1242,7 @@ def get_email_scan_detail_route(scan_id):
 @login_required
 def verify_page():
     body = '''<div style="max-width:800px;margin:20px auto;padding:20px">
-<div style="background:#f59e0b;color:white;padding:20px;border-radius:10px;margin-bottom:20px">
-<h1 style="margin:0">✅ Verify Emails (Background)</h1>
-<p style="margin:5px 0 0 0">Drop emails, close browser, come back later</p>
-</div>
+<div style="background:#f59e0b;color:white;padding:20px;border-radius:10px;margin-bottom:20px"><h1 style="margin:0">✅ Verify Emails</h1></div>
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
 <h3 style="margin-top:0">📋 Last 3 Jobs</h3>
 <div id="jobsList">Loading...</div>
@@ -1172,30 +1250,20 @@ def verify_page():
 </div>
 <div style="background:white;padding:20px;border-radius:10px">
 <h3 style="margin-top:0">🆕 New Verification</h3>
-<textarea id="emailsInput" style="width:100%;height:180px;border:1px solid #ddd;border-radius:5px;padding:10px;font-family:monospace;box-sizing:border-box" placeholder="email1@example.com&#10;email2@example.com"></textarea>
+<textarea id="emailsInput" style="width:100%;height:180px;border:1px solid #ddd;border-radius:5px;padding:10px;font-family:monospace;box-sizing:border-box"></textarea>
 <div style="border:2px dashed #ddd;padding:15px;text-align:center;margin:10px 0">
 <input type="file" id="emailFile" accept=".csv,.txt">
 <button onclick="readFile()" style="background:#f59e0b;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;margin-left:10px">Upload</button>
 </div>
 <button onclick="loadFromFinder()" style="background:#f59e0b;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-right:8px;margin-bottom:8px">📥 From Finder</button>
-<button onclick="startBackgroundVerify()" style="background:#0d9488;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-bottom:8px">▶️ Start Background Verify</button>
+<button onclick="startBackgroundVerify()" style="background:#0d9488;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-bottom:8px">▶️ Start Verify</button>
 <div id="startMsg" style="margin-top:10px"></div>
 </div></div>
 <script>
 async function loadFromFinder(){const res=await fetch('/get-stored-emails');const data=await res.json();if(data.emails&&data.emails.length>0){document.getElementById('emailsInput').value=data.emails.join('\\n');alert('Loaded '+data.emails.length)}}
-function readFile(){const f=document.getElementById('emailFile').files[0];if(!f){alert('Select file');return}const r=new FileReader();r.onload=function(e){const lines=e.target.result.split('\\n');const emails=[];lines.forEach(l=>{l=l.trim();if(l.includes(','))l=l.split(',')[0].trim();if(l.includes('@'))emails.push(l)});document.getElementById('emailsInput').value=emails.join('\\n');alert('Loaded '+emails.length+' emails')};r.readAsText(f)}
-async function startBackgroundVerify(){const emails=document.getElementById('emailsInput').value.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);if(emails.length===0){alert('Enter emails');return}const name=prompt('Name this job:','Job '+new Date().toLocaleString());document.getElementById('startMsg').innerHTML='<p style="color:#666">Starting...</p>';try{const res=await fetch('/verify-async',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({emails:emails,name:name||'Untitled'})});const data=await res.json();if(data.success){document.getElementById('startMsg').innerHTML='<p style="color:green">✅ Job #'+data.job_id+' started!</p>';document.getElementById('emailsInput').value='';refreshJobs()}}catch(e){document.getElementById('startMsg').innerHTML='<p style="color:red">Error: '+e+'</p>'}}
-async function refreshJobs(){const res=await fetch('/verify-jobs');const data=await res.json();const container=document.getElementById('jobsList');if(!data.jobs||data.jobs.length===0){container.innerHTML='<p style="color:#666">No jobs yet.</p>';return}let html='';data.jobs.forEach(job=>{const percent=job.total>0?Math.round((job.processed/job.total)*100):0;const sc=job.status==='completed'?'#0d9488':(job.status==='running'?'#f59e0b':'#ef4444');const si=job.status==='completed'?'✅':(job.status==='running'?'🔄':'⏹️');html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+sc+'"><div style="font-weight:bold">'+si+' '+job.name+' <span style="color:#666;font-weight:normal;font-size:13px">#'+job.id+'</span></div><div style="margin-top:8px;background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+percent+'%;height:16px;background:'+sc+';text-align:center;color:white;font-size:11px;line-height:16px">'+percent+'%</div></div><div style="font-size:13px;margin-top:6px">Processed: '+job.processed+' / '+job.total+' | ✅ '+job.valid+' | ❌ '+job.invalid+'</div><button onclick="loadResults('+job.id+')" style="background:#3b82f6;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:13px;margin-top:8px">View Results</button><div id="result-'+job.id+'" style="margin-top:10px"></div></div>'});container.innerHTML=html}
-async function loadResults(jobId){const res=await fetch('/verify-results/'+jobId);const data=await res.json();const container=document.getElementById('result-'+jobId);let html='<h4 style="margin:8px 0 4px 0">✅ Valid: '+data.valid.length+'</h4><div style="max-height:120px;overflow-y:auto;background:white;padding:8px;border-radius:5px;font-size:12px;word-break:break-all">';data.valid.slice(0,50).forEach(e=>{html+='<div style="color:#155724">'+e+'</div>'});html+='</div><h4 style="margin:8px 0 4px 0">❌ Invalid: '+data.invalid.length+'</h4><div style="max-height:80px;overflow-y:auto;background:white;padding:8px;border-radius:5px;font-size:12px;word-break:break-all">';data.invalid.slice(0,30).forEach(e=>{html+='<div style="color:#721c24">'+e+'</div>'});html+='</div><div style="margin-top:10px"><button onclick="downloadJob('+jobId+')" style="background:#0d9488;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px;margin-right:5px">⬇️ Download</button><button onclick="sendJobToScout('+jobId+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">📨 Send to Scout</button></div>';container.innerHTML=html}
-async function downloadJob(jobId){const res=await fetch('/verify-results/'+jobId);const data=await res.json();const csv='Email\\n'+data.valid.join('\\n');const b=new Blob([csv],{type:'text/csv'});const u=URL.createObjectURL(b);const a=document.createElement('a');a.href=u;a.download='valid_job_'+jobId+'.csv';a.click()}
-async function sendJobToScout(jobId){
-  const res=await fetch('/verify-results/'+jobId);
-  const data=await res.json();
-  if(!data.valid||data.valid.length===0){alert('No valid emails');return}
-  await fetch('/save-scout-recipients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients:data.valid})});
-  localStorage.setItem('scoutRecipients', JSON.stringify(data.valid));
-  window.location.href='/scout';
-}
+function readFile(){const f=document.getElementById('emailFile').files[0];if(!f){alert('Select file');return}const r=new FileReader();r.onload=function(e){const lines=e.target.result.split('\\n');const emails=[];lines.forEach(l=>{l=l.trim();if(l.includes(','))l=l.split(',')[0].trim();if(l.includes('@'))emails.push(l)});document.getElementById('emailsInput').value=emails.join('\\n');alert('Loaded '+emails.length)}};r.readAsText(f)}
+async function startBackgroundVerify(){const emails=document.getElementById('emailsInput').value.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);if(emails.length===0){alert('Enter emails');return}const name=prompt('Job name:','Job '+new Date().toLocaleString());document.getElementById('startMsg').innerHTML='<p style="color:#666">Starting...</p>';try{const res=await fetch('/verify-async',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({emails:emails,name:name||'Untitled'})});const data=await res.json();if(data.success){document.getElementById('startMsg').innerHTML='<p style="color:green">✅ Job #'+data.job_id+' started!</p>';document.getElementById('emailsInput').value='';refreshJobs()}}catch(e){document.getElementById('startMsg').innerHTML='<p style="color:red">Error: '+e+'</p>'}}
+async function refreshJobs(){const res=await fetch('/verify-jobs');const data=await res.json();const container=document.getElementById('jobsList');if(!data.jobs||data.jobs.length===0){container.innerHTML='<p style="color:#666">No jobs yet.</p>';return}let html='';data.jobs.forEach(job=>{const percent=job.total>0?Math.round((job.processed/job.total)*100):0;const sc=job.status==='completed'?'#0d9488':(job.status==='running'?'#f59e0b':'#ef4444');const si=job.status==='completed'?'✅':(job.status==='running'?'🔄':'⏹️');html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+sc+'"><div style="font-weight:bold">'+si+' '+job.name+' <span style="color:#666;font-weight:normal">#'+job.id+'</span></div><div style="margin-top:8px;background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+percent+'%;height:16px;background:'+sc+';text-align:center;color:white;font-size:11px;line-height:16px">'+percent+'%</div></div><div style="font-size:13px;margin-top:6px">Processed: '+job.processed+' / '+job.total+' | ✅ '+job.valid+' | ❌ '+job.invalid+'</div></div>'});container.innerHTML=html}
 window.onload=function(){refreshJobs();setInterval(refreshJobs,10000)};
 </script>'''
     return render_page("Verify", body)
@@ -1206,14 +1274,11 @@ window.onload=function(){refreshJobs();setInterval(refreshJobs,10000)};
 @app.route('/scout')
 @login_required
 def scout():
-    preload = request.args.get('add', '')
     body = '''<div style="max-width:800px;margin:20px auto;padding:20px">
 <div style="background:#0d9488;color:white;padding:20px;border-radius:10px;margin-bottom:20px"><h1 style="margin:0">📨 Email Scout</h1></div>
 <div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
 <h3 style="margin-top:0">📥 Recipients</h3>
 <textarea id="emailsInput" oninput="syncRecipients()" style="width:100%;height:160px;border:1px solid #ddd;border-radius:5px;padding:10px;font-family:monospace;box-sizing:border-box"></textarea>
-<button onclick="loadFromFinder()" style="background:#0d9488;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;margin:8px 4px 0 0">From Finder</button>
-<button onclick="loadFromVerified()" style="background:#f59e0b;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;margin:8px 4px 0 0">From Verified</button>
 <button onclick="clearAll()" style="background:#ef4444;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;margin:8px 4px 0 0">Clear</button>
 <div id="emailCount" style="margin-top:10px;font-weight:bold">0 recipients</div>
 </div>
@@ -1223,70 +1288,45 @@ def scout():
 <input type="text" id="subjectLine" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;margin-bottom:10px;box-sizing:border-box">
 <label>Message</label>
 <textarea id="messageBody" rows="5" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;margin-bottom:10px;box-sizing:border-box"></textarea>
-<button onclick="insertPh('{name}')" style="background:#f59e0b;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer">{name}</button>
-<button onclick="insertPh('{email}')" style="background:#f59e0b;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer">{email}</button>
 <button onclick="generatePreview()" style="background:#0d9488;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer">👁️ Preview</button>
 <div id="preview" style="margin-top:10px;background:#f9f9f9;padding:10px;border-radius:5px;display:none;font-size:13px"></div>
 </div>
-<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px">
-<div style="background:white;padding:15px;text-align:center;border-radius:10px"><div id="totalScouted" style="font-size:22px;font-weight:bold;color:#0d9488">0</div><div>Total</div></div>
-<div style="background:white;padding:15px;text-align:center;border-radius:10px"><div id="todayScouted" style="font-size:22px;font-weight:bold;color:#0d9488">0</div><div>Today</div></div>
-<div style="background:white;padding:15px;text-align:center;border-radius:10px"><div id="workingRate" style="font-size:22px;font-weight:bold;color:#0d9488">0%</div><div>Rate</div></div>
-<div style="background:white;padding:15px;text-align:center;border-radius:10px"><div id="autoClickStatus" style="font-size:22px;font-weight:bold;color:#0d9488">Off</div><div>Auto</div></div>
-</div>
-<div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
-<h3 style="margin-top:0">🚀 Launch</h3>
-<button onclick="startCampaign()" style="background:#0d9488;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-right:8px;margin-bottom:8px">▶️ Start</button>
-<button onclick="stopCampaign()" style="background:#ef4444;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-right:8px;margin-bottom:8px">⏹️ Stop</button>
-<button onclick="openBulk()" style="background:#3b82f6;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer">📤 Open Next 10</button>
+<div style="background:white;padding:20px;border-radius:10px">
+<h3 style="margin-top:0">🚀 Send</h3>
+<button onclick="startCampaign()" style="background:#0d9488;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-right:8px">▶️ Start</button>
+<button onclick="stopCampaign()" style="background:#ef4444;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer">⏹️ Stop</button>
 <div id="launchStatus" style="margin-top:10px"></div>
 </div>
-<div style="background:white;padding:20px;border-radius:10px">
+<div style="background:white;padding:20px;border-radius:10px;margin-top:20px">
 <h3 style="margin-top:0">📊 Log</h3>
 <div id="log" style="max-height:150px;overflow-y:auto;background:#f9f9f9;padding:10px;border-radius:5px;font-size:13px"></div>
 </div></div>
 <script>
 let recipients=[],scoutedEmails=0,isRunning=false;
-function syncRecipients(){const val=document.getElementById('emailsInput').value;recipients=val.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);updateUI();saveState()}
+function syncRecipients(){const val=document.getElementById('emailsInput').value;recipients=val.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);document.getElementById('emailCount').textContent=recipients.length+' recipients';saveState()}
 window.onload=async function(){
   try{const res=await fetch('/load-scout-state');const data=await res.json();
     if(data.recipients && data.recipients.length > 0){recipients = data.recipients;document.getElementById('emailsInput').value = recipients.join('\\n');}
     if(data.subject) document.getElementById('subjectLine').value = data.subject;
     if(data.message) document.getElementById('messageBody').value = data.message;
-    if(data.count) scoutedEmails = data.count;
   }catch(e){}
-  const preload = new URLSearchParams(window.location.search).get('add');
-  if(preload){const ta = document.getElementById('emailsInput');if(ta && !ta.value) ta.value = preload;}
-  if(!recipients || recipients.length === 0){
-    try{const saved = localStorage.getItem('scoutRecipients');if(saved){const arr = JSON.parse(saved);if(arr && arr.length > 0){recipients = arr;document.getElementById('emailsInput').value = recipients.join('\\n');}}}catch(e){}
-  }
   const currentValue = document.getElementById('emailsInput').value.trim();
   if(currentValue){recipients = currentValue.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);}
-  updateUI();
+  document.getElementById('emailCount').textContent=recipients.length+' recipients';
 };
-function updateUI(){document.getElementById('emailCount').textContent=recipients.length+' recipients';document.getElementById('totalScouted').textContent=scoutedEmails;document.getElementById('todayScouted').textContent=scoutedEmails;document.getElementById('workingRate').textContent=(recipients.length>0?Math.round((scoutedEmails/recipients.length)*100):0)+'%'}
-async function saveState(){try{localStorage.setItem('scoutRecipients', JSON.stringify(recipients));await fetch('/save-scout-state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients:recipients,subject:document.getElementById('subjectLine').value,message:document.getElementById('messageBody').value,count:scoutedEmails})})}catch(e){}}
-async function loadFromFinder(){const res=await fetch('/get-stored-emails');const data=await res.json();if(data.emails&&data.emails.length>0){recipients=data.emails;document.getElementById('emailsInput').value=recipients.join('\\n');updateUI();saveState()}else{alert('No emails in Finder. Run a scan first.')}}
-async function loadFromVerified(){
-  let res=await fetch('/get-verified-emails');let data=await res.json();
-  let emails = (data.valid && data.valid.length > 0) ? data.valid : [];
-  if(emails.length === 0){try{const jobsRes = await fetch('/verify-jobs');const jobsData = await jobsRes.json();if(jobsData.jobs && jobsData.jobs.length > 0){for(const job of jobsData.jobs){if(job.status === 'completed' && job.valid > 0){const jobRes = await fetch('/verify-results/' + job.id);const jobData = await jobRes.json();if(jobData.valid && jobData.valid.length > 0){emails = jobData.valid;break;}}}}}catch(e){}}
-  if(emails.length > 0){recipients = emails;document.getElementById('emailsInput').value = recipients.join('\\n');updateUI();saveState();}else{alert('No verified emails yet. Run a verification first.');}
-}
-function clearAll(){recipients=[];scoutedEmails=0;document.getElementById('emailsInput').value='';document.getElementById('subjectLine').value='';document.getElementById('messageBody').value='';localStorage.removeItem('scoutRecipients');updateUI();saveState();isRunning=false;document.getElementById('autoClickStatus').textContent='Off'}
-function insertPh(t){document.getElementById('messageBody').value+=t;saveState()}
+async function saveState(){try{await fetch('/save-scout-state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients:recipients,subject:document.getElementById('subjectLine').value,message:document.getElementById('messageBody').value,count:scoutedEmails})})}catch(e){}}
+function clearAll(){recipients=[];scoutedEmails=0;document.getElementById('emailsInput').value='';document.getElementById('subjectLine').value='';document.getElementById('messageBody').value='';document.getElementById('emailCount').textContent='0 recipients';saveState();isRunning=false}
 function generatePreview(){const s=document.getElementById('subjectLine').value;const m=document.getElementById('messageBody').value;const p=document.getElementById('preview');p.innerHTML='<b>Subject:</b> '+s+'<br><br><b>Message:</b><br>'+m.replace('{name}','John Doe').replace('{email}','john@store.com');p.style.display='block'}
-function startCampaign(){if(recipients.length===0){alert('Add recipients first');return}isRunning=true;document.getElementById('autoClickStatus').textContent='On';document.getElementById('launchStatus').innerHTML='<p style="color:green">🚀 Started</p>';openNextEmail()}
-function stopCampaign(){isRunning=false;document.getElementById('autoClickStatus').textContent='Off';document.getElementById('launchStatus').innerHTML='<p style="color:red">⏹️ Stopped</p>';saveState()}
-function openNextEmail(){if(!isRunning)return;if(scoutedEmails>=recipients.length){isRunning=false;document.getElementById('autoClickStatus').textContent='Off';document.getElementById('launchStatus').innerHTML='<p style="color:blue">🎉 Complete</p>';saveState();return}const email=recipients[scoutedEmails];const subj=document.getElementById('subjectLine').value;const msg=document.getElementById('messageBody').value;const body=msg.replace('{name}','Store Owner').replace('{email}',email);window.location.href='mailto:'+email+'?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(body);const log=document.getElementById('log');log.innerHTML+='<div>📨 '+email+'</div>';log.scrollTop=log.scrollHeight;scoutedEmails++;updateUI();saveState()}
+function startCampaign(){if(recipients.length===0){alert('Add recipients first');return}isRunning=true;document.getElementById('launchStatus').innerHTML='<p style="color:green">🚀 Started</p>';openNextEmail()}
+function stopCampaign(){isRunning=false;document.getElementById('launchStatus').innerHTML='<p style="color:red">⏹️ Stopped</p>';saveState()}
+function openNextEmail(){if(!isRunning)return;if(scoutedEmails>=recipients.length){isRunning=false;document.getElementById('launchStatus').innerHTML='<p style="color:blue">🎉 Complete</p>';saveState();return}const email=recipients[scoutedEmails];const subj=document.getElementById('subjectLine').value;const msg=document.getElementById('messageBody').value;const body=msg.replace('{name}','Store Owner').replace('{email}',email);window.location.href='mailto:'+email+'?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(body);const log=document.getElementById('log');log.innerHTML+='<div>📨 '+email+'</div>';log.scrollTop=log.scrollHeight;scoutedEmails++;saveState()}
 document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible'&&isRunning)setTimeout(openNextEmail,2000)});
 document.addEventListener('click',function(e){if(isRunning&&scoutedEmails<recipients.length&&!e.target.closest('button'))setTimeout(openNextEmail,2000)});
-function openBulk(){const subj=document.getElementById('subjectLine').value;const msg=document.getElementById('messageBody').value;for(let i=0;i<Math.min(10,recipients.length-scoutedEmails);i++){const email=recipients[scoutedEmails+i];const body=msg.replace('{name}','Store Owner').replace('{email}',email);window.open('mailto:'+email+'?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(body),'_blank')}scoutedEmails+=Math.min(10,recipients.length-scoutedEmails);updateUI();saveState()}
 </script>'''
     return render_page("Scout", body)
 
 # ==========================================
-# AUDIT PAGE
+# ANALYZE & SEND (Main Page)
 # ==========================================
 @app.route('/audit')
 @login_required
@@ -1295,26 +1335,52 @@ def audit_page():
     sender_name = get_user_sender_name(user_email) or ''
     preload = request.args.get('url', '')
     body = '''<div style="max-width:900px;margin:20px auto;padding:20px">
-<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
-<label style="font-weight:bold">Store URL</label>
-<input type="text" id="auditUrl" placeholder="e.g. golfsociety.shop" value="''' + preload.replace('"','') + '''" style="width:100%;padding:12px;border:2px solid #ddd;border-radius:8px;font-size:16px;margin:10px 0;box-sizing:border-box">
-<button onclick="runAudit()" style="background:#65a30d;color:white;padding:12px 30px;border:none;border-radius:8px;cursor:pointer;font-size:16px;width:100%">🔍 Run Audit</button>
-<div id="auditStatus" style="margin-top:10px"></div>
-</div>
+
 <div style="background:#65a30d;color:white;padding:20px;border-radius:10px;margin-bottom:20px;display:flex;align-items:center;gap:16px">
 <svg width="56" height="56" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" style="flex-shrink:0"><path d="M32 4L8 14V30C8 45 19 57 32 60C45 57 56 45 56 30V14L32 4Z" fill="white" opacity="0.25" stroke="white" stroke-width="2" stroke-linejoin="round"/><path d="M22 32L29 39L43 25" stroke="white" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-<div><h1 style="margin:0;font-size:24px">Security Analysis</h1><p style="margin:4px 0 0 0;font-size:14px;opacity:0.9">Real audit of any Shopify store</p></div>
+<div><h1 style="margin:0;font-size:24px">Analyze & Send</h1><p style="margin:4px 0 0 0;font-size:14px;opacity:0.9">Bulk audit + personalized outreach</p></div>
 </div>
-<div id="currentAuditLabel" style="display:none;color:#65a30d;font-weight:bold;margin-bottom:10px">▼ Current audit</div>
+
+<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
+<h3 style="margin-top:0">📥 Import Emails</h3>
+<button onclick="importFrom('finder')" style="background:#667eea;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:13px">🔍 From Finder</button>
+<button onclick="importFrom('discovery')" style="background:#8b5cf6;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:13px">🎯 From Discovery</button>
+<button onclick="importFrom('verified')" style="background:#f59e0b;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:13px">✅ From Verified</button>
+<button onclick="toggleManual()" style="background:#0d9488;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:13px">✍️ Paste Manual</button>
+<div id="manualPaste" style="display:none;margin-top:10px">
+<textarea id="manualEmails" placeholder="Paste emails one per line" style="width:100%;height:100px;padding:10px;border:1px solid #ddd;border-radius:5px;font-family:monospace;box-sizing:border-box"></textarea>
+<button onclick="addManual()" style="background:#0d9488;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;margin-top:5px">Add to Queue</button>
+</div>
+<div id="importStatus" style="margin-top:10px"></div>
+</div>
+
+<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
+<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+<h3 style="margin:0">📋 Queue (<span id="queueCount">0</span>)</h3>
+<button onclick="clearQueue()" style="background:#ef4444;color:white;padding:6px 14px;border:none;border-radius:5px;cursor:pointer;font-size:12px">🗑️ Clear Pending</button>
+</div>
+<div id="progressBar" style="margin-top:12px;display:none;background:#e0e0e0;border-radius:8px;overflow:hidden">
+<div id="progressFill" style="height:20px;background:linear-gradient(90deg,#4ade80,#22c55e);text-align:center;color:white;font-size:12px;line-height:20px;transition:width 0.3s">0%</div>
+</div>
+<div id="queueList" style="margin-top:12px">Loading...</div>
+</div>
+
+<div id="modeButtons" style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
+<h3 style="margin-top:0">🚀 Start Processing</h3>
+<button onclick="startManualMode()" style="background:#3b82f6;color:white;padding:14px 24px;border:none;border-radius:8px;cursor:pointer;font-size:16px;margin-right:10px;margin-bottom:10px">▶️ Start Manual</button>
+<button onclick="startAutoMode()" style="background:#0d9488;color:white;padding:14px 24px;border:none;border-radius:8px;cursor:pointer;font-size:16px;margin-bottom:10px">⚡ Start Auto</button>
+<button onclick="stopAutoMode()" id="stopBtn" style="background:#ef4444;color:white;padding:14px 24px;border:none;border-radius:8px;cursor:pointer;font-size:16px;display:none;margin-left:10px">⏹️ Stop Auto</button>
+<div id="modeStatus" style="margin-top:10px"></div>
+</div>
+
+<div id="auditSection" style="display:none">
+<div id="currentEmailLabel" style="background:#65a30d;color:white;padding:10px 16px;border-radius:8px;font-weight:bold;margin-bottom:15px"></div>
 <div id="auditResult"></div>
 
 <div id="outreachSection" style="display:none;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-top:20px">
-<h3 style="margin-top:0">✉️ Generate Outreach Email</h3>
-<p style="color:#666;font-size:13px">Uses your audit findings to write a personalized email.</p>
-<div style="margin-bottom:10px">
+<h3 style="margin-top:0">✉️ Outreach Email</h3>
 <label style="font-weight:bold;font-size:13px">Your name:</label>
 <input type="text" id="senderName" value="''' + sender_name.replace('"','') + '''" placeholder="e.g. Daniel Phillips" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:5px;margin:5px 0 10px 0;box-sizing:border-box;font-size:14px">
-</div>
 <div style="margin-bottom:10px">
 <button onclick="generateEmail('friendly')" style="background:#0d9488;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;margin-right:5px">😊 Friendly</button>
 <button onclick="generateEmail('professional')" style="background:#3b82f6;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;margin-right:5px">💼 Professional</button>
@@ -1325,178 +1391,378 @@ def audit_page():
 <input type="text" id="genSubject" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;margin:5px 0 10px 0;box-sizing:border-box;font-size:14px">
 <label style="font-weight:bold;font-size:13px">Message:</label>
 <textarea id="genBody" rows="10" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;margin-top:5px;box-sizing:border-box;font-size:13px;font-family:monospace"></textarea>
-<button onclick="copyEmail()" style="background:#3b82f6;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;margin-top:10px;margin-right:5px">📋 Copy</button>
-<button onclick="sendToScout()" style="background:#0d9488;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;margin-top:10px">📨 Send to Scout</button>
-<div id="copyStatus" style="font-size:12px;color:green;margin-top:5px"></div>
+<button onclick="sendToScoutAndOpen()" style="background:#0d9488;color:white;padding:12px 24px;border:none;border-radius:6px;cursor:pointer;font-size:15px;margin-top:12px;margin-right:8px">📨 Send to Scout & Open Gmail</button>
+<button onclick="skipCurrent()" style="background:#6b7280;color:white;padding:12px 24px;border:none;border-radius:6px;cursor:pointer;font-size:15px;margin-top:12px">⏭️ Skip</button>
+<div id="actionStatus" style="font-size:13px;color:green;margin-top:8px"></div>
+</div>
 </div>
 </div>
 
-<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-top:20px">
-<h3 style="margin-top:0">📋 Last 3 Audits (Previous)</h3>
-<div id="auditHistory">Loading...</div>
-</div>
 </div>
 <script>
-let currentReport = null;
+let currentItem = null;
+let currentAuditReport = null;
+let autoMode = false;
+let currentMode = null;
 
-async function runAudit(){
-  const url=document.getElementById('auditUrl').value.trim();
-  if(!url){alert('Enter URL');return}
-  const status=document.getElementById('auditStatus');const result=document.getElementById('auditResult');
-  status.innerHTML='<p style="color:#666">⏳ Analyzing... this may take 30-45 seconds</p>';
-  result.innerHTML='<p style="color:#666;text-align:center;padding:30px">Please wait... checking store, products, policies, apps, payments, SEO</p>';
-  document.getElementById('outreachSection').style.display='none';
-  document.getElementById('currentAuditLabel').style.display='none';
-  const c=new AbortController();const t=setTimeout(()=>c.abort(),120000);
+// ============================================
+// QUEUE MANAGEMENT
+// ============================================
+async function loadQueue(){
   try{
-    const res=await fetch('/run-audit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:url}),signal:c.signal});
-    clearTimeout(t);
-    if(!res.ok){status.innerHTML='<p style="color:red">HTTP '+res.status+'</p>';result.innerHTML='';return}
-    const data=await res.json();
-    if(data.error){status.innerHTML='<p style="color:red">'+data.error+'</p>';result.innerHTML='';return}
-    currentReport = data;
-    status.innerHTML='<p style="color:green">✅ Complete</p>';
-    document.getElementById('currentAuditLabel').style.display='block';
-    renderReport(data);
-    document.getElementById('outreachSection').style.display='block';
-    loadAuditHistory();
-  }catch(e){clearTimeout(t);status.innerHTML='<p style="color:red">'+(e.name==='AbortError'?'Timeout':'Error: '+e.message)+'</p>';result.innerHTML=''}
+    const res = await fetch('/get-audit-queue');
+    const data = await res.json();
+    const c = document.getElementById('queueList');
+    document.getElementById('queueCount').textContent = data.items.length;
+    // Progress
+    const total = data.items.length;
+    const done = data.items.filter(i=>i.status==='done'||i.status==='skipped').length;
+    if(total > 0){
+      document.getElementById('progressBar').style.display='block';
+      const pct = Math.round((done/total)*100);
+      document.getElementById('progressFill').style.width = pct + '%';
+      document.getElementById('progressFill').textContent = pct + '% (' + done + '/' + total + ')';
+    }
+    if(total === 0){ c.innerHTML='<p style="color:#666">Queue empty. Import emails above to start.</p>'; return; }
+    let html='';
+    data.items.forEach(i=>{
+      let icon = '⏳';
+      let color = '#f59e0b';
+      if(i.status==='done'){ icon='✅'; color='#16a34a'; }
+      else if(i.status==='current'){ icon='▶️'; color='#3b82f6'; }
+      else if(i.status==='skipped'){ icon='⏭️'; color='#6b7280'; }
+      html += '<div style="background:#f9f9f9;padding:10px;border-radius:6px;margin:6px 0;border-left:4px solid '+color+';display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">';
+      html += '<div style="font-size:14px"><span style="margin-right:8px">'+icon+'</span><b>'+i.email+'</b><br><span style="color:#666;font-size:12px">'+i.domain+'</span></div>';
+      html += '<div style="display:flex;gap:6px">';
+      if(i.status === 'pending' || i.status === 'current'){
+        html += '<button onclick="analyzeItem('+i.id+')" style="background:#3b82f6;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">Analyze</button>';
+        html += '<button onclick="skipItem('+i.id+')" style="background:#6b7280;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">Skip</button>';
+      } else if(i.status==='done' || i.status==='skipped'){
+        html += '<button onclick="resetItem('+i.id+')" style="background:#f59e0b;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">Undo</button>';
+      }
+      html += '</div></div>';
+    });
+    c.innerHTML = html;
+  }catch(e){ console.error(e); }
 }
+
+async function importFrom(source){
+  const status = document.getElementById('importStatus');
+  status.innerHTML = '<p style="color:#666">⏳ Importing from '+source+'...</p>';
+  try{
+    const res = await fetch('/import-to-queue', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({source: source})
+    });
+    const data = await res.json();
+    if(data.success){
+      status.innerHTML = '<p style="color:green">✅ Added '+data.added+' (skipped '+data.skipped+' duplicates)</p>';
+      loadQueue();
+    } else { status.innerHTML = '<p style="color:red">Error: '+(data.error||'Unknown')+'</p>'; }
+  }catch(e){ status.innerHTML = '<p style="color:red">Error: '+e.message+'</p>'; }
+}
+
+function toggleManual(){
+  const el = document.getElementById('manualPaste');
+  el.style.display = el.style.display === 'none' ? 'block' : 'none';
+}
+async function addManual(){
+  const text = document.getElementById('manualEmails').value;
+  const emails = text.split('\\n').map(s=>s.trim()).filter(s=>s.includes('@'));
+  if(emails.length === 0){ alert('No valid emails'); return; }
+  const res = await fetch('/add-to-queue', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({emails: emails})});
+  const data = await res.json();
+  if(data.success){
+    document.getElementById('importStatus').innerHTML = '<p style="color:green">✅ Added '+data.added+' (skipped '+data.skipped+')</p>';
+    document.getElementById('manualEmails').value='';
+    loadQueue();
+  }
+}
+
+async function clearQueue(){
+  if(!confirm('Clear all pending items?')) return;
+  await fetch('/clear-queue', {method:'POST'});
+  loadQueue();
+}
+
+async function skipItem(id){
+  await fetch('/update-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id, status:'skipped'})});
+  loadQueue();
+}
+
+async function resetItem(id){
+  await fetch('/update-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id, status:'pending'})});
+  loadQueue();
+}
+
+// ============================================
+// ANALYZE
+// ============================================
+async function analyzeItem(id){
+  document.getElementById('auditSection').style.display = 'block';
+  document.getElementById('auditResult').innerHTML = '<p style="color:#666;padding:20px;text-align:center">⏳ Running audit... 30-45 seconds</p>';
+  document.getElementById('outreachSection').style.display = 'none';
+  document.getElementById('currentEmailLabel').textContent = '🔍 Loading...';
+  // Mark as current
+  await fetch('/update-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id, status:'current'})});
+  try{
+    const res = await fetch('/analyze-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})});
+    const data = await res.json();
+    if(data.success){
+      currentItem = data.item;
+      currentAuditReport = data.item.report;
+      document.getElementById('currentEmailLabel').textContent = '📧 ' + currentItem.email + '  →  ' + currentItem.domain;
+      renderReport(data.item.report);
+      document.getElementById('outreachSection').style.display = 'block';
+      // auto-generate friendly email
+      generateEmail('friendly');
+      loadQueue();
+    } else {
+      document.getElementById('auditResult').innerHTML = '<p style="color:red">Error: '+(data.error||'Unknown')+'</p>';
+    }
+  }catch(e){
+    document.getElementById('auditResult').innerHTML = '<p style="color:red">Error: '+e.message+'</p>';
+  }
+}
+
 function scoreColor(s){if(s>=75)return '#16a34a';if(s>=50)return '#f59e0b';return '#ef4444'}
 function scoreBar(l,s){const c=scoreColor(s);return '<div style="margin:10px 0"><div style="display:flex;justify-content:space-between;margin-bottom:4px"><b>'+l+'</b><span style="color:'+c+';font-weight:bold">'+s+'%</span></div><div style="background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+s+'%;height:12px;background:'+c+'"></div></div></div>'}
+
 function renderReport(r){
   const ch=r.checks||{};const sc=r.scores||{};const iss=r.issues||[];
   let h='';
-  h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px"><div><h2 style="margin:0">Store Audit Overview</h2><div style="color:#666;font-size:13px;margin-top:6px">Store: <a href="https://'+r.domain+'" target="_blank" style="color:#3b82f6"><b>https://'+r.domain+'/</b></a></div></div>'+(r.case_id?'<div style="background:#f3f4f6;padding:6px 12px;border-radius:6px;font-size:13px;color:#374151">Case ID: <b>'+r.case_id+'</b></div>':'')+'</div></div>';
-  h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><h3 style="margin-top:0">📈 Scores</h3>'+scoreBar('Overall',sc.overall_score||0)+scoreBar('Trust',sc.trust_score||0)+scoreBar('Technical',sc.technical_score||0)+scoreBar('Marketing',sc.marketing_score||0)+'</div>';
+  h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:15px"><h2 style="margin:0">Store Audit Overview</h2><div style="color:#666;font-size:13px;margin-top:6px">Store: <a href="https://'+r.domain+'" target="_blank" style="color:#3b82f6">https://'+r.domain+'/</a></div>'+(r.case_id?'<div style="background:#f3f4f6;padding:6px 12px;border-radius:6px;font-size:13px;color:#374151;margin-top:8px;display:inline-block">Case ID: <b>'+r.case_id+'</b></div>':'')+'</div>';
+  h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:15px"><h3 style="margin-top:0">📈 Scores</h3>'+scoreBar('Overall',sc.overall_score||0)+scoreBar('Trust',sc.trust_score||0)+scoreBar('Technical',sc.technical_score||0)+scoreBar('Marketing',sc.marketing_score||0)+'</div>';
   const hi=iss.filter(i=>i.severity==='high');
-  if(hi.length>0)h+='<div style="background:#fef2f2;border-left:4px solid #ef4444;padding:15px;border-radius:8px;margin-bottom:20px"><div style="color:#991b1b;font-weight:bold;font-size:16px;margin-bottom:6px">⚠️ Critical issues detected!</div><div style="color:#7f1d1d;font-size:13px">'+hi.length+' high-priority issue(s)</div></div>';
-  if(iss.length>0){h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><h3 style="margin-top:0;color:#991b1b">⚠️ Issues Found ('+iss.length+')</h3>';iss.forEach(i=>{const c=i.severity==='high'?'#ef4444':(i.severity==='medium'?'#f59e0b':'#6b7280');h+='<div style="background:#fef2f2;border-left:4px solid '+c+';padding:15px;border-radius:8px;margin:10px 0"><div style="font-weight:bold;font-size:15px;margin-bottom:6px">⚠️ '+i.title+'</div><div style="color:#374151;font-size:14px;margin-bottom:8px">'+i.description+'</div><div style="background:#fef3c7;padding:10px;border-radius:6px;font-size:13px;color:#78350f"><b>💡 Recommendation:</b> '+i.recommendation+'</div></div>'});h+='</div>'}else{h+='<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:15px;border-radius:8px;margin-bottom:20px"><div style="color:#166534;font-weight:bold">✅ No critical issues detected</div></div>'}
-  if(r.positives&&r.positives.length>0){h+='<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:15px;border-radius:8px;margin-bottom:20px"><h3 style="margin-top:0;color:#166534">✅ What Works Well</h3>';r.positives.forEach(p=>{h+='<div style="margin:6px 0;color:#14532d">✅ '+p+'</div>'});h+='</div>'}
-  h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><h3 style="margin-top:0">🔍 Detailed Checks</h3><table style="width:100%;border-collapse:collapse;font-size:14px">';
-  function row(l,v){return '<tr><td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold">'+l+'</td><td style="padding:8px;border-bottom:1px solid #eee">'+v+'</td></tr>'}
-  h+=row('Is Shopify Store',ch.is_shopify?'✅ Yes':'❌ Not detected');
-  h+=row('HTTPS',ch.https?'✅ Enabled':'❌ Disabled');
-  h+=row('Load Time',ch.load_time_seconds?ch.load_time_seconds+'s':'N/A');
-  h+=row('Store Age',ch.store_age_label||'Unknown');
-  h+=row('Product Count',(ch.product_count!==null&&ch.product_count!==undefined)?ch.product_count+(ch.product_count_capped?'+':''):'N/A');
-  h+=row('Max Image Size',ch.max_image_kb?ch.max_image_kb+' KB':'N/A');
-  h+=row('Theme',ch.theme||'Unknown');
-  h+=row('Mobile Responsive',ch.mobile_responsive?'✅ Yes':'❌ No');
-  h+=row('Cart Type',ch.cart_type||'Unknown');
-  h+=row('Currency',ch.currency||'Unknown');
-  h+=row('Payment Options',(ch.payment_methods&&ch.payment_methods.length>0)?ch.payment_methods.join(', '):'None detected');
-  h+=row('Free Shipping',ch.free_shipping_advertised?'✅ Advertised':'❌ Not advertised');
-  h+=row('Reviews App',(ch.review_apps&&ch.review_apps.length>0)?ch.review_apps.join(', '):'None');
-  h+=row('Contact Page',ch.has_contact_page?'✅ Found':'❌ Not found');
-  h+=row('Email Link',ch.has_email_link?'✅ Found':'❌ Not found');
-  h+=row('Phone Link',ch.has_phone_link?'✅ Found':'❌ Not found');
-  h+=row('Policy Pages',ch.policy_pages_found||'0/4');
-  h+=row('Social Links',(ch.social_links&&ch.social_links.length>0)?ch.social_links.join(', '):'None found');
-  h+=row('Meta Title',(ch.meta_title_length||0)+' chars');
-  h+=row('Meta Description',(ch.meta_description_length||0)+' chars');
-  h+=row('Detected Apps',(ch.detected_apps&&ch.detected_apps.length>0)?ch.detected_apps.join(', '):'None detected');
-  h+='</table></div>';
-  h+='<div style="background:#eff6ff;border-left:4px solid #3b82f6;padding:15px;border-radius:8px;font-size:13px;color:#1e40af"><b>ℹ️ Note:</b> This audit uses only publicly available data. Sales, customer counts, and checkout abandonment cannot be measured from outside a store.</div>';
+  if(hi.length>0)h+='<div style="background:#fef2f2;border-left:4px solid #ef4444;padding:15px;border-radius:8px;margin-bottom:15px"><div style="color:#991b1b;font-weight:bold">⚠️ '+hi.length+' critical issue(s) found</div></div>';
+  if(iss.length>0){h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:15px"><h3 style="margin-top:0;color:#991b1b">⚠️ Issues ('+iss.length+')</h3>';iss.forEach(i=>{const c=i.severity==='high'?'#ef4444':(i.severity==='medium'?'#f59e0b':'#6b7280');h+='<div style="background:#fef2f2;border-left:4px solid '+c+';padding:12px;border-radius:6px;margin:8px 0"><div style="font-weight:bold;font-size:14px">⚠️ '+i.title+'</div><div style="color:#374151;font-size:13px;margin:4px 0">'+i.description+'</div><div style="background:#fef3c7;padding:8px;border-radius:5px;font-size:12px;color:#78350f"><b>💡</b> '+i.recommendation+'</div></div>'});h+='</div>'}
+  if(r.positives&&r.positives.length>0){h+='<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:12px;border-radius:6px;margin-bottom:15px"><b style="color:#166534">✅ What Works Well</b>';r.positives.forEach(p=>{h+='<div style="margin:4px 0;color:#14532d;font-size:13px">✅ '+p+'</div>'});h+='</div>'}
   document.getElementById('auditResult').innerHTML=h;
 }
 
+// ============================================
+// EMAIL GENERATION
+// ============================================
 async function generateEmail(tone){
-  if(!currentReport){alert('Run an audit first');return}
+  if(!currentAuditReport){ alert('No audit yet'); return; }
   const senderName = document.getElementById('senderName').value.trim();
   try{
     const res = await fetch('/generate-email', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({report: currentReport, tone: tone, sender_name: senderName})
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({report: currentAuditReport, tone: tone, sender_name: senderName})
     });
     const data = await res.json();
     if(data.success){
       document.getElementById('genSubject').value = data.subject;
       document.getElementById('genBody').value = data.body;
       document.getElementById('emailPreview').style.display = 'block';
-      document.getElementById('copyStatus').textContent = '';
       if(senderName){
         fetch('/save-sender-name',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sender_name:senderName})});
       }
-    } else {
-      alert('Error: ' + (data.error || 'Unknown'));
     }
-  }catch(e){alert('Error: '+e.message)}
-}
-function copyEmail(){
-  const subj = document.getElementById('genSubject').value;
-  const body = document.getElementById('genBody').value;
-  const full = 'Subject: ' + subj + '\\n\\n' + body;
-  navigator.clipboard.writeText(full).then(()=>{
-    document.getElementById('copyStatus').textContent = '✅ Copied to clipboard!';
-    setTimeout(()=>{document.getElementById('copyStatus').textContent='';},3000);
-  }).catch(()=>{alert('Copy failed. Long-press to select manually.')});
-}
-async function sendToScout(){
-  const subj = document.getElementById('genSubject').value;
-  const body = document.getElementById('genBody').value;
-  if(!subj || !body){alert('Generate email first');return}
-  await fetch('/save-scout-state',{
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({recipients:[], subject:subj, message:body, count:0})
-  });
-  window.location.href='/scout';
+  }catch(e){ alert('Error: '+e.message); }
 }
 
-async function loadAuditHistory(){
-  const res=await fetch('/get-audit-history');const data=await res.json();
-  const c=document.getElementById('auditHistory');
-  if(!data.audits||data.audits.length===0){c.innerHTML='<p style="color:#666">No previous audits.</p>';return}
-  let html='';
-  data.audits.forEach(a=>{
-    const color=scoreColor(a.score);
-    html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+color+'">';
-    html+='<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
-    html+='<div><b><a href="https://'+a.domain+'" target="_blank" style="color:#3b82f6;text-decoration:none">'+a.domain+'</a></b> <span style="color:'+color+';font-weight:bold">'+a.score+'%</span><br><span style="font-size:12px;color:#666">'+a.created_at+'</span></div>';
-    html+='<button onclick="toggleViewAudit('+a.id+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">View</button>';
-    html+='</div><div id="audit-view-'+a.id+'" style="display:none;margin-top:10px"></div></div>';
+async function sendToScoutAndOpen(){
+  if(!currentItem){ alert('No active item'); return; }
+  const subj = document.getElementById('genSubject').value;
+  const body = document.getElementById('genBody').value;
+  if(!subj || !body){ alert('Generate email first'); return; }
+  // Save subject + message to current item
+  await fetch('/update-queue-item', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id:currentItem.id, subject:subj, message:body})
   });
-  c.innerHTML=html;
+  // Add to scout
+  await fetch('/save-scout-recipients', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({recipients: [currentItem.email]})
+  });
+  await fetch('/save-scout-state', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({recipients: [currentItem.email], subject:subj, message:body, count:0})
+  });
+  // Mark as done
+  await fetch('/update-queue-item', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id:currentItem.id, status:'done'})
+  });
+  await fetch('/mark-sent', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({email: currentItem.email})
+  });
+  // Open Gmail
+  const mailto = 'mailto:' + currentItem.email + '?subject=' + encodeURIComponent(subj) + '&body=' + encodeURIComponent(body);
+  window.location.href = mailto;
+  // In auto mode, will advance when user returns
 }
-async function toggleViewAudit(id){
-  const c=document.getElementById('audit-view-'+id);
-  if(c.style.display==='block'){c.style.display='none';return}
-  c.style.display='block';
-  c.innerHTML='<p style="color:#666;font-size:12px">Loading...</p>';
+
+async function skipCurrent(){
+  if(!currentItem){ return; }
+  await fetch('/update-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentItem.id, status:'skipped'})});
+  currentItem = null;
+  document.getElementById('auditSection').style.display = 'none';
+  loadQueue();
+  if(autoMode){ nextAuto(); }
+}
+
+// ============================================
+// AUTO MODE
+// ============================================
+async function startManualMode(){
+  currentMode = 'manual';
+  document.getElementById('modeStatus').innerHTML = '<p style="color:blue">▶️ Manual mode: click each email to analyze</p>';
+  document.getElementById('stopBtn').style.display = 'none';
+}
+
+async function startAutoMode(){
+  currentMode = 'auto';
+  autoMode = true;
+  document.getElementById('modeStatus').innerHTML = '<p style="color:green">⚡ Auto mode ON — processing queue automatically</p>';
+  document.getElementById('stopBtn').style.display = 'inline-block';
+  nextAuto();
+}
+
+async function stopAutoMode(){
+  autoMode = false;
+  currentMode = null;
+  document.getElementById('modeStatus').innerHTML = '<p style="color:red">⏹️ Auto mode stopped</p>';
+  document.getElementById('stopBtn').style.display = 'none';
+}
+
+async function nextAuto(){
+  if(!autoMode) return;
   try{
-    const res=await fetch('/get-audit-detail/'+id);
-    const data=await res.json();
-    if(!data.report){c.innerHTML='<p style="color:#666;font-size:12px">Not found.</p>';return}
-    const r=data.report;const sc=r.scores||{};
-    let html='<div style="background:white;padding:12px;border-radius:6px;font-size:13px">';
-    html+='<b>Overall Score:</b> '+scoreBar('',sc.overall_score||0);
-    html+='<div style="margin-top:8px"><b>Case ID:</b> '+(r.case_id||'N/A')+'</div>';
-    html+='<div style="margin-top:4px"><b>Products:</b> '+(r.checks&&r.checks.product_count!==undefined?r.checks.product_count:'N/A')+'</div>';
-    html+='<div style="margin-top:4px"><b>Issues:</b> '+(r.issues?r.issues.length:0)+'</div>';
-    html+='<button onclick="loadFullAudit('+id+')" style="background:#65a30d;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px;margin-top:10px">Load Full Report</button>';
-    html+='</div>';
-    c.innerHTML=html;
-  }catch(e){c.innerHTML='<p style="color:red;font-size:12px">Error loading</p>'}
+    const res = await fetch('/get-next-pending');
+    const data = await res.json();
+    if(data.item){
+      document.getElementById('modeStatus').innerHTML = '<p style="color:green">⚡ Auto: analyzing '+data.item.email+'...</p>';
+      await analyzeItem(data.item.id);
+    } else {
+      autoMode = false;
+      document.getElementById('modeStatus').innerHTML = '<p style="color:blue">🎉 Auto complete! All emails processed.</p>';
+      document.getElementById('stopBtn').style.display = 'none';
+    }
+  }catch(e){ console.error(e); }
 }
-async function loadFullAudit(id){
-  try{
-    const res=await fetch('/get-audit-detail/'+id);
-    const data=await res.json();
-    if(!data.report){alert('Not found');return}
-    currentReport = data.report;
-    document.getElementById('currentAuditLabel').style.display='block';
-    renderReport(currentReport);
-    document.getElementById('outreachSection').style.display='block';
-    window.scrollTo({top:0,behavior:'smooth'});
-  }catch(e){alert('Error loading')}
-}
-window.onload=function(){loadAuditHistory();if(document.getElementById('auditUrl').value.trim())runAudit()};
+
+// Resume auto mode when user returns
+document.addEventListener('visibilitychange', function(){
+  if(document.visibilityState === 'visible' && autoMode && currentItem){
+    // The previous email was opened; mark done already happened. Advance to next.
+    setTimeout(nextAuto, 2000);
+  }
+});
+
+window.onload = function(){ loadQueue(); };
 </script>'''
-    return render_page("Security Analysis", body)
+    return render_page("Analyze & Send", body)
 
 # ==========================================
-# API ROUTES
+# QUEUE API ROUTES
+# ==========================================
+@app.route('/get-audit-queue')
+@login_required
+def get_audit_queue_route():
+    user_email = session.get('user_id')
+    return jsonify({'items': get_queue(user_email)})
+
+@app.route('/import-to-queue', methods=['POST'])
+@login_required
+def import_to_queue():
+    user_email = session.get('user_id')
+    source = request.json.get('source', '')
+    emails = []
+    try:
+        if source == 'finder':
+            state = load_user_state(user_email)
+            emails = state.get('found_emails', [])
+        elif source == 'verified':
+            state = load_user_state(user_email)
+            emails = state.get('verified_emails', [])
+            if not emails:
+                # fall back to most recent completed verify job
+                conn = get_db()
+                if conn:
+                    try:
+                        cur = conn.cursor()
+                        cur.execute("SELECT valid_emails FROM verify_jobs WHERE user_email = %s AND status = 'completed' ORDER BY created_at DESC LIMIT 1", (user_email,))
+                        row = cur.fetchone(); cur.close()
+                        if row and row[0]: emails = row[0].split('|||')
+                    except: pass
+                    finally: release_db(conn)
+        elif source == 'discovery':
+            # Discovery stores don't have emails yet - skip
+            return jsonify({'success': False, 'error': 'Discovery only has store URLs, not emails. Run Email Finder first.'})
+        else:
+            return jsonify({'success': False, 'error': 'Unknown source'})
+        if not emails:
+            return jsonify({'success': False, 'error': 'No emails available from this source'})
+        added, skipped = add_to_queue(user_email, emails)
+        return jsonify({'success': True, 'added': added, 'skipped': skipped})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/add-to-queue', methods=['POST'])
+@login_required
+def add_to_queue_route():
+    user_email = session.get('user_id')
+    emails = request.json.get('emails', [])
+    added, skipped = add_to_queue(user_email, emails)
+    return jsonify({'success': True, 'added': added, 'skipped': skipped})
+
+@app.route('/update-queue-item', methods=['POST'])
+@login_required
+def update_queue_item_route():
+    user_email = session.get('user_id')
+    data = request.json
+    item_id = data.pop('id', None)
+    if not item_id: return jsonify({'success': False, 'error': 'No id'})
+    update_queue_item(item_id, user_email, **data)
+    return jsonify({'success': True})
+
+@app.route('/mark-sent', methods=['POST'])
+@login_required
+def mark_sent_route():
+    user_email = session.get('user_id')
+    email = request.json.get('email', '')
+    if email: mark_sent(user_email, email)
+    return jsonify({'success': True})
+
+@app.route('/clear-queue', methods=['POST'])
+@login_required
+def clear_queue_route():
+    user_email = session.get('user_id')
+    n = clear_queue(user_email, only_pending=True)
+    return jsonify({'success': True, 'cleared': n})
+
+@app.route('/get-next-pending')
+@login_required
+def get_next_pending_route():
+    user_email = session.get('user_id')
+    item = get_next_pending_item(user_email)
+    return jsonify({'item': item})
+
+@app.route('/analyze-queue-item', methods=['POST'])
+@login_required
+def analyze_queue_item():
+    user_email = session.get('user_id')
+    item_id = request.json.get('id')
+    item = get_queue_item(item_id, user_email)
+    if not item: return jsonify({'success': False, 'error': 'Item not found'})
+    # If already has report, return cached
+    if item.get('report'):
+        return jsonify({'success': True, 'item': item})
+    # Run audit
+    case_id = generate_case_id()
+    report = audit_store(item['domain'], case_id)
+    update_queue_item(item_id, user_email, report=report, status='current')
+    save_audit_history(user_email, item['domain'], report)
+    item = get_queue_item(item_id, user_email)
+    return jsonify({'success': True, 'item': item})
+
+# ==========================================
+# OTHER API ROUTES
 # ==========================================
 @app.route('/save-sender-name', methods=['POST'])
 @login_required
@@ -1516,43 +1782,12 @@ def generate_email_route():
     sender_name = data.get('sender_name', '').strip()
     if not sender_name:
         sender_name = get_user_sender_name(session.get('user_id')) or ''
-    if not report:
-        return jsonify({'success': False, 'error': 'No report data'})
+    if not report: return jsonify({'success': False, 'error': 'No report data'})
     try:
         result = generate_outreach_email(report, tone, sender_name)
         return jsonify({'success': True, 'subject': result['subject'], 'body': result['body']})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
-
-@app.route('/run-audit', methods=['POST'])
-@login_required
-def run_audit():
-    import traceback
-    data = request.json
-    url = data.get('url', '').strip()
-    if not url: return jsonify({'error': 'No URL provided'})
-    case_id = generate_case_id()
-    try:
-        report = audit_store(url, case_id)
-        user_email = session.get('user_id')
-        if user_email:
-            save_audit_history(user_email, report.get('domain', url), report)
-        return jsonify(report)
-    except Exception as e:
-        print(f"AUDIT ERROR: {traceback.format_exc()}")
-        return jsonify({'error': f'{type(e).__name__}: {str(e)}'})
-
-@app.route('/get-audit-history')
-@login_required
-def get_audit_history_route():
-    user_email = session.get('user_id')
-    return jsonify({'audits': get_audit_history(user_email)})
-
-@app.route('/get-audit-detail/<int:audit_id>')
-@login_required
-def get_audit_detail_route(audit_id):
-    user_email = session.get('user_id')
-    return jsonify({'report': get_audit_detail(audit_id, user_email)})
 
 @app.route('/verify-async', methods=['POST'])
 @login_required
@@ -1574,19 +1809,6 @@ def verify_async():
     thread = threading.Thread(target=background_verify_worker, args=(job_id,), daemon=True)
     thread.start()
     return jsonify({'success': True, 'job_id': job_id, 'total': len(emails)})
-
-@app.route('/verify-results/<int:job_id>')
-@login_required
-def verify_results(job_id):
-    conn = get_db()
-    if not conn: return jsonify({'error': 'No DB'}), 500
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT valid_emails, invalid_emails FROM verify_jobs WHERE id = %s", (job_id,))
-        row = cur.fetchone(); cur.close()
-        if not row: return jsonify({'error': 'Not found'}), 404
-        return jsonify({'valid': row[0].split('|||') if row[0] else [], 'invalid': row[1].split('|||') if row[1] else []})
-    finally: release_db(conn)
 
 @app.route('/verify-jobs')
 @login_required
@@ -1620,14 +1842,6 @@ def bulk_email():
         save_user_state(user_email, found_emails='|||'.join(all_found))
         save_email_scan(user_email, results, len(results))
     return jsonify({'success': bool(results), 'results': results})
-
-@app.route('/store-emails', methods=['POST'])
-@login_required
-def store_emails():
-    emails = request.json.get('emails', [])
-    user_email = session.get('user_id')
-    if user_email: save_user_state(user_email, found_emails='|||'.join(emails))
-    return jsonify({'success': True})
 
 @app.route('/get-stored-emails')
 @login_required
