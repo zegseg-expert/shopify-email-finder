@@ -20,14 +20,7 @@ app.secret_key = 'super_secret_key_12345_change_this'
 DATABASE_URL = os.environ.get('DATABASE_URL')
 SHODAN_API_KEY = 'W5LL903l5aFfMROHmpBQGNm7mMkCimWq'
 
-SHOPIFY_IPS = [
-    "23.227.38.32", "23.227.38.36", "23.227.38.65", "23.227.38.66",
-    "23.227.38.67", "23.227.38.68", "23.227.38.69", "23.227.38.70",
-    "23.227.38.71", "23.227.38.72", "23.227.38.73", "23.227.38.74",
-    "23.227.39.20"
-]
-
-KNOWN_FREE_EMAILS = ['gmail.com','yahoo.com','hotmail.com','outlook.com','aol.com','protonmail.com']
+SHOPIFY_IPS = ["23.227.38.32","23.227.38.36","23.227.38.65","23.227.38.66","23.227.38.67","23.227.38.68","23.227.38.69","23.227.38.70","23.227.38.71","23.227.38.72","23.227.38.73","23.227.38.74","23.227.39.20"]
 
 # ==========================================
 # DB POOL
@@ -104,6 +97,17 @@ def init_db():
             has_email BOOLEAN DEFAULT FALSE,
             discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_email, domain))""")
+        # NEW: Email scan history (last 3)
+        cur.execute("""CREATE TABLE IF NOT EXISTS email_scans (
+            id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
+            emails TEXT, email_count INTEGER DEFAULT 0,
+            store_count INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        # NEW: Audit history (last 3)
+        cur.execute("""CREATE TABLE IF NOT EXISTS audit_history (
+            id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
+            domain VARCHAR(255) NOT NULL, report JSONB,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
         conn.commit(); cur.close()
         print("✅ DB ready")
     except Exception as e: print(f"❌ DB: {e}")
@@ -126,15 +130,11 @@ def generate_case_id():
     return "ESS" + str(random.randint(10000, 99999))
 
 def root_domain(hostname):
-    """Extract root domain from hostname like 88mega.poopourri.com → poopourri.com"""
-    hostname = hostname.strip().lower()
-    hostname = hostname.replace("https://", "").replace("http://", "").split("/")[0]
+    hostname = hostname.strip().lower().replace("https://", "").replace("http://", "").split("/")[0]
     parts = hostname.split('.')
-    if len(parts) <= 2:
-        return hostname
-    # Check common two-part TLDs
-    if parts[-2] in ['co', 'com', 'net', 'org', 'ac', 'gov'] and len(parts) >= 3:
-        if parts[-1] in ['uk', 'au', 'nz', 'in', 'za', 'br', 'mx']:
+    if len(parts) <= 2: return hostname
+    if parts[-2] in ['co','com','net','org','ac','gov'] and len(parts) >= 3:
+        if parts[-1] in ['uk','au','nz','in','za','br','mx']:
             return '.'.join(parts[-3:])
     return '.'.join(parts[-2:])
 
@@ -196,6 +196,100 @@ def load_user_state(user_email):
     except: return {}
     finally: release_db(conn)
 
+# ==========================================
+# EMAIL SCAN HISTORY (last 3)
+# ==========================================
+def save_email_scan(user_email, emails, store_count):
+    """Save scan to history, keep only latest 3"""
+    conn = get_db()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("""INSERT INTO email_scans (user_email, emails, email_count, store_count)
+            VALUES (%s, %s, %s, %s)""",
+            (user_email, '|||'.join(emails), len(emails), store_count))
+        # Delete oldest beyond 3
+        cur.execute("""DELETE FROM email_scans WHERE user_email = %s
+            AND id NOT IN (SELECT id FROM email_scans WHERE user_email = %s
+            ORDER BY created_at DESC LIMIT 3)""", (user_email, user_email))
+        conn.commit(); cur.close()
+    except Exception as e: print(f"save_email_scan: {e}")
+    finally: release_db(conn)
+
+def get_email_scans(user_email):
+    """Get last 3 email scans"""
+    conn = get_db()
+    if not conn: return []
+    try:
+        cur = conn.cursor()
+        cur.execute("""SELECT id, email_count, store_count, created_at
+            FROM email_scans WHERE user_email = %s ORDER BY created_at DESC LIMIT 3""", (user_email,))
+        rows = cur.fetchall(); cur.close()
+        return [{'id': r[0], 'count': r[1], 'stores': r[2], 'created_at': str(r[3])[:16]} for r in rows]
+    except: return []
+    finally: release_db(conn)
+
+def get_email_scan_detail(scan_id, user_email):
+    """Get emails from a specific scan"""
+    conn = get_db()
+    if not conn: return []
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT emails FROM email_scans WHERE id = %s AND user_email = %s", (scan_id, user_email))
+        row = cur.fetchone(); cur.close()
+        return row[0].split('|||') if row and row[0] else []
+    except: return []
+    finally: release_db(conn)
+
+# ==========================================
+# AUDIT HISTORY (last 3)
+# ==========================================
+def save_audit_history(user_email, domain, report):
+    conn = get_db()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("""INSERT INTO audit_history (user_email, domain, report)
+            VALUES (%s, %s, %s)""", (user_email, domain, json.dumps(report)))
+        cur.execute("""DELETE FROM audit_history WHERE user_email = %s
+            AND id NOT IN (SELECT id FROM audit_history WHERE user_email = %s
+            ORDER BY created_at DESC LIMIT 3)""", (user_email, user_email))
+        conn.commit(); cur.close()
+    except Exception as e: print(f"save_audit: {e}")
+    finally: release_db(conn)
+
+def get_audit_history(user_email):
+    conn = get_db()
+    if not conn: return []
+    try:
+        cur = conn.cursor()
+        cur.execute("""SELECT id, domain, report, created_at FROM audit_history
+            WHERE user_email = %s ORDER BY created_at DESC LIMIT 3""", (user_email,))
+        rows = cur.fetchall(); cur.close()
+        results = []
+        for r in rows:
+            try:
+                score = json.loads(r[2]).get('scores', {}).get('overall_score', 0) if r[2] else 0
+            except: score = 0
+            results.append({'id': r[0], 'domain': r[1], 'score': score, 'created_at': str(r[3])[:16]})
+        return results
+    except: return []
+    finally: release_db(conn)
+
+def get_audit_detail(audit_id, user_email):
+    conn = get_db()
+    if not conn: return None
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT report FROM audit_history WHERE id = %s AND user_email = %s", (audit_id, user_email))
+        row = cur.fetchone(); cur.close()
+        return json.loads(row[0]) if row and row[0] else None
+    except: return None
+    finally: release_db(conn)
+
+# ==========================================
+# VERIFY
+# ==========================================
 def verify_email(email):
     try:
         if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
@@ -225,8 +319,7 @@ def background_verify_worker(job_id):
         remaining = row[0].split('|||') if row[0] else []
         valid = row[1].split('|||') if row[1] else []
         invalid = row[2].split('|||') if row[2] else []
-    finally:
-        release_db(conn)
+    finally: release_db(conn)
     CHUNK_SIZE = 100
     while remaining:
         conn = get_db()
@@ -236,8 +329,7 @@ def background_verify_worker(job_id):
             cur.execute("SELECT status FROM verify_jobs WHERE id = %s", (job_id,))
             sr = cur.fetchone(); cur.close()
             if not sr or sr[0] == 'cancelled': return
-        finally:
-            release_db(conn)
+        finally: release_db(conn)
         chunk = remaining[:CHUNK_SIZE]
         remaining = remaining[CHUNK_SIZE:]
         with ThreadPoolExecutor(max_workers=20) as ex:
@@ -256,8 +348,7 @@ def background_verify_worker(job_id):
                 (len(valid) + len(invalid), '|||'.join(valid), '|||'.join(invalid),
                  '|||'.join(remaining), new_status, job_id))
             conn.commit(); cur.close()
-        finally:
-            release_db(conn)
+        finally: release_db(conn)
 
 def find_emails(domain):
     domain = domain.strip().lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
@@ -296,84 +387,50 @@ def find_emails(domain):
     return final
 
 # ==========================================
-# DISCOVERY METHODS
+# DISCOVERY
 # ==========================================
-def is_shopify(domain):
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        r = requests.get(f"https://{domain}", headers=headers, timeout=6, allow_redirects=True)
-        if r.status_code == 200:
-            html = r.text.lower()
-            return any(x in html for x in ['cdn.shopify.com', 'shopify.theme', 'shopify-section', 'myshopify.com', 'shopify-payment-button'])
-    except: pass
-    return False
-
 def discover_via_shodan(limit=5):
-    """Query Shodan for domains on Shopify IPs (with subdomain filtering)"""
-    discovered = []
-    seen_roots = set()
+    discovered = []; seen_roots = set()
     for ip in SHOPIFY_IPS[:limit]:
         try:
             url = f"https://api.shodan.io/shodan/host/{ip}?key={SHODAN_API_KEY}"
             r = requests.get(url, timeout=15)
             if r.status_code == 200:
-                data = r.json()
-                for hostname in data.get('hostnames', []):
-                    root = root_domain(hostname)
+                for hn in r.json().get('hostnames', []):
+                    root = root_domain(hn)
                     if "shopify" in root: continue
                     if '.' not in root or len(root) < 5: continue
                     if root in seen_roots: continue
                     seen_roots.add(root)
                     discovered.append({'domain': root, 'source': 'shodan'})
-            elif r.status_code == 403:
-                print(f"Shodan rate limit at {ip}")
-                break
+            elif r.status_code == 403: break
             time.sleep(1)
-        except Exception as e:
-            print(f"Shodan error {ip}: {e}")
+        except: continue
     return discovered
 
 def discover_via_theme_showcase():
-    """Scrape Shopify's public theme showcase for demo stores"""
-    discovered = []
-    seen = set()
+    discovered = []; seen = set()
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    theme_pages = [
-        "https://themes.shopify.com/themes?sort_by=most_recent",
-        "https://themes.shopify.com/themes?sort_by=popular",
-    ]
-    for page in theme_pages:
+    for page in ["https://themes.shopify.com/themes?sort_by=most_recent","https://themes.shopify.com/themes?sort_by=popular"]:
         try:
             r = requests.get(page, headers=headers, timeout=15)
             if r.status_code == 200:
-                # Look for demo store links like https://theme-name.myshopify.com
-                matches = re.findall(r'https://([a-z0-9\-]+)\.myshopify\.com', r.text, re.IGNORECASE)
-                for m in matches:
-                    if m in seen: continue
-                    if m in ['www','cdn','checkout','account','admin']: continue
+                for m in re.findall(r'https://([a-z0-9\-]+)\.myshopify\.com', r.text, re.IGNORECASE):
+                    if m in seen or m in ['www','cdn','checkout','account','admin']: continue
                     seen.add(m)
                     discovered.append({'domain': f"{m}.myshopify.com", 'source': 'theme_showcase'})
-        except Exception as e:
-            print(f"Theme error: {e}")
+        except: continue
     return discovered
 
 def discover_via_search(keyword=''):
-    """Search via DuckDuckGo with better headers and Bing fallback"""
-    discovered = []
-    seen_roots = set()
-    
-    # Try DuckDuckGo first
+    discovered = []; seen_roots = set()
     try:
         query = f'"Powered by Shopify" {keyword}'.strip()
         url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.5"
-        }
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36","Accept-Language": "en-US,en;q=0.5"}
         r = requests.post(url, headers=headers, timeout=15)
         if r.status_code == 200:
-            links = re.findall(r'class="result__a" href="(.*?)"', r.text)
-            for link in links[:30]:
+            for link in re.findall(r'class="result__a" href="(.*?)"', r.text)[:30]:
                 if "uddg=" in link:
                     import urllib.parse
                     parsed = urllib.parse.parse_qs(urllib.parse.urlparse(link).query)
@@ -384,10 +441,7 @@ def discover_via_search(keyword=''):
                 if root in seen_roots: continue
                 seen_roots.add(root)
                 discovered.append({'domain': root, 'source': 'search'})
-    except Exception as e:
-        print(f"DDG error: {e}")
-    
-    # If DDG failed, try Bing
+    except: pass
     if not discovered:
         try:
             query = f'"Powered by Shopify" {keyword}'.strip()
@@ -395,47 +449,34 @@ def discover_via_search(keyword=''):
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
             r = requests.get(url, headers=headers, timeout=15)
             if r.status_code == 200:
-                links = re.findall(r'<a href="(https?://[^"]+)"', r.text)
-                for link in links[:30]:
+                for link in re.findall(r'<a href="(https?://[^"]+)"', r.text)[:30]:
                     clean = link.replace("https://", "").replace("http://", "").split("/")[0]
                     root = root_domain(clean)
-                    if "bing.com" in root or "microsoft" in root: continue
-                    if "shopify.com" in root: continue
+                    if "bing.com" in root or "microsoft" in root or "shopify.com" in root: continue
                     if root in seen_roots: continue
                     seen_roots.add(root)
                     discovered.append({'domain': root, 'source': 'search'})
-        except Exception as e:
-            print(f"Bing error: {e}")
-    
+        except: pass
     return discovered
 
 def discover_via_related(user_email):
-    """Find related stores from saved stores' footers"""
-    discovered = []
-    seen_roots = set()
-    # Get a few of user's saved stores
+    discovered = []; seen_roots = set()
     conn = get_db()
     if not conn: return discovered
     try:
         cur = conn.cursor()
         cur.execute("SELECT domain FROM discovered_stores WHERE user_email = %s LIMIT 5", (user_email,))
-        seeds = [r[0] for r in cur.fetchall()]
-        cur.close()
-    finally:
-        release_db(conn)
-    
+        seeds = [r[0] for r in cur.fetchall()]; cur.close()
+    finally: release_db(conn)
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     for seed in seeds:
         try:
             r = requests.get(f"https://{seed}", headers=headers, timeout=8)
             if r.status_code == 200:
-                # Look for external shopify-like links
-                external = re.findall(r'href="https?://([a-zA-Z0-9\.\-]+)"', r.text)
-                for ext in external[:20]:
+                for ext in re.findall(r'href="https?://([a-zA-Z0-9\.\-]+)"', r.text)[:20]:
                     root = root_domain(ext)
-                    if root == seed: continue
-                    if root in seen_roots: continue
-                    if any(skip in root for skip in ['shopify','facebook','instagram','twitter','youtube','tiktok','pinterest','google','apple']): continue
+                    if root == seed or root in seen_roots: continue
+                    if any(s in root for s in ['shopify','facebook','instagram','twitter','youtube','tiktok','pinterest','google','apple']): continue
                     if '.' not in root or len(root) < 5: continue
                     seen_roots.add(root)
                     discovered.append({'domain': root, 'source': 'related'})
@@ -456,38 +497,32 @@ def save_discovered(user_email, stores):
                 if cur.rowcount > 0: saved += 1
             except: pass
         conn.commit(); cur.close()
-    except Exception as e:
-        print(f"save discovered: {e}")
-    finally:
-        release_db(conn)
+    except: pass
+    finally: release_db(conn)
     return saved
 
 # ==========================================
-# AUDIT ENGINE (same as before)
+# AUDIT
 # ==========================================
 def audit_store(domain, case_id):
     raw = domain.strip().lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
     report = {"domain": raw, "case_id": case_id, "audited_at": datetime.now().isoformat(), "checks": {}, "scores": {}, "issues": [], "positives": []}
     if not raw or '.' not in raw:
-        report['error'] = "Invalid domain"
-        return report
+        report['error'] = "Invalid domain"; return report
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept-Language": "en-US,en;q=0.5"}
     base_url = f"https://{raw}"
     try:
         start = time.time()
         r = requests.get(base_url, headers=headers, timeout=10, allow_redirects=True)
         lt = round(time.time() - start, 2)
-        report["checks"]["https"] = True
-        report["checks"]["http_status"] = r.status_code
-        report["checks"]["load_time_seconds"] = lt
-        report["checks"]["final_url"] = r.url
+        report["checks"]["https"] = True; report["checks"]["http_status"] = r.status_code
+        report["checks"]["load_time_seconds"] = lt; report["checks"]["final_url"] = r.url
         html = r.text
         if lt < 1.5: report["positives"].append(f"Fast load time ({lt}s)")
         elif lt > 3: report["issues"].append({"title": "Slow Load Time", "description": f"Store took {lt}s to load.", "recommendation": "Optimize images, remove unused apps.", "severity": "medium"})
     except Exception as e:
         report["checks"]["https"] = False
-        report["error"] = f"Could not reach store: {str(e)[:100]}"
-        return report
+        report["error"] = f"Could not reach store: {str(e)[:100]}"; return report
     is_shop = any(x in html.lower() for x in ['cdn.shopify.com', 'shopify.theme', 'shopify-section', 'myshopify.com'])
     report["checks"]["is_shopify"] = is_shop
     if is_shop: report["positives"].append("Confirmed Shopify store")
@@ -495,8 +530,7 @@ def audit_store(domain, case_id):
         r2 = requests.get(f"{base_url}/products.json?limit=250", headers=headers, timeout=10)
         if r2.status_code == 200:
             pc = len(r2.json().get('products', []))
-            report["checks"]["product_count"] = pc
-            report["checks"]["product_count_capped"] = (pc == 250)
+            report["checks"]["product_count"] = pc; report["checks"]["product_count_capped"] = (pc == 250)
             if pc == 0: report["issues"].append({"title": "No Products Visible", "description": "No products.", "recommendation": "Add products.", "severity": "high"})
             elif pc < 10: report["issues"].append({"title": f"Only {pc} Products", "description": "Few products.", "recommendation": "Aim for 20+.", "severity": "medium"})
             else: report["positives"].append(f"{pc}+ products")
@@ -507,10 +541,8 @@ def audit_store(domain, case_id):
     report["checks"]["mobile_responsive"] = hv
     if hv: report["positives"].append("Mobile responsive")
     else: report["issues"].append({"title": "Not Mobile Responsive", "description": "Missing viewport.", "recommendation": "Use mobile theme.", "severity": "high"})
-    he = bool(re.search(r'mailto:[^"\']+', html))
-    hp = bool(re.search(r'tel:[^"\']+', html))
-    report["checks"]["has_email_link"] = he
-    report["checks"]["has_phone_link"] = hp
+    he = bool(re.search(r'mailto:[^"\']+', html)); hp = bool(re.search(r'tel:[^"\']+', html))
+    report["checks"]["has_email_link"] = he; report["checks"]["has_phone_link"] = hp
     report["checks"]["has_contact_page"] = 'contact' in html.lower()
     if he or hp: report["positives"].append("Contact info present")
     else: report["issues"].append({"title": "No Contact Info", "description": "No email/phone.", "recommendation": "Add Contact page.", "severity": "high"})
@@ -627,8 +659,7 @@ def signup():
     if request.method == 'POST':
         email = request.form.get('email', '').strip().lower()
         password = request.form.get('password', '')
-        if not email or not password:
-            return render_template_string(SIGNUP_HTML, error="Fill all fields")
+        if not email or not password: return render_template_string(SIGNUP_HTML, error="Fill all fields")
         conn = get_db()
         if not conn: return render_template_string(SIGNUP_HTML, error="DB not available")
         try:
@@ -669,19 +700,25 @@ def logout():
     session.clear(); return redirect('/login')
 
 # ==========================================
-# HOME
+# HOME (Email Finder with Last 3 Results)
 # ==========================================
 @app.route('/')
 @login_required
 def home():
     body = '''<div style="max-width:700px;margin:20px auto;padding:20px">
-<div style="background:white;padding:30px;border-radius:15px;box-shadow:0 4px 12px rgba(0,0,0,0.1)">
+<div style="background:white;padding:30px;border-radius:15px;box-shadow:0 4px 12px rgba(0,0,0,0.1);margin-bottom:20px">
 <h2 style="color:#333;margin-top:0">🔍 Email Finder</h2>
 <p style="color:#666">Paste up to <b>100 store URLs</b> (one per line).</p>
 <textarea id="urls" style="width:100%;height:180px;padding:12px;border:2px solid #ddd;border-radius:8px;font-size:14px;font-family:monospace;box-sizing:border-box" placeholder="deluxura.shop&#10;hipchik.com"></textarea>
 <button onclick="findBulkEmails()" style="background:#667eea;color:white;padding:12px;border:none;border-radius:8px;cursor:pointer;font-size:16px;width:100%;margin:10px 0">Search All URLs</button>
 <div id="result" style="margin-top:20px;background:#f8f9fa;padding:15px;border-radius:8px;min-height:40px"></div>
-</div></div>
+</div>
+
+<div style="background:white;padding:20px;border-radius:15px;box-shadow:0 4px 12px rgba(0,0,0,0.1)">
+<h3 style="margin-top:0;color:#333">📋 Last 3 Results</h3>
+<div id="historyList">Loading...</div>
+</div>
+</div>
 <script>
 async function findBulkEmails(){
   const input=document.getElementById('urls').value;
@@ -699,14 +736,43 @@ async function findBulkEmails(){
         item.emails.forEach(e=>{html+='<div style="background:white;padding:8px;margin:5px 0;border-radius:5px;border-left:4px solid #667eea;font-weight:bold;word-break:break-all">'+e+'</div>'});
       });
       result.innerHTML=html;
+      loadHistory();
     } else { result.innerHTML='<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">No emails found</div>'; }
   }catch(e){result.innerHTML='<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">Error: '+e+'</div>'}
 }
+async function loadHistory(){
+  const res=await fetch('/get-email-scans');
+  const data=await res.json();
+  const c=document.getElementById('historyList');
+  if(!data.scans || data.scans.length===0){c.innerHTML='<p style="color:#666">No scans yet. Run a search above.</p>';return}
+  let html='';
+  data.scans.forEach(s=>{
+    html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid #667eea">';
+    html+='<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
+    html+='<div><b>'+s.count+' emails</b> from '+s.stores+' stores<br><span style="font-size:12px;color:#666">'+s.created_at+'</span></div>';
+    html+='<button onclick="viewScan('+s.id+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">View</button>';
+    html+='</div>';
+    html+='<div id="scan-'+s.id+'" style="margin-top:10px"></div>';
+    html+='</div>';
+  });
+  c.innerHTML=html;
+}
+async function viewScan(id){
+  const res=await fetch('/get-email-scan/'+id);
+  const data=await res.json();
+  const c=document.getElementById('scan-'+id);
+  if(!data.emails || data.emails.length===0){c.innerHTML='<p style="color:#666">No emails in this scan.</p>';return}
+  let html='<div style="background:white;padding:10px;border-radius:6px;max-height:200px;overflow-y:auto;font-size:13px;word-break:break-all">';
+  data.emails.forEach(e=>{html+='<div style="padding:4px 0;border-bottom:1px solid #eee">📧 '+e+'</div>'});
+  html+='</div>';
+  c.innerHTML=html;
+}
+window.onload=loadHistory;
 </script>'''
     return render_page("Finder", body)
 
 # ==========================================
-# STORE DISCOVERY PAGE
+# DISCOVERY PAGE
 # ==========================================
 @app.route('/discover')
 @login_required
@@ -748,14 +814,11 @@ async function runDiscovery(method){
       if(data.by_method){for(const[k,v]of Object.entries(data.by_method)){if(v>0)details+=' · '+k+': '+v}}
       status.innerHTML='<p style="color:green">✅ Found '+data.found+' stores (saved: '+data.saved+')'+details+'</p>';
       loadStores();
-    } else {
-      status.innerHTML='<p style="color:red">Error: '+(data.error||'Unknown')+'</p>';
-    }
+    } else { status.innerHTML='<p style="color:red">Error: '+(data.error||'Unknown')+'</p>'; }
   }catch(e){status.innerHTML='<p style="color:red">Error: '+e+'</p>'}
 }
 async function loadStores(){
-  const res=await fetch('/get-discovered');
-  const data=await res.json();
+  const res=await fetch('/get-discovered');const data=await res.json();
   document.getElementById('storeCount').textContent=data.stores.length;
   const c=document.getElementById('storeList');
   if(data.stores.length===0){c.innerHTML='<p style="color:#666">No stores yet. Run a discovery method above.</p>';return}
@@ -775,12 +838,7 @@ function actFindEmail(d){window.location.href='/?url='+encodeURIComponent(d)}
 function actAudit(d){window.location.href='/audit?url='+encodeURIComponent(d)}
 function actScout(d){window.location.href='/scout?add='+encodeURIComponent(d)}
 async function clearStores(){if(!confirm('Delete all discovered stores?'))return;await fetch('/clear-discovered',{method:'POST'});loadStores()}
-async function exportStores(){
-  const res=await fetch('/get-discovered');const data=await res.json();
-  const csv='domain,source,discovered_at\\n'+data.stores.map(s=>s.domain+','+s.source+','+s.discovered_at).join('\\n');
-  const b=new Blob([csv],{type:'text/csv'});const u=URL.createObjectURL(b);
-  const a=document.createElement('a');a.href=u;a.download='discovered_stores.csv';a.click();
-}
+async function exportStores(){const res=await fetch('/get-discovered');const data=await res.json();const csv='domain,source,discovered_at\\n'+data.stores.map(s=>s.domain+','+s.source+','+s.discovered_at).join('\\n');const b=new Blob([csv],{type:'text/csv'});const u=URL.createObjectURL(b);const a=document.createElement('a');a.href=u;a.download='discovered_stores.csv';a.click()}
 window.onload=loadStores;
 </script>'''
     return render_page("Store Discovery", body)
@@ -793,29 +851,18 @@ window.onload=loadStores;
 def run_discovery():
     user_email = session.get('user_id')
     method = request.json.get('method', 'all')
-    by_method = {}
-    all_found = []
+    by_method = {}; all_found = []
     try:
         if method in ['shodan', 'all']:
-            r = discover_via_shodan(limit=5)
-            by_method['shodan'] = len(r)
-            all_found.extend(r)
+            r = discover_via_shodan(limit=5); by_method['shodan'] = len(r); all_found.extend(r)
         if method in ['theme', 'all']:
-            r = discover_via_theme_showcase()
-            by_method['theme'] = len(r)
-            all_found.extend(r)
+            r = discover_via_theme_showcase(); by_method['theme'] = len(r); all_found.extend(r)
         if method in ['search', 'all']:
-            r = discover_via_search('')
-            by_method['search'] = len(r)
-            all_found.extend(r)
+            r = discover_via_search(''); by_method['search'] = len(r); all_found.extend(r)
         if method in ['related', 'all']:
-            r = discover_via_related(user_email)
-            by_method['related'] = len(r)
-            all_found.extend(r)
-        # Deduplicate by domain
+            r = discover_via_related(user_email); by_method['related'] = len(r); all_found.extend(r)
         unique = {}
-        for s in all_found:
-            unique[s['domain']] = s
+        for s in all_found: unique[s['domain']] = s
         found_list = list(unique.values())
         saved = save_discovered(user_email, found_list) if found_list else 0
         return jsonify({'success': True, 'found': len(found_list), 'saved': saved, 'by_method': by_method})
@@ -830,11 +877,9 @@ def get_discovered():
     if not conn: return jsonify({'stores': []})
     try:
         cur = conn.cursor()
-        cur.execute("""SELECT domain, source, discovered_at FROM discovered_stores
-            WHERE user_email = %s ORDER BY discovered_at DESC LIMIT 500""", (user_email,))
+        cur.execute("SELECT domain, source, discovered_at FROM discovered_stores WHERE user_email = %s ORDER BY discovered_at DESC LIMIT 500", (user_email,))
         rows = cur.fetchall(); cur.close()
-        stores = [{'domain': r[0], 'source': r[1], 'discovered_at': str(r[2])[:16]} for r in rows]
-        return jsonify({'stores': stores})
+        return jsonify({'stores': [{'domain': r[0], 'source': r[1], 'discovered_at': str(r[2])[:16]} for r in rows]})
     except: return jsonify({'stores': []})
     finally: release_db(conn)
 
@@ -851,6 +896,21 @@ def clear_discovered():
         return jsonify({'success': True})
     except: return jsonify({'success': False})
     finally: release_db(conn)
+
+# ==========================================
+# EMAIL SCAN API
+# ==========================================
+@app.route('/get-email-scans')
+@login_required
+def get_email_scans_route():
+    user_email = session.get('user_id')
+    return jsonify({'scans': get_email_scans(user_email)})
+
+@app.route('/get-email-scan/<int:scan_id>')
+@login_required
+def get_email_scan_detail_route(scan_id):
+    user_email = session.get('user_id')
+    return jsonify({'emails': get_email_scan_detail(scan_id, user_email)})
 
 # ==========================================
 # VERIFY PAGE
@@ -957,7 +1017,7 @@ function openBulk(){const subj=document.getElementById('subjectLine').value;cons
     return render_page("Scout", body)
 
 # ==========================================
-# AUDIT PAGE
+# AUDIT PAGE (with history)
 # ==========================================
 @app.route('/audit')
 @login_required
@@ -975,13 +1035,92 @@ def audit_page():
 <div><h1 style="margin:0;font-size:24px">Security Analysis</h1><p style="margin:4px 0 0 0;font-size:14px;opacity:0.9">Real audit of any Shopify store</p></div>
 </div>
 <div id="auditResult"></div>
+
+<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-top:20px">
+<h3 style="margin-top:0">📋 Last 3 Audits</h3>
+<div id="auditHistory">Loading...</div>
+</div>
 </div>
 <script>
-async function runAudit(){const url=document.getElementById('auditUrl').value.trim();if(!url){alert('Enter URL');return}const status=document.getElementById('auditStatus');const result=document.getElementById('auditResult');status.innerHTML='<p style="color:#666">⏳ Analyzing...</p>';result.innerHTML='<p style="color:#666;text-align:center;padding:30px">Please wait...</p>';const c=new AbortController();const t=setTimeout(()=>c.abort(),90000);try{const res=await fetch('/run-audit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:url}),signal:c.signal});clearTimeout(t);if(!res.ok){status.innerHTML='<p style="color:red">HTTP '+res.status+'</p>';result.innerHTML='';return}const data=await res.json();if(data.error){status.innerHTML='<p style="color:red">'+data.error+'</p>';result.innerHTML='';return}status.innerHTML='<p style="color:green">✅ Complete</p>';renderReport(data)}catch(e){clearTimeout(t);status.innerHTML='<p style="color:red">'+(e.name==='AbortError'?'Timeout':'Error: '+e.message)+'</p>';result.innerHTML=''}}
+async function runAudit(){
+  const url=document.getElementById('auditUrl').value.trim();
+  if(!url){alert('Enter URL');return}
+  const status=document.getElementById('auditStatus');const result=document.getElementById('auditResult');
+  status.innerHTML='<p style="color:#666">⏳ Analyzing...</p>';result.innerHTML='<p style="color:#666;text-align:center;padding:30px">Please wait...</p>';
+  const c=new AbortController();const t=setTimeout(()=>c.abort(),90000);
+  try{
+    const res=await fetch('/run-audit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:url}),signal:c.signal});
+    clearTimeout(t);
+    if(!res.ok){status.innerHTML='<p style="color:red">HTTP '+res.status+'</p>';result.innerHTML='';return}
+    const data=await res.json();
+    if(data.error){status.innerHTML='<p style="color:red">'+data.error+'</p>';result.innerHTML='';return}
+    status.innerHTML='<p style="color:green">✅ Complete</p>';renderReport(data);loadAuditHistory();
+  }catch(e){clearTimeout(t);status.innerHTML='<p style="color:red">'+(e.name==='AbortError'?'Timeout':'Error: '+e.message)+'</p>';result.innerHTML=''}
+}
 function scoreColor(s){if(s>=75)return '#16a34a';if(s>=50)return '#f59e0b';return '#ef4444'}
 function scoreBar(l,s){const c=scoreColor(s);return '<div style="margin:10px 0"><div style="display:flex;justify-content:space-between;margin-bottom:4px"><b>'+l+'</b><span style="color:'+c+';font-weight:bold">'+s+'%</span></div><div style="background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+s+'%;height:12px;background:'+c+'"></div></div></div>'}
-function renderReport(r){const ch=r.checks||{};const sc=r.scores||{};const iss=r.issues||[];let h='';h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px"><div><h2 style="margin:0">Store Audit Overview</h2><div style="color:#666;font-size:13px;margin-top:6px">Store: <b>https://'+r.domain+'/</b></div></div>'+(r.case_id?'<div style="background:#f3f4f6;padding:6px 12px;border-radius:6px;font-size:13px;color:#374151">Case ID: <b>'+r.case_id+'</b></div>':'')+'</div></div>';h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><h3 style="margin-top:0">📈 Scores</h3>'+scoreBar('Overall',sc.overall_score||0)+scoreBar('Trust',sc.trust_score||0)+scoreBar('Technical',sc.technical_score||0)+scoreBar('Marketing',sc.marketing_score||0)+'</div>';const hi=iss.filter(i=>i.severity==='high');if(hi.length>0)h+='<div style="background:#fef2f2;border-left:4px solid #ef4444;padding:15px;border-radius:8px;margin-bottom:20px"><div style="color:#991b1b;font-weight:bold;font-size:16px;margin-bottom:6px">⚠️ Critical issues detected!</div><div style="color:#7f1d1d;font-size:13px">'+hi.length+' high-priority issue(s)</div></div>';if(iss.length>0){h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><h3 style="margin-top:0;color:#991b1b">⚠️ Issues Found ('+iss.length+')</h3>';iss.forEach(i=>{const c=i.severity==='high'?'#ef4444':(i.severity==='medium'?'#f59e0b':'#6b7280');h+='<div style="background:#fef2f2;border-left:4px solid '+c+';padding:15px;border-radius:8px;margin:10px 0"><div style="font-weight:bold;font-size:15px;margin-bottom:6px">⚠️ '+i.title+'</div><div style="color:#374151;font-size:14px;margin-bottom:8px">'+i.description+'</div><div style="background:#fef3c7;padding:10px;border-radius:6px;font-size:13px;color:#78350f"><b>💡 Recommendation:</b> '+i.recommendation+'</div></div>'});h+='</div>'}else{h+='<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:15px;border-radius:8px;margin-bottom:20px"><div style="color:#166534;font-weight:bold">✅ No critical issues detected</div></div>'}if(r.positives&&r.positives.length>0){h+='<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:15px;border-radius:8px;margin-bottom:20px"><h3 style="margin-top:0;color:#166534">✅ What Works Well</h3>';r.positives.forEach(p=>{h+='<div style="margin:6px 0;color:#14532d">✅ '+p+'</div>'});h+='</div>'}h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><h3 style="margin-top:0">🔍 Detailed Checks</h3><table style="width:100%;border-collapse:collapse;font-size:14px">';function row(l,v){return '<tr><td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold">'+l+'</td><td style="padding:8px;border-bottom:1px solid #eee">'+v+'</td></tr>'}h+=row('Is Shopify Store',ch.is_shopify?'✅ Yes':'❌ Not detected');h+=row('HTTPS',ch.https?'✅ Enabled':'❌ Disabled');h+=row('HTTP Status',ch.http_status||'N/A');h+=row('Load Time',ch.load_time_seconds?ch.load_time_seconds+'s':'N/A');h+=row('Product Count',(ch.product_count!==null&&ch.product_count!==undefined)?ch.product_count+(ch.product_count_capped?'+':''):'N/A');h+=row('Theme',ch.theme||'Unknown');h+=row('Mobile Responsive',ch.mobile_responsive?'✅ Yes':'❌ No');h+=row('Currency',ch.currency||'Unknown');h+=row('Contact Page',ch.has_contact_page?'✅ Found':'❌ Not found');h+=row('Email Link',ch.has_email_link?'✅ Found':'❌ Not found');h+=row('Phone Link',ch.has_phone_link?'✅ Found':'❌ Not found');h+=row('Policy Pages',ch.policy_pages_found||'0/4');h+=row('Social Links',(ch.social_links&&ch.social_links.length>0)?ch.social_links.join(', '):'None found');h+=row('Detected Apps',(ch.detected_apps&&ch.detected_apps.length>0)?ch.detected_apps.join(', '):'None detected');h+='</table></div>';h+='<div style="background:#eff6ff;border-left:4px solid #3b82f6;padding:15px;border-radius:8px;font-size:13px;color:#1e40af"><b>ℹ️ Note:</b> This audit uses only publicly available data.</div>';document.getElementById('auditResult').innerHTML=h}
-window.onload=function(){if(document.getElementById('auditUrl').value.trim())runAudit()};
+function renderReport(r){
+  const ch=r.checks||{};const sc=r.scores||{};const iss=r.issues||[];
+  let h='';
+  h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px"><div><h2 style="margin:0">Store Audit Overview</h2><div style="color:#666;font-size:13px;margin-top:6px">Store: <b>https://'+r.domain+'/</b></div></div>'+(r.case_id?'<div style="background:#f3f4f6;padding:6px 12px;border-radius:6px;font-size:13px;color:#374151">Case ID: <b>'+r.case_id+'</b></div>':'')+'</div></div>';
+  h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><h3 style="margin-top:0">📈 Scores</h3>'+scoreBar('Overall',sc.overall_score||0)+scoreBar('Trust',sc.trust_score||0)+scoreBar('Technical',sc.technical_score||0)+scoreBar('Marketing',sc.marketing_score||0)+'</div>';
+  const hi=iss.filter(i=>i.severity==='high');
+  if(hi.length>0)h+='<div style="background:#fef2f2;border-left:4px solid #ef4444;padding:15px;border-radius:8px;margin-bottom:20px"><div style="color:#991b1b;font-weight:bold;font-size:16px;margin-bottom:6px">⚠️ Critical issues detected!</div><div style="color:#7f1d1d;font-size:13px">'+hi.length+' high-priority issue(s)</div></div>';
+  if(iss.length>0){h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><h3 style="margin-top:0;color:#991b1b">⚠️ Issues Found ('+iss.length+')</h3>';iss.forEach(i=>{const c=i.severity==='high'?'#ef4444':(i.severity==='medium'?'#f59e0b':'#6b7280');h+='<div style="background:#fef2f2;border-left:4px solid '+c+';padding:15px;border-radius:8px;margin:10px 0"><div style="font-weight:bold;font-size:15px;margin-bottom:6px">⚠️ '+i.title+'</div><div style="color:#374151;font-size:14px;margin-bottom:8px">'+i.description+'</div><div style="background:#fef3c7;padding:10px;border-radius:6px;font-size:13px;color:#78350f"><b>💡 Recommendation:</b> '+i.recommendation+'</div></div>'});h+='</div>'}else{h+='<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:15px;border-radius:8px;margin-bottom:20px"><div style="color:#166534;font-weight:bold">✅ No critical issues detected</div></div>'}
+  if(r.positives&&r.positives.length>0){h+='<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:15px;border-radius:8px;margin-bottom:20px"><h3 style="margin-top:0;color:#166534">✅ What Works Well</h3>';r.positives.forEach(p=>{h+='<div style="margin:6px 0;color:#14532d">✅ '+p+'</div>'});h+='</div>'}
+  h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><h3 style="margin-top:0">🔍 Detailed Checks</h3><table style="width:100%;border-collapse:collapse;font-size:14px">';
+  function row(l,v){return '<tr><td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold">'+l+'</td><td style="padding:8px;border-bottom:1px solid #eee">'+v+'</td></tr>'}
+  h+=row('Is Shopify Store',ch.is_shopify?'✅ Yes':'❌ Not detected');
+  h+=row('HTTPS',ch.https?'✅ Enabled':'❌ Disabled');
+  h+=row('HTTP Status',ch.http_status||'N/A');
+  h+=row('Load Time',ch.load_time_seconds?ch.load_time_seconds+'s':'N/A');
+  h+=row('Product Count',(ch.product_count!==null&&ch.product_count!==undefined)?ch.product_count+(ch.product_count_capped?'+':''):'N/A');
+  h+=row('Theme',ch.theme||'Unknown');
+  h+=row('Mobile Responsive',ch.mobile_responsive?'✅ Yes':'❌ No');
+  h+=row('Currency',ch.currency||'Unknown');
+  h+=row('Contact Page',ch.has_contact_page?'✅ Found':'❌ Not found');
+  h+=row('Email Link',ch.has_email_link?'✅ Found':'❌ Not found');
+  h+=row('Phone Link',ch.has_phone_link?'✅ Found':'❌ Not found');
+  h+=row('Policy Pages',ch.policy_pages_found||'0/4');
+  h+=row('Social Links',(ch.social_links&&ch.social_links.length>0)?ch.social_links.join(', '):'None found');
+  h+=row('Detected Apps',(ch.detected_apps&&ch.detected_apps.length>0)?ch.detected_apps.join(', '):'None detected');
+  h+='</table></div>';
+  h+='<div style="background:#eff6ff;border-left:4px solid #3b82f6;padding:15px;border-radius:8px;font-size:13px;color:#1e40af"><b>ℹ️ Note:</b> This audit uses only publicly available data.</div>';
+  document.getElementById('auditResult').innerHTML=h;
+}
+async function loadAuditHistory(){
+  const res=await fetch('/get-audit-history');const data=await res.json();
+  const c=document.getElementById('auditHistory');
+  if(!data.audits||data.audits.length===0){c.innerHTML='<p style="color:#666">No audits yet. Run one above.</p>';return}
+  let html='';
+  data.audits.forEach(a=>{
+    const color=scoreColor(a.score);
+    html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+color+'">';
+    html+='<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
+    html+='<div><b>'+a.domain+'</b> <span style="color:'+color+';font-weight:bold">'+a.score+'%</span><br><span style="font-size:12px;color:#666">'+a.created_at+'</span></div>';
+    html+='<button onclick="viewAudit('+a.id+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">View</button>';
+    html+='</div>';
+    html+='<div id="audit-view-'+a.id+'" style="margin-top:10px"></div>';
+    html+='</div>';
+  });
+  c.innerHTML=html;
+}
+async function viewAudit(id){
+  const res=await fetch('/get-audit-detail/'+id);const data=await res.json();
+  const c=document.getElementById('audit-view-'+id);
+  if(!data.report){c.innerHTML='<p style="color:#666">Not found.</p>';return}
+  const r=data.report;
+  const sc=r.scores||{};
+  let html='<div style="background:white;padding:12px;border-radius:6px;font-size:13px">';
+  html+='<b>Overall:</b> '+scoreBar('',sc.overall_score||0);
+  html+='<div style="margin-top:8px"><b>Case ID:</b> '+(r.case_id||'N/A')+'</div>';
+  html+='<div style="margin-top:4px"><b>Domain:</b> '+r.domain+'</div>';
+  html+='<div style="margin-top:4px"><b>Products:</b> '+(r.checks?.product_count!==undefined?r.checks.product_count:'N/A')+'</div>';
+  html+='<div style="margin-top:4px"><b>Issues:</b> '+(r.issues?.length||0)+'</div>';
+  html+='</div>';
+  c.innerHTML=html;
+}
+window.onload=function(){loadAuditHistory();if(document.getElementById('auditUrl').value.trim())runAudit()};
 </script>'''
     return render_page("Security Analysis", body)
 
@@ -1000,18 +1139,23 @@ def run_audit():
         report = audit_store(url, case_id)
         user_email = session.get('user_id')
         if user_email:
-            conn = get_db()
-            if conn:
-                try:
-                    cur = conn.cursor()
-                    cur.execute("INSERT INTO store_audits (user_email, domain, report) VALUES (%s, %s, %s)", (user_email, url, json.dumps(report)))
-                    conn.commit(); cur.close()
-                except: pass
-                finally: release_db(conn)
+            save_audit_history(user_email, report.get('domain', url), report)
         return jsonify(report)
     except Exception as e:
         print(f"AUDIT ERROR: {traceback.format_exc()}")
         return jsonify({'error': f'{type(e).__name__}: {str(e)}'})
+
+@app.route('/get-audit-history')
+@login_required
+def get_audit_history_route():
+    user_email = session.get('user_id')
+    return jsonify({'audits': get_audit_history(user_email)})
+
+@app.route('/get-audit-detail/<int:audit_id>')
+@login_required
+def get_audit_detail_route(audit_id):
+    user_email = session.get('user_id')
+    return jsonify({'report': get_audit_detail(audit_id, user_email)})
 
 @app.route('/verify-async', methods=['POST'])
 @login_required
@@ -1029,8 +1173,7 @@ def verify_async():
             VALUES (%s, %s, %s, %s, '', '', 'pending') RETURNING id""", (user_email, job_name, len(emails), '|||'.join(emails)))
         job_id = cur.fetchone()[0]
         conn.commit(); cur.close()
-    finally:
-        release_db(conn)
+    finally: release_db(conn)
     thread = threading.Thread(target=background_verify_worker, args=(job_id,), daemon=True)
     thread.start()
     return jsonify({'success': True, 'job_id': job_id, 'total': len(emails)})
@@ -1058,8 +1201,7 @@ def verify_jobs_list():
         cur = conn.cursor()
         cur.execute("""SELECT id, job_name, total, processed, status, created_at, valid_emails, invalid_emails FROM verify_jobs WHERE user_email = %s ORDER BY created_at DESC LIMIT 3""", (user_email,))
         rows = cur.fetchall(); cur.close()
-        jobs = [{'id': r[0], 'name': r[1], 'total': r[2], 'processed': r[3], 'status': r[4], 'created_at': str(r[5]), 'valid': len(r[6].split('|||')) if r[6] else 0, 'invalid': len(r[7].split('|||')) if r[7] else 0} for r in rows]
-        return jsonify({'jobs': jobs})
+        return jsonify({'jobs': [{'id': r[0], 'name': r[1], 'total': r[2], 'processed': r[3], 'status': r[4], 'created_at': str(r[5]), 'valid': len(r[6].split('|||')) if r[6] else 0, 'invalid': len(r[7].split('|||')) if r[7] else 0} for r in rows]})
     finally: release_db(conn)
 
 @app.route('/bulk-email', methods=['POST'])
@@ -1077,7 +1219,9 @@ def bulk_email():
     user_email = session.get('user_id')
     all_found = []
     for r in results: all_found.extend(r['emails'])
-    if user_email and all_found: save_user_state(user_email, found_emails='|||'.join(all_found))
+    if user_email:
+        save_user_state(user_email, found_emails='|||'.join(all_found))
+        save_email_scan(user_email, all_found, len(results))
     return jsonify({'success': bool(results), 'results': results})
 
 @app.route('/store-emails', methods=['POST'])
