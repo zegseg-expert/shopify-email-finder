@@ -97,14 +97,13 @@ def init_db():
             has_email BOOLEAN DEFAULT FALSE,
             discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_email, domain))""")
-        # NEW: email_scans with results JSON (store+email pairs)
         cur.execute("""CREATE TABLE IF NOT EXISTS email_scans (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
-            results JSONB, email_count INTEGER DEFAULT 0, store_count INTEGER DEFAULT 0,
+            results JSONB, emails TEXT, email_count INTEGER DEFAULT 0, store_count INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        # Backward compatibility: add column if not exists (for old table)
         try:
             cur.execute("ALTER TABLE email_scans ADD COLUMN IF NOT EXISTS results JSONB")
+            cur.execute("ALTER TABLE email_scans ADD COLUMN IF NOT EXISTS emails TEXT")
         except: pass
         cur.execute("""CREATE TABLE IF NOT EXISTS audit_history (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
@@ -199,7 +198,7 @@ def load_user_state(user_email):
     finally: release_db(conn)
 
 # ==========================================
-# EMAIL SCAN HISTORY (with store+email pairs)
+# EMAIL SCAN HISTORY (fixed with fallback)
 # ==========================================
 def save_email_scan(user_email, results, store_count):
     """results = [{'store': 'x.com', 'emails': ['a@x.com','b@x.com']}, ...]"""
@@ -207,10 +206,14 @@ def save_email_scan(user_email, results, store_count):
     if not conn: return
     try:
         total_emails = sum(len(r.get('emails', [])) for r in results)
+        # Also build flat email list for backward compat
+        flat_emails = []
+        for r in results:
+            flat_emails.extend(r.get('emails', []))
         cur = conn.cursor()
-        cur.execute("""INSERT INTO email_scans (user_email, results, email_count, store_count)
-            VALUES (%s, %s, %s, %s)""",
-            (user_email, json.dumps(results), total_emails, store_count))
+        cur.execute("""INSERT INTO email_scans (user_email, results, emails, email_count, store_count)
+            VALUES (%s, %s, %s, %s, %s)""",
+            (user_email, json.dumps(results), ','.join(flat_emails), total_emails, store_count))
         cur.execute("""DELETE FROM email_scans WHERE user_email = %s
             AND id NOT IN (SELECT id FROM email_scans WHERE user_email = %s
             ORDER BY created_at DESC LIMIT 3)""", (user_email, user_email))
@@ -231,17 +234,31 @@ def get_email_scans(user_email):
     finally: release_db(conn)
 
 def get_email_scan_detail(scan_id, user_email):
+    """Returns results list. Falls back to old 'emails' field if results is empty."""
     conn = get_db()
     if not conn: return []
     try:
         cur = conn.cursor()
-        cur.execute("SELECT results FROM email_scans WHERE id = %s AND user_email = %s", (scan_id, user_email))
+        cur.execute("SELECT results, emails FROM email_scans WHERE id = %s AND user_email = %s", (scan_id, user_email))
         row = cur.fetchone(); cur.close()
-        if row and row[0]:
-            try: return json.loads(row[0])
-            except: return []
+        if not row: return []
+        # Try JSON results first
+        if row[0]:
+            try:
+                parsed = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                if parsed and len(parsed) > 0:
+                    return parsed
+            except Exception as e:
+                print(f"results parse error: {e}")
+        # Fallback to old flat emails field
+        if row[1]:
+            flat = row[1].split(',') if isinstance(row[1], str) else row[1]
+            # Convert flat list to results format with "unknown" store
+            return [{'store': '(old format)', 'emails': [e for e in flat if e.strip()]}]
         return []
-    except: return []
+    except Exception as e:
+        print(f"get_email_scan_detail error: {e}")
+        return []
     finally: release_db(conn)
 
 # ==========================================
@@ -505,21 +522,8 @@ def save_discovered(user_email, stores):
     return saved
 
 # ==========================================
-# AUDIT (Enhanced with 8 new checks)
+# AUDIT (Enhanced)
 # ==========================================
-def whois_lookup_age(domain):
-    """Get domain age in months"""
-    try:
-        import whois
-        w = whois.whois(domain)
-        if w.creation_date:
-            cd = w.creation_date
-            if isinstance(cd, list): cd = cd[0]
-            delta = datetime.now() - cd
-            return int(delta.days / 30)
-    except: pass
-    return None
-
 def audit_store(domain, case_id):
     raw = domain.strip().lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
     report = {"domain": raw, "case_id": case_id, "audited_at": datetime.now().isoformat(), "checks": {}, "scores": {}, "issues": [], "positives": []}
@@ -528,7 +532,6 @@ def audit_store(domain, case_id):
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept-Language": "en-US,en;q=0.5"}
     base_url = f"https://{raw}"
 
-    # CHECK 1: HTTPS + speed
     try:
         start = time.time()
         r = requests.get(base_url, headers=headers, timeout=10, allow_redirects=True)
@@ -542,12 +545,10 @@ def audit_store(domain, case_id):
         report["checks"]["https"] = False
         report["error"] = f"Could not reach store: {str(e)[:100]}"; return report
 
-    # CHECK 2: Shopify
     is_shop = any(x in html.lower() for x in ['cdn.shopify.com', 'shopify.theme', 'shopify-section', 'myshopify.com'])
     report["checks"]["is_shopify"] = is_shop
     if is_shop: report["positives"].append("Confirmed Shopify store")
 
-    # CHECK 3: Products
     try:
         r2 = requests.get(f"{base_url}/products.json?limit=250", headers=headers, timeout=10)
         if r2.status_code == 200:
@@ -557,8 +558,6 @@ def audit_store(domain, case_id):
             if pc == 0: report["issues"].append({"title": "No Products Visible", "description": "No products.", "recommendation": "Add products.", "severity": "high"})
             elif pc < 10: report["issues"].append({"title": f"Only {pc} Products", "description": "Few products.", "recommendation": "Aim for 20+.", "severity": "medium"})
             else: report["positives"].append(f"{pc}+ products")
-
-            # CHECK 11: Image size (largest image)
             max_img_kb = 0
             for p in products_data[:10]:
                 for img in p.get('images', [])[:3]:
@@ -579,30 +578,25 @@ def audit_store(domain, case_id):
                     report["positives"].append("Images optimized")
     except: report["checks"]["product_count"] = None
 
-    # CHECK 4: Theme
     tm = re.search(r'"theme_name"\s*:\s*"([^"]+)"', html)
     report["checks"]["theme"] = tm.group(1) if tm else "Unknown"
 
-    # CHECK 5: Mobile
     hv = 'name="viewport"' in html.lower()
     report["checks"]["mobile_responsive"] = hv
     if hv: report["positives"].append("Mobile responsive")
     else: report["issues"].append({"title": "Not Mobile Responsive", "description": "Missing viewport.", "recommendation": "Use mobile theme.", "severity": "high"})
 
-    # CHECK 6: Contact
     he = bool(re.search(r'mailto:[^"\']+', html)); hp = bool(re.search(r'tel:[^"\']+', html))
     report["checks"]["has_email_link"] = he; report["checks"]["has_phone_link"] = hp
     report["checks"]["has_contact_page"] = 'contact' in html.lower()
     if he or hp: report["positives"].append("Contact info present")
     else: report["issues"].append({"title": "No Contact Info", "description": "No email/phone.", "recommendation": "Add Contact page.", "severity": "high"})
 
-    # CHECK 7: Socials
     socials = [p.split('.')[0] for p in ['facebook.com','instagram.com','twitter.com','tiktok.com','youtube.com','pinterest.com'] if p in html.lower()]
     report["checks"]["social_links"] = socials
     if len(socials) >= 2: report["positives"].append(f"{len(socials)} socials")
     elif len(socials) == 0: report["issues"].append({"title": "No Social Media", "description": "None found.", "recommendation": "Add social profiles.", "severity": "medium"})
 
-    # CHECK 8: Policies
     pols = ['/policies/refund-policy','/policies/privacy-policy','/policies/terms-of-service','/policies/shipping-policy']
     pf = [0]
     def cp(p):
@@ -615,11 +609,9 @@ def audit_store(domain, case_id):
     if pf[0] == 4: report["positives"].append("All policies present")
     elif pf[0] < 2: report["issues"].append({"title": f"Missing {4-pf[0]} Policies", "description": f"Only {pf[0]}/4.", "recommendation": "Add in Settings.", "severity": "high"})
 
-    # CHECK 9: Currency
     cm = re.search(r'"currency"\s*:\s*"([A-Z]{3})"', html)
     report["checks"]["currency"] = cm.group(1) if cm else "Unknown"
 
-    # CHECK 10: Apps
     apps = []
     for name, sigs in {"Klaviyo":["klaviyo"],"Judge.me":["judge.me"],"Yotpo":["yotpo"],"Loox":["loox.io"],"ReConvert":["reconvert"],"Recharge":["rechargepayments"],"Tidio":["tidio"],"Gorgias":["gorgias"],"Facebook Pixel":["connect.facebook.net","fbq("],"Google Analytics":["google-analytics.com","gtag("],"TikTok Pixel":["analytics.tiktok.com"]}.items():
         for s in sigs:
@@ -628,96 +620,36 @@ def audit_store(domain, case_id):
     ha = any('Pixel' in a or 'Analytics' in a for a in apps)
     if not ha: report["issues"].append({"title": "No Tracking Pixel", "description": "No pixel.", "recommendation": "Install tracking.", "severity": "high"})
 
-    # ==========================================
-    # NEW CHECK 12: Payment methods
-    # ==========================================
     payments = []
     html_low = html.lower()
-    payment_sigs = {
-        "PayPal": ["paypal.com/sdk", "paypal-button", "paypalobjects"],
-        "Stripe": ["js.stripe.com", "stripe.com/v3"],
-        "Klarna": ["klarna.com", "klarna-checkout"],
-        "Afterpay": ["afterpay.com", "afterpay"],
-        "Apple Pay": ["apple-pay", "applepay"],
-        "Google Pay": ["google-pay", "googlepay"],
-        "Shop Pay": ["shop-pay", "shop_pay", "shoppay"],
-        "Amazon Pay": ["amazonpay", "amazon-pay"],
-        "Affirm": ["affirm.com", "affirm-"],
-        "Zip": ["zip.co", "zip-payments"]
-    }
+    payment_sigs = {"PayPal": ["paypal.com/sdk", "paypal-button", "paypalobjects"],"Stripe": ["js.stripe.com", "stripe.com/v3"],"Klarna": ["klarna.com", "klarna-checkout"],"Afterpay": ["afterpay.com", "afterpay"],"Apple Pay": ["apple-pay", "applepay"],"Google Pay": ["google-pay", "googlepay"],"Shop Pay": ["shop-pay", "shop_pay", "shoppay"],"Amazon Pay": ["amazonpay", "amazon-pay"],"Affirm": ["affirm.com", "affirm-"],"Zip": ["zip.co", "zip-payments"]}
     for name, sigs in payment_sigs.items():
         for s in sigs:
             if s in html_low:
                 payments.append(name); break
     report["checks"]["payment_methods"] = payments
-    if len(payments) >= 2:
-        report["positives"].append(f"{len(payments)} payment options")
-    elif len(payments) <= 1:
-        report["issues"].append({
-            "title": "Limited Payment Options",
-            "description": f"Only {len(payments)} payment method(s) detected." + (" (credit card only)" if not payments else ""),
-            "recommendation": "Add PayPal, Shop Pay, and Apple Pay. Stores with 3+ options convert 20% better.",
-            "severity": "medium"
-        })
+    if len(payments) >= 2: report["positives"].append(f"{len(payments)} payment options")
+    elif len(payments) <= 1: report["issues"].append({"title": "Limited Payment Options", "description": f"Only {len(payments)} payment method(s) detected.", "recommendation": "Add PayPal, Shop Pay, and Apple Pay. 3+ options convert 20% better.", "severity": "medium"})
 
-    # ==========================================
-    # NEW CHECK 13: Reviews app
-    # ==========================================
     review_apps = []
     for name, sigs in {"Judge.me":["judge.me","judgeme"],"Loox":["loox.io"],"Yotpo":["yotpo"],"Okendo":["okendo"],"Stamped":["stamped.io"],"Reviews.io":["reviews.io"],"Trustpilot":["trustpilot"]}.items():
         for s in sigs:
             if s in html_low: review_apps.append(name); break
     report["checks"]["review_apps"] = review_apps
-    if review_apps:
-        report["positives"].append(f"Reviews: {', '.join(review_apps)}")
-    else:
-        report["issues"].append({
-            "title": "No Reviews App",
-            "description": "No customer review system detected.",
-            "recommendation": "Install Judge.me (free) or Loox. Reviews increase conversion by 15-30%.",
-            "severity": "high"
-        })
+    if review_apps: report["positives"].append(f"Reviews: {', '.join(review_apps)}")
+    else: report["issues"].append({"title": "No Reviews App", "description": "No customer review system detected.", "recommendation": "Install Judge.me (free) or Loox. Reviews increase conversion 15-30%.", "severity": "high"})
 
-    # ==========================================
-    # NEW CHECK 14: Shipping info
-    # ==========================================
     has_free_shipping_banner = any(x in html_low for x in ['free shipping', 'free delivery', 'shipping on us'])
-    has_shipping_page = False
-    try:
-        sr = requests.get(f"{base_url}/policies/shipping-policy", headers=headers, timeout=5)
-        has_shipping_page = (sr.status_code == 200)
-    except: pass
     report["checks"]["free_shipping_advertised"] = has_free_shipping_banner
-    report["checks"]["shipping_page_exists"] = has_shipping_page
-    if has_free_shipping_banner:
-        report["positives"].append("Free shipping advertised")
-    else:
-        report["issues"].append({
-            "title": "No Free Shipping Banner",
-            "description": "Free shipping is the #1 reason customers choose a store.",
-            "recommendation": "Add a free shipping threshold. Even $50+ free shipping boosts AOV.",
-            "severity": "medium"
-        })
+    if has_free_shipping_banner: report["positives"].append("Free shipping advertised")
+    else: report["issues"].append({"title": "No Free Shipping Banner", "description": "Free shipping is the #1 reason customers choose a store.", "recommendation": "Add a free shipping threshold. Even $50+ free shipping boosts AOV.", "severity": "medium"})
 
-    # ==========================================
-    # NEW CHECK 15: Cart type
-    # ==========================================
     is_drawer_cart = any(x in html_low for x in ['cart-drawer', 'cart__drawer', 'drawer__cart', 'cart-notification'])
     is_page_cart = '/cart' in html_low and not is_drawer_cart
     report["checks"]["cart_type"] = "drawer" if is_drawer_cart else ("page" if is_page_cart else "unknown")
-    if is_drawer_cart:
-        report["positives"].append("Modern drawer cart")
-    elif is_page_cart:
-        report["issues"].append({
-            "title": "Page-Based Cart",
-            "description": "Cart opens as a full page instead of a slide-in drawer.",
-            "recommendation": "Switch to a drawer cart. It converts 15-25% better.",
-            "severity": "medium"
-        })
+    if is_drawer_cart: report["positives"].append("Modern drawer cart")
+    elif is_page_cart: report["issues"].append({"title": "Page-Based Cart", "description": "Cart opens as full page instead of slide-in drawer.", "recommendation": "Switch to a drawer cart. Converts 15-25% better.", "severity": "medium"})
 
-    # ==========================================
-    # NEW CHECK 16: SEO meta
-    # ==========================================
     title_match = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
     desc_match = re.search(r'<meta[^>]*name=["\']description["\'][^>]*content=["\'](.*?)["\']', html, re.IGNORECASE | re.DOTALL)
     page_title = title_match.group(1).strip() if title_match else ""
@@ -725,18 +657,11 @@ def audit_store(domain, case_id):
     report["checks"]["meta_title"] = page_title[:100] + ("..." if len(page_title) > 100 else "")
     report["checks"]["meta_title_length"] = len(page_title)
     report["checks"]["meta_description_length"] = len(page_desc)
-    if len(page_title) == 0:
-        report["issues"].append({"title": "Missing Page Title", "description": "No `<title>` tag.", "recommendation": "Add SEO title (50-60 chars).", "severity": "high"})
-    elif len(page_title) > 70:
-        report["issues"].append({"title": "Meta Title Too Long", "description": f"Title is {len(page_title)} chars (Google cuts at 60).", "recommendation": "Shorten to 50-60 chars.", "severity": "low"})
-    if len(page_desc) == 0:
-        report["issues"].append({"title": "Missing Meta Description", "description": "No description for search engines.", "recommendation": "Add 150-160 char description.", "severity": "medium"})
-    elif len(page_desc) > 170:
-        report["issues"].append({"title": "Meta Description Too Long", "description": f"Description is {len(page_desc)} chars.", "recommendation": "Keep under 160 chars.", "severity": "low"})
+    if len(page_title) == 0: report["issues"].append({"title": "Missing Page Title", "description": "No `<title>` tag.", "recommendation": "Add SEO title (50-60 chars).", "severity": "high"})
+    elif len(page_title) > 70: report["issues"].append({"title": "Meta Title Too Long", "description": f"Title is {len(page_title)} chars.", "recommendation": "Shorten to 50-60 chars.", "severity": "low"})
+    if len(page_desc) == 0: report["issues"].append({"title": "Missing Meta Description", "description": "No description for search engines.", "recommendation": "Add 150-160 char description.", "severity": "medium"})
+    elif len(page_desc) > 170: report["issues"].append({"title": "Meta Description Too Long", "description": f"Description is {len(page_desc)} chars.", "recommendation": "Keep under 160 chars.", "severity": "low"})
 
-    # ==========================================
-    # NEW CHECK 17: Store age (WHOIS)
-    # ==========================================
     age_months = None
     try:
         import whois
@@ -749,17 +674,12 @@ def audit_store(domain, case_id):
     except: pass
     report["checks"]["store_age_months"] = age_months
     if age_months is not None:
-        if age_months < 6:
-            report["checks"]["store_age_label"] = f"{age_months} months (new)"
-        elif age_months < 12:
-            report["checks"]["store_age_label"] = f"{age_months} months"
+        if age_months < 6: report["checks"]["store_age_label"] = f"{age_months} months (new)"
+        elif age_months < 12: report["checks"]["store_age_label"] = f"{age_months} months"
         else:
             years = age_months // 12
             report["checks"]["store_age_label"] = f"{years} year{'s' if years > 1 else ''}"
 
-    # ==========================================
-    # SCORES
-    # ==========================================
     trust = 0
     if he or hp: trust += 20
     trust += int((pf[0]/4)*30)
@@ -796,6 +716,74 @@ def audit_store(domain, case_id):
 
     report["scores"]["overall_score"] = int((report["scores"]["trust_score"] + report["scores"]["technical_score"] + report["scores"]["marketing_score"]) / 3)
     return report
+
+# ==========================================
+# EMAIL GENERATOR (Smart Templates)
+# ==========================================
+def generate_outreach_email(report, tone='friendly'):
+    """Generate a personalized outreach email based on audit issues"""
+    domain = report.get('domain', '')
+    brand = domain.split('.')[0].title() if domain else 'there'
+    issues = report.get('issues', [])
+    positives = report.get('positives', [])
+    scores = report.get('scores', {})
+    checks = report.get('checks', {})
+    overall = scores.get('overall_score', 0)
+    
+    # Get top 3 highest-severity issues
+    priority = {'high': 0, 'medium': 1, 'low': 2}
+    sorted_issues = sorted(issues, key=lambda x: priority.get(x.get('severity', 'low'), 3))
+    top_issues = sorted_issues[:3]
+    
+    # Build issue bullets (with specific numbers)
+    issue_bullets = []
+    for i in top_issues:
+        title = i.get('title', '')
+        # Add number if available
+        if 'Product' in title and checks.get('product_count'):
+            title = f"Only {checks['product_count']} products listed"
+        elif 'Load Time' in title and checks.get('load_time_seconds'):
+            title = f"Slow load time ({checks['load_time_seconds']}s)"
+        issue_bullets.append(title)
+    
+    # Subject line
+    if overall < 50:
+        subject = f"Found {len(issues)} issues on {domain}"
+    elif overall < 75:
+        subject = f"Quick idea for {domain}"
+    else:
+        subject = f"Nice store! One thing I noticed on {domain}"
+    
+    # Body — different tones
+    if tone == 'friendly':
+        greeting = f"Hi {brand} team,"
+        opener = f"I was looking at {domain} today and noticed a few things that could be costing you sales."
+        closer = "Want me to send over a quick 2-min video showing how to fix these?"
+        signoff = "No pitch — just thought it was worth sharing."
+    elif tone == 'professional':
+        greeting = f"Hello {brand} team,"
+        opener = f"I recently analyzed {domain} and identified {len(issues)} optimization opportunities."
+        closer = "Would it be worth a 15-minute call this week to discuss?"
+        signoff = "I help Shopify stores improve conversion. Happy to walk you through it."
+    else:  # casual
+        greeting = f"Hey {brand},"
+        opener = f"Took a look at {domain} — cool store! Noticed a few things though."
+        closer = "Want me to send a quick checklist of fixes?"
+        signoff = "No pressure either way!"
+    
+    body = f"""{greeting}
+
+{opener}
+
+Top 3 issues I found:
+
+"""
+    for b in issue_bullets:
+        body += f"• {b}\n"
+    
+    body += f"\nOverall score: {overall}/100. Most are fixable in a day or two.\n\n{closer}\n\n{signoff}\n\nBest,\n[Your name]"
+    
+    return {'subject': subject, 'body': body, 'tone': tone}
 
 # ==========================================
 # NAVBAR
@@ -1209,140 +1197,46 @@ def scout():
 </div></div>
 <script>
 let recipients=[],scoutedEmails=0,isRunning=false;
-function syncRecipients(){
-  const val=document.getElementById('emailsInput').value;
-  recipients=val.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);
-  updateUI();
-  saveState();
-}
+function syncRecipients(){const val=document.getElementById('emailsInput').value;recipients=val.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);updateUI();saveState()}
 window.onload=async function(){
-  try{
-    const res=await fetch('/load-scout-state');
-    const data=await res.json();
-    if(data.recipients && data.recipients.length > 0){
-      recipients = data.recipients;
-      document.getElementById('emailsInput').value = recipients.join('\\n');
-    }
+  try{const res=await fetch('/load-scout-state');const data=await res.json();
+    if(data.recipients && data.recipients.length > 0){recipients = data.recipients;document.getElementById('emailsInput').value = recipients.join('\\n');}
     if(data.subject) document.getElementById('subjectLine').value = data.subject;
     if(data.message) document.getElementById('messageBody').value = data.message;
     if(data.count) scoutedEmails = data.count;
   }catch(e){}
   const preload = new URLSearchParams(window.location.search).get('add');
-  if(preload){
-    const ta = document.getElementById('emailsInput');
-    if(ta && !ta.value) ta.value = preload;
-  }
+  if(preload){const ta = document.getElementById('emailsInput');if(ta && !ta.value) ta.value = preload;}
   if(!recipients || recipients.length === 0){
-    try{
-      const saved = localStorage.getItem('scoutRecipients');
-      if(saved){
-        const arr = JSON.parse(saved);
-        if(arr && arr.length > 0){
-          recipients = arr;
-          document.getElementById('emailsInput').value = recipients.join('\\n');
-        }
-      }
-    }catch(e){}
+    try{const saved = localStorage.getItem('scoutRecipients');if(saved){const arr = JSON.parse(saved);if(arr && arr.length > 0){recipients = arr;document.getElementById('emailsInput').value = recipients.join('\\n');}}}catch(e){}
   }
   const currentValue = document.getElementById('emailsInput').value.trim();
-  if(currentValue){
-    recipients = currentValue.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);
-  }
+  if(currentValue){recipients = currentValue.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);}
   updateUI();
 };
-function updateUI(){
-  document.getElementById('emailCount').textContent=recipients.length+' recipients';
-  document.getElementById('totalScouted').textContent=scoutedEmails;
-  document.getElementById('todayScouted').textContent=scoutedEmails;
-  document.getElementById('workingRate').textContent=(recipients.length>0?Math.round((scoutedEmails/recipients.length)*100):0)+'%';
-}
-async function saveState(){
-  try{
-    localStorage.setItem('scoutRecipients', JSON.stringify(recipients));
-    await fetch('/save-scout-state',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({recipients:recipients,subject:document.getElementById('subjectLine').value,message:document.getElementById('messageBody').value,count:scoutedEmails})
-    });
-  }catch(e){}
-}
-async function loadFromFinder(){
-  const res=await fetch('/get-stored-emails');const data=await res.json();
-  if(data.emails&&data.emails.length>0){
-    recipients=data.emails;
-    document.getElementById('emailsInput').value=recipients.join('\\n');
-    updateUI();saveState();
-  } else { alert('No emails in Finder. Run a scan first.'); }
-}
+function updateUI(){document.getElementById('emailCount').textContent=recipients.length+' recipients';document.getElementById('totalScouted').textContent=scoutedEmails;document.getElementById('todayScouted').textContent=scoutedEmails;document.getElementById('workingRate').textContent=(recipients.length>0?Math.round((scoutedEmails/recipients.length)*100):0)+'%'}
+async function saveState(){try{localStorage.setItem('scoutRecipients', JSON.stringify(recipients));await fetch('/save-scout-state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients:recipients,subject:document.getElementById('subjectLine').value,message:document.getElementById('messageBody').value,count:scoutedEmails})})}catch(e){}}
+async function loadFromFinder(){const res=await fetch('/get-stored-emails');const data=await res.json();if(data.emails&&data.emails.length>0){recipients=data.emails;document.getElementById('emailsInput').value=recipients.join('\\n');updateUI();saveState()}else{alert('No emails in Finder. Run a scan first.')}}
 async function loadFromVerified(){
-  let res=await fetch('/get-verified-emails');
-  let data=await res.json();
+  let res=await fetch('/get-verified-emails');let data=await res.json();
   let emails = (data.valid && data.valid.length > 0) ? data.valid : [];
-  if(emails.length === 0){
-    try{
-      const jobsRes = await fetch('/verify-jobs');
-      const jobsData = await jobsRes.json();
-      if(jobsData.jobs && jobsData.jobs.length > 0){
-        for(const job of jobsData.jobs){
-          if(job.status === 'completed' && job.valid > 0){
-            const jobRes = await fetch('/verify-results/' + job.id);
-            const jobData = await jobRes.json();
-            if(jobData.valid && jobData.valid.length > 0){
-              emails = jobData.valid;
-              break;
-            }
-          }
-        }
-      }
-    }catch(e){}
-  }
-  if(emails.length > 0){
-    recipients = emails;
-    document.getElementById('emailsInput').value = recipients.join('\\n');
-    updateUI();saveState();
-  } else {
-    alert('No verified emails yet. Run a verification first.');
-  }
+  if(emails.length === 0){try{const jobsRes = await fetch('/verify-jobs');const jobsData = await jobsRes.json();if(jobsData.jobs && jobsData.jobs.length > 0){for(const job of jobsData.jobs){if(job.status === 'completed' && job.valid > 0){const jobRes = await fetch('/verify-results/' + job.id);const jobData = await jobRes.json();if(jobData.valid && jobData.valid.length > 0){emails = jobData.valid;break;}}}}}catch(e){}}
+  if(emails.length > 0){recipients = emails;document.getElementById('emailsInput').value = recipients.join('\\n');updateUI();saveState();}else{alert('No verified emails yet. Run a verification first.');}
 }
-function clearAll(){
-  recipients=[];scoutedEmails=0;
-  document.getElementById('emailsInput').value='';
-  document.getElementById('subjectLine').value='';
-  document.getElementById('messageBody').value='';
-  localStorage.removeItem('scoutRecipients');
-  updateUI();saveState();
-  isRunning=false;
-  document.getElementById('autoClickStatus').textContent='Off';
-}
+function clearAll(){recipients=[];scoutedEmails=0;document.getElementById('emailsInput').value='';document.getElementById('subjectLine').value='';document.getElementById('messageBody').value='';localStorage.removeItem('scoutRecipients');updateUI();saveState();isRunning=false;document.getElementById('autoClickStatus').textContent='Off'}
 function insertPh(t){document.getElementById('messageBody').value+=t;saveState()}
 function generatePreview(){const s=document.getElementById('subjectLine').value;const m=document.getElementById('messageBody').value;const p=document.getElementById('preview');p.innerHTML='<b>Subject:</b> '+s+'<br><br><b>Message:</b><br>'+m.replace('{name}','John Doe').replace('{email}','john@store.com');p.style.display='block'}
 function startCampaign(){if(recipients.length===0){alert('Add recipients first');return}isRunning=true;document.getElementById('autoClickStatus').textContent='On';document.getElementById('launchStatus').innerHTML='<p style="color:green">🚀 Started</p>';openNextEmail()}
 function stopCampaign(){isRunning=false;document.getElementById('autoClickStatus').textContent='Off';document.getElementById('launchStatus').innerHTML='<p style="color:red">⏹️ Stopped</p>';saveState()}
-function openNextEmail(){
-  if(!isRunning)return;
-  if(scoutedEmails>=recipients.length){isRunning=false;document.getElementById('autoClickStatus').textContent='Off';document.getElementById('launchStatus').innerHTML='<p style="color:blue">🎉 Complete</p>';saveState();return}
-  const email=recipients[scoutedEmails];const subj=document.getElementById('subjectLine').value;const msg=document.getElementById('messageBody').value;
-  const body=msg.replace('{name}','Store Owner').replace('{email}',email);
-  window.location.href='mailto:'+email+'?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(body);
-  const log=document.getElementById('log');log.innerHTML+='<div>📨 '+email+'</div>';log.scrollTop=log.scrollHeight;
-  scoutedEmails++;updateUI();saveState();
-}
+function openNextEmail(){if(!isRunning)return;if(scoutedEmails>=recipients.length){isRunning=false;document.getElementById('autoClickStatus').textContent='Off';document.getElementById('launchStatus').innerHTML='<p style="color:blue">🎉 Complete</p>';saveState();return}const email=recipients[scoutedEmails];const subj=document.getElementById('subjectLine').value;const msg=document.getElementById('messageBody').value;const body=msg.replace('{name}','Store Owner').replace('{email}',email);window.location.href='mailto:'+email+'?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(body);const log=document.getElementById('log');log.innerHTML+='<div>📨 '+email+'</div>';log.scrollTop=log.scrollHeight;scoutedEmails++;updateUI();saveState()}
 document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible'&&isRunning)setTimeout(openNextEmail,2000)});
 document.addEventListener('click',function(e){if(isRunning&&scoutedEmails<recipients.length&&!e.target.closest('button'))setTimeout(openNextEmail,2000)});
-function openBulk(){
-  const subj=document.getElementById('subjectLine').value;const msg=document.getElementById('messageBody').value;
-  for(let i=0;i<Math.min(10,recipients.length-scoutedEmails);i++){
-    const email=recipients[scoutedEmails+i];
-    const body=msg.replace('{name}','Store Owner').replace('{email}',email);
-    window.open('mailto:'+email+'?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(body),'_blank');
-  }
-  scoutedEmails+=Math.min(10,recipients.length-scoutedEmails);updateUI();saveState();
-}
+function openBulk(){const subj=document.getElementById('subjectLine').value;const msg=document.getElementById('messageBody').value;for(let i=0;i<Math.min(10,recipients.length-scoutedEmails);i++){const email=recipients[scoutedEmails+i];const body=msg.replace('{name}','Store Owner').replace('{email}',email);window.open('mailto:'+email+'?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(body),'_blank')}scoutedEmails+=Math.min(10,recipients.length-scoutedEmails);updateUI();saveState()}
 </script>'''
     return render_page("Scout", body)
 
 # ==========================================
-# AUDIT PAGE
+# AUDIT PAGE (with Generate Email)
 # ==========================================
 @app.route('/audit')
 @login_required
@@ -1360,18 +1254,41 @@ def audit_page():
 <div><h1 style="margin:0;font-size:24px">Security Analysis</h1><p style="margin:4px 0 0 0;font-size:14px;opacity:0.9">Real audit of any Shopify store</p></div>
 </div>
 <div id="auditResult"></div>
+
+<div id="outreachSection" style="display:none;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-top:20px">
+<h3 style="margin-top:0">✉️ Generate Outreach Email</h3>
+<p style="color:#666;font-size:13px">Uses your audit findings to write a personalized email.</p>
+<div style="margin-bottom:10px">
+<button onclick="generateEmail('friendly')" style="background:#0d9488;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;margin-right:5px">😊 Friendly</button>
+<button onclick="generateEmail('professional')" style="background:#3b82f6;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;margin-right:5px">💼 Professional</button>
+<button onclick="generateEmail('casual')" style="background:#f59e0b;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px">😎 Casual</button>
+</div>
+<div id="emailPreview" style="display:none">
+<label style="font-weight:bold;font-size:13px">Subject:</label>
+<input type="text" id="genSubject" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;margin:5px 0 10px 0;box-sizing:border-box;font-size:14px">
+<label style="font-weight:bold;font-size:13px">Message:</label>
+<textarea id="genBody" rows="10" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;margin-top:5px;box-sizing:border-box;font-size:13px;font-family:monospace"></textarea>
+<button onclick="copyEmail()" style="background:#3b82f6;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;margin-top:10px;margin-right:5px">📋 Copy</button>
+<button onclick="sendToScout()" style="background:#0d9488;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;margin-top:10px">📨 Send to Scout</button>
+<div id="copyStatus" style="font-size:12px;color:green;margin-top:5px"></div>
+</div>
+</div>
+
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-top:20px">
 <h3 style="margin-top:0">📋 Last 3 Audits</h3>
 <div id="auditHistory">Loading...</div>
 </div>
 </div>
 <script>
+let currentReport = null;
+
 async function runAudit(){
   const url=document.getElementById('auditUrl').value.trim();
   if(!url){alert('Enter URL');return}
   const status=document.getElementById('auditStatus');const result=document.getElementById('auditResult');
   status.innerHTML='<p style="color:#666">⏳ Analyzing... this may take 30-45 seconds</p>';
   result.innerHTML='<p style="color:#666;text-align:center;padding:30px">Please wait... checking store, products, policies, apps, payments, SEO</p>';
+  document.getElementById('outreachSection').style.display='none';
   const c=new AbortController();const t=setTimeout(()=>c.abort(),120000);
   try{
     const res=await fetch('/run-audit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:url}),signal:c.signal});
@@ -1379,7 +1296,11 @@ async function runAudit(){
     if(!res.ok){status.innerHTML='<p style="color:red">HTTP '+res.status+'</p>';result.innerHTML='';return}
     const data=await res.json();
     if(data.error){status.innerHTML='<p style="color:red">'+data.error+'</p>';result.innerHTML='';return}
-    status.innerHTML='<p style="color:green">✅ Complete</p>';renderReport(data);loadAuditHistory();
+    currentReport = data;
+    status.innerHTML='<p style="color:green">✅ Complete</p>';
+    renderReport(data);
+    document.getElementById('outreachSection').style.display='block';
+    loadAuditHistory();
   }catch(e){clearTimeout(t);status.innerHTML='<p style="color:red">'+(e.name==='AbortError'?'Timeout':'Error: '+e.message)+'</p>';result.innerHTML=''}
 }
 function scoreColor(s){if(s>=75)return '#16a34a';if(s>=50)return '#f59e0b';return '#ef4444'}
@@ -1420,6 +1341,46 @@ function renderReport(r){
   h+='<div style="background:#eff6ff;border-left:4px solid #3b82f6;padding:15px;border-radius:8px;font-size:13px;color:#1e40af"><b>ℹ️ Note:</b> This audit uses only publicly available data. Sales, customer counts, and checkout abandonment cannot be measured from outside a store.</div>';
   document.getElementById('auditResult').innerHTML=h;
 }
+
+async function generateEmail(tone){
+  if(!currentReport){alert('Run an audit first');return}
+  try{
+    const res = await fetch('/generate-email', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({report: currentReport, tone: tone})
+    });
+    const data = await res.json();
+    if(data.success){
+      document.getElementById('genSubject').value = data.subject;
+      document.getElementById('genBody').value = data.body;
+      document.getElementById('emailPreview').style.display = 'block';
+      document.getElementById('copyStatus').textContent = '';
+    } else {
+      alert('Error: ' + (data.error || 'Unknown'));
+    }
+  }catch(e){alert('Error: '+e.message)}
+}
+function copyEmail(){
+  const subj = document.getElementById('genSubject').value;
+  const body = document.getElementById('genBody').value;
+  const full = 'Subject: ' + subj + '\\n\\n' + body;
+  navigator.clipboard.writeText(full).then(()=>{
+    document.getElementById('copyStatus').textContent = '✅ Copied to clipboard!';
+    setTimeout(()=>{document.getElementById('copyStatus').textContent='';},3000);
+  }).catch(()=>{alert('Copy failed. Long-press to select manually.')});
+}
+async function sendToScout(){
+  const subj = document.getElementById('genSubject').value;
+  const body = document.getElementById('genBody').value;
+  if(!subj || !body){alert('Generate email first');return}
+  await fetch('/save-scout-state',{
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({recipients:[], subject:subj, message:body, count:0})
+  });
+  window.location.href='/scout';
+}
+
 async function loadAuditHistory(){
   const res=await fetch('/get-audit-history');const data=await res.json();
   const c=document.getElementById('auditHistory');
@@ -1431,9 +1392,7 @@ async function loadAuditHistory(){
     html+='<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
     html+='<div><b><a href="https://'+a.domain+'" target="_blank" style="color:#3b82f6;text-decoration:none">'+a.domain+'</a></b> <span style="color:'+color+';font-weight:bold">'+a.score+'%</span><br><span style="font-size:12px;color:#666">'+a.created_at+'</span></div>';
     html+='<button onclick="viewAudit('+a.id+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">View</button>';
-    html+='</div>';
-    html+='<div id="audit-view-'+a.id+'" style="margin-top:10px"></div>';
-    html+='</div>';
+    html+='</div><div id="audit-view-'+a.id+'" style="margin-top:10px"></div></div>';
   });
   c.innerHTML=html;
 }
@@ -1441,16 +1400,22 @@ async function viewAudit(id){
   const res=await fetch('/get-audit-detail/'+id);const data=await res.json();
   const c=document.getElementById('audit-view-'+id);
   if(!data.report){c.innerHTML='<p style="color:#666">Not found.</p>';return}
-  const r=data.report;
-  const sc=r.scores||{};
+  const r=data.report;const sc=r.scores||{};
   let html='<div style="background:white;padding:12px;border-radius:6px;font-size:13px">';
   html+='<b>Overall:</b> '+scoreBar('',sc.overall_score||0);
   html+='<div style="margin-top:8px"><b>Case ID:</b> '+(r.case_id||'N/A')+'</div>';
-  html+='<div style="margin-top:4px"><b>Domain:</b> '+r.domain+'</div>';
-  html+='<div style="margin-top:4px"><b>Products:</b> '+(r.checks?.product_count!==undefined?r.checks.product_count:'N/A')+'</div>';
   html+='<div style="margin-top:4px"><b>Issues:</b> '+(r.issues?.length||0)+'</div>';
+  html+='<button onclick="reloadThisAudit('+JSON.stringify(JSON.stringify(r)).replace(/"/g,'&quot;')+')" style="background:#0d9488;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px;margin-top:8px">Show Full Report</button>';
   html+='</div>';
   c.innerHTML=html;
+}
+function reloadThisAudit(jsonStr){
+  try{
+    currentReport = JSON.parse(jsonStr);
+    renderReport(currentReport);
+    document.getElementById('outreachSection').style.display='block';
+    window.scrollTo({top:0,behavior:'smooth'});
+  }catch(e){alert('Error loading report')}
 }
 window.onload=function(){loadAuditHistory();if(document.getElementById('auditUrl').value.trim())runAudit()};
 </script>'''
@@ -1459,6 +1424,20 @@ window.onload=function(){loadAuditHistory();if(document.getElementById('auditUrl
 # ==========================================
 # API ROUTES
 # ==========================================
+@app.route('/generate-email', methods=['POST'])
+@login_required
+def generate_email_route():
+    data = request.json
+    report = data.get('report', {})
+    tone = data.get('tone', 'friendly')
+    if not report:
+        return jsonify({'success': False, 'error': 'No report data'})
+    try:
+        result = generate_outreach_email(report, tone)
+        return jsonify({'success': True, 'subject': result['subject'], 'body': result['body']})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
 @app.route('/run-audit', methods=['POST'])
 @login_required
 def run_audit():
