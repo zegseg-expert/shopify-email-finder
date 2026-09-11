@@ -18,6 +18,14 @@ from datetime import datetime
 app = Flask(__name__)
 app.secret_key = 'super_secret_key_12345_change_this'
 DATABASE_URL = os.environ.get('DATABASE_URL')
+SHODAN_API_KEY = 'W5LL903l5aFfMROHmpBQGNm7mMkCimWq'
+
+SHOPIFY_IPS = [
+    "23.227.38.32", "23.227.38.36", "23.227.38.65", "23.227.38.66",
+    "23.227.38.67", "23.227.38.68", "23.227.38.69", "23.227.38.70",
+    "23.227.38.71", "23.227.38.72", "23.227.38.73", "23.227.38.74",
+    "23.227.39.20"
+]
 
 # ==========================================
 # DB POOL
@@ -88,6 +96,13 @@ def init_db():
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             domain VARCHAR(255) NOT NULL, report JSONB,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS discovered_stores (
+            id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
+            domain VARCHAR(255) NOT NULL, source VARCHAR(50),
+            has_email BOOLEAN DEFAULT FALSE,
+            is_saved BOOLEAN DEFAULT TRUE,
+            discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_email, domain))""")
         conn.commit(); cur.close()
         print("✅ DB ready")
     except Exception as e: print(f"❌ DB: {e}")
@@ -186,7 +201,6 @@ def verify_email(email):
         return email, False, "Unknown"
 
 def background_verify_worker(job_id):
-    print(f"🔄 Job {job_id} started")
     conn = get_db()
     if not conn: return
     try:
@@ -230,7 +244,6 @@ def background_verify_worker(job_id):
             conn.commit(); cur.close()
         finally:
             release_db(conn)
-    print(f"✅ Job {job_id} done")
 
 def find_emails(domain):
     domain = domain.strip().lower().replace("https://", "").replace("http://", "").replace("www.", "")
@@ -270,13 +283,104 @@ def find_emails(domain):
     return final
 
 # ==========================================
+# STORE DISCOVERY METHODS
+# ==========================================
+def is_shopify(domain):
+    """Verify a domain is a Shopify store"""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        r = requests.get(f"https://{domain}", headers=headers, timeout=6, allow_redirects=True)
+        if r.status_code == 200:
+            html = r.text.lower()
+            return any(x in html for x in ['cdn.shopify.com', 'shopify.theme', 'shopify-section', 'myshopify.com', 'shopify-payment-button'])
+    except: pass
+    return False
+
+def discover_via_shodan(ip_list, limit=10):
+    """Query Shodan for domains on Shopify IPs"""
+    discovered = []
+    for ip in ip_list[:limit]:
+        try:
+            url = f"https://api.shodan.io/shodan/host/{ip}?key={SHODAN_API_KEY}"
+            r = requests.get(url, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                for hostname in data.get('hostnames', []):
+                    domain = hostname.strip().lower()
+                    if "shopify" not in domain and '.' in domain and len(domain) > 5:
+                        discovered.append({'domain': domain, 'source': 'shodan'})
+            elif r.status_code == 403:
+                print(f"Shodan rate limit hit at {ip}")
+                break
+            time.sleep(1)
+        except Exception as e:
+            print(f"Shodan error on {ip}: {e}")
+    return discovered
+
+def discover_via_sitemap(candidate_domains):
+    """Check candidate domains to see if they are Shopify stores"""
+    discovered = []
+    def check(d):
+        try:
+            r = requests.get(f"https://{d}/sitemap.xml", timeout=5, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code == 200 and 'shopify' in r.text.lower():
+                return {'domain': d, 'source': 'sitemap'}
+        except: pass
+        return None
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        results = list(ex.map(check, candidate_domains[:50]))
+    for r in results:
+        if r: discovered.append(r)
+    return discovered
+
+def discover_via_google(keyword, limit=20):
+    """Search Google for Shopify stores. Uses DuckDuckGo as fallback."""
+    discovered = []
+    try:
+        query = f'"Powered by Shopify" {keyword}'
+        url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        r = requests.post(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            links = re.findall(r'class="result__a" href="(.*?)"', r.text)
+            for link in links[:limit]:
+                if "uddg=" in link:
+                    import urllib.parse
+                    parsed = urllib.parse.parse_qs(urllib.parse.urlparse(link).query)
+                    if 'uddg' in parsed: link = parsed['uddg'][0]
+                clean = link.replace("https://", "").replace("http://", "").split("/")[0]
+                if "shopify.com" not in clean and '.' in clean and len(clean) > 5:
+                    discovered.append({'domain': clean, 'source': 'google'})
+    except Exception as e:
+        print(f"DDG error: {e}")
+    return discovered
+
+def save_discovered(user_email, stores):
+    """Save discovered stores to database"""
+    conn = get_db()
+    if not conn: return 0
+    saved = 0
+    try:
+        cur = conn.cursor()
+        for store in stores:
+            try:
+                cur.execute("""INSERT INTO discovered_stores (user_email, domain, source)
+                    VALUES (%s, %s, %s) ON CONFLICT (user_email, domain) DO NOTHING""",
+                    (user_email, store['domain'], store.get('source', 'unknown')))
+                if cur.rowcount > 0: saved += 1
+            except: pass
+        conn.commit(); cur.close()
+    except Exception as e:
+        print(f"save discovered: {e}")
+    finally:
+        release_db(conn)
+    return saved
+
+# ==========================================
 # STORE AUDIT ENGINE
 # ==========================================
 def audit_store(domain, case_id):
-    raw = domain.strip().lower()
-    raw = raw.replace("https://", "").replace("http://", "").replace("www.", "")
-    raw = raw.split("/")[0]
-    
+    raw = domain.strip().lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
     report = {
         "domain": raw, "case_id": case_id,
         "audited_at": datetime.now().isoformat(),
@@ -285,13 +389,11 @@ def audit_store(domain, case_id):
     if not raw or '.' not in raw:
         report['error'] = "Invalid domain"
         return report
-    
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept-Language": "en-US,en;q=0.5"
     }
     base_url = f"https://{raw}"
-    
     try:
         start = time.time()
         r = requests.get(base_url, headers=headers, timeout=10, allow_redirects=True)
@@ -306,168 +408,82 @@ def audit_store(domain, case_id):
         elif load_time > 3:
             report["issues"].append({
                 "title": "Slow Load Time",
-                "description": f"Store took {load_time}s to load. Slow stores lose 30-50% of visitors.",
-                "recommendation": "Optimize images, remove unused apps, enable Shopify CDN caching.",
+                "description": f"Store took {load_time}s to load.",
+                "recommendation": "Optimize images, remove unused apps.",
                 "severity": "medium"
             })
     except Exception as e:
         report["checks"]["https"] = False
         report["error"] = f"Could not reach store: {str(e)[:100]}"
         return report
-    
-    is_shopify = any(x in html.lower() for x in [
-        'cdn.shopify.com', 'shopify.theme', 'shopify-section',
-        'shopify-payment-button', 'myshopify.com', 'shopify.com/s/files'
-    ])
-    report["checks"]["is_shopify"] = is_shopify
-    if is_shopify:
-        report["positives"].append("Confirmed Shopify store")
-    
+    is_shop = any(x in html.lower() for x in ['cdn.shopify.com', 'shopify.theme', 'shopify-section', 'myshopify.com'])
+    report["checks"]["is_shopify"] = is_shop
+    if is_shop: report["positives"].append("Confirmed Shopify store")
     try:
         r2 = requests.get(f"{base_url}/products.json?limit=250", headers=headers, timeout=10)
         if r2.status_code == 200:
-            data = r2.json()
-            product_count = len(data.get('products', []))
-            report["checks"]["product_count"] = product_count
-            report["checks"]["product_count_capped"] = (product_count == 250)
-            if product_count == 0:
-                report["issues"].append({
-                    "title": "No Products Visible",
-                    "description": "The store has no products listed publicly. This will kill all sales.",
-                    "recommendation": "Add products immediately. Aim for at least 10-20 products to start.",
-                    "severity": "high"
-                })
-            elif product_count < 10:
-                report["issues"].append({
-                    "title": f"Only {product_count} Products Listed",
-                    "description": f"Store has only {product_count} products. This makes the store look new or incomplete.",
-                    "recommendation": "Add more products. Aim for 20+ to build trust and increase order value.",
-                    "severity": "medium"
-                })
+            pc = len(r2.json().get('products', []))
+            report["checks"]["product_count"] = pc
+            report["checks"]["product_count_capped"] = (pc == 250)
+            if pc == 0:
+                report["issues"].append({"title": "No Products Visible", "description": "Store has no products.", "recommendation": "Add products immediately.", "severity": "high"})
+            elif pc < 10:
+                report["issues"].append({"title": f"Only {pc} Products", "description": f"Only {pc} products listed.", "recommendation": "Add more products (aim for 20+).", "severity": "medium"})
             else:
-                report["positives"].append(f"{product_count}+ products listed")
-    except:
-        report["checks"]["product_count"] = None
-    
-    theme_name = None
-    theme_match = re.search(r'"theme_name"\s*:\s*"([^"]+)"', html)
-    if theme_match:
-        theme_name = theme_match.group(1)
-    else:
-        tm = re.search(r'/cdn/shop/t/(\d+)/assets/', html)
-        if tm: theme_name = f"Theme ID {tm.group(1)}"
-    report["checks"]["theme"] = theme_name or "Unknown"
-    
-    has_viewport = 'name="viewport"' in html.lower() or "name='viewport'" in html.lower()
+                report["positives"].append(f"{pc}+ products listed")
+    except: report["checks"]["product_count"] = None
+    tm = re.search(r'"theme_name"\s*:\s*"([^"]+)"', html)
+    report["checks"]["theme"] = tm.group(1) if tm else "Unknown"
+    has_viewport = 'name="viewport"' in html.lower()
     report["checks"]["mobile_responsive"] = has_viewport
-    if has_viewport:
-        report["positives"].append("Mobile responsive")
-    else:
-        report["issues"].append({
-            "title": "Not Mobile Responsive",
-            "description": "Store is missing the viewport meta tag. Over 70% of shoppers use phones.",
-            "recommendation": "Switch to a mobile-first Shopify theme like Dawn or Refresh.",
-            "severity": "high"
-        })
-    
+    if has_viewport: report["positives"].append("Mobile responsive")
+    else: report["issues"].append({"title": "Not Mobile Responsive", "description": "Missing viewport meta.", "recommendation": "Use mobile-first theme.", "severity": "high"})
     has_email = bool(re.search(r'mailto:[^"\']+', html))
     has_phone = bool(re.search(r'tel:[^"\']+', html))
-    has_contact = 'contact' in html.lower()
     report["checks"]["has_email_link"] = has_email
     report["checks"]["has_phone_link"] = has_phone
-    report["checks"]["has_contact_page"] = has_contact
-    if has_email or has_phone:
-        report["positives"].append("Contact info present")
-    else:
-        report["issues"].append({
-            "title": "No Contact Information",
-            "description": "No visible email or phone number. Customers won't trust a store they can't reach.",
-            "recommendation": "Add a Contact page with email, phone, and business address in the footer.",
-            "severity": "high"
-        })
-    
-    socials = []
-    for p in ['facebook.com', 'instagram.com', 'twitter.com', 'x.com', 'tiktok.com', 'youtube.com', 'pinterest.com']:
-        if p in html.lower(): socials.append(p.split('.')[0])
+    report["checks"]["has_contact_page"] = 'contact' in html.lower()
+    if has_email or has_phone: report["positives"].append("Contact info present")
+    else: report["issues"].append({"title": "No Contact Info", "description": "No email or phone.", "recommendation": "Add Contact page.", "severity": "high"})
+    socials = [p.split('.')[0] for p in ['facebook.com','instagram.com','twitter.com','tiktok.com','youtube.com','pinterest.com'] if p in html.lower()]
     report["checks"]["social_links"] = socials
-    if len(socials) >= 2:
-        report["positives"].append(f"Active on {len(socials)} socials")
-    elif len(socials) == 0:
-        report["issues"].append({
-            "title": "No Social Media Links",
-            "description": "Store has no Facebook, Instagram, or TikTok links. Social proof builds trust.",
-            "recommendation": "Add your social profiles to the footer. Post regularly to drive traffic.",
-            "severity": "medium"
-        })
-    
+    if len(socials) >= 2: report["positives"].append(f"Active on {len(socials)} socials")
+    elif len(socials) == 0: report["issues"].append({"title": "No Social Media", "description": "No social links found.", "recommendation": "Add social profiles.", "severity": "medium"})
     policies = ['/policies/refund-policy', '/policies/privacy-policy', '/policies/terms-of-service', '/policies/shipping-policy']
-    policies_found = [0]
-    def check_policy(p):
+    pf = [0]
+    def check_p(p):
         try:
             r3 = requests.get(f"{base_url}{p}", headers=headers, timeout=5)
-            if r3.status_code == 200: policies_found[0] += 1
+            if r3.status_code == 200: pf[0] += 1
         except: pass
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        list(ex.map(check_policy, policies))
-    report["checks"]["policy_pages_found"] = f"{policies_found[0]}/4"
-    if policies_found[0] == 4:
-        report["positives"].append("All policy pages present")
-    elif policies_found[0] < 2:
-        report["issues"].append({
-            "title": f"Missing {4 - policies_found[0]} Policy Pages",
-            "description": f"Only {policies_found[0]}/4 essential policy pages exist.",
-            "recommendation": "Add Refund, Privacy, Terms, and Shipping policies in Settings → Policies.",
-            "severity": "high"
-        })
-    elif policies_found[0] < 4:
-        report["issues"].append({
-            "title": f"Only {policies_found[0]}/4 Policy Pages",
-            "description": "Some essential policy pages are missing.",
-            "recommendation": "Add the remaining policies in your Shopify admin.",
-            "severity": "medium"
-        })
-    
-    currency_match = re.search(r'"currency"\s*:\s*"([A-Z]{3})"', html)
-    if currency_match:
-        report["checks"]["currency"] = currency_match.group(1)
-    else:
-        c2 = re.search(r'Shopify\.currency\s*=\s*\{[^}]*"active"\s*:\s*"([A-Z]{3})"', html)
-        report["checks"]["currency"] = c2.group(1) if c2 else "Unknown"
-    
-    detected_apps = []
-    app_signatures = {
-        "Klaviyo": ["klaviyo"], "Judge.me": ["judge.me", "judgeme"], "Yotpo": ["yotpo"],
-        "Loox": ["loox.io"], "Privy": ["privy.com"], "ReConvert": ["reconvert"],
-        "Bold": ["boldapps", "bold.com"], "Recharge": ["rechargepayments"],
-        "Tidio": ["tidio"], "Gorgias": ["gorgias"], "Zendesk": ["zendesk"],
+    with ThreadPoolExecutor(max_workers=4) as ex: list(ex.map(check_p, policies))
+    report["checks"]["policy_pages_found"] = f"{pf[0]}/4"
+    if pf[0] == 4: report["positives"].append("All policy pages present")
+    elif pf[0] < 2: report["issues"].append({"title": f"Missing {4-pf[0]} Policy Pages", "description": f"Only {pf[0]}/4 policies.", "recommendation": "Add policies in Settings.", "severity": "high"})
+    cm = re.search(r'"currency"\s*:\s*"([A-Z]{3})"', html)
+    report["checks"]["currency"] = cm.group(1) if cm else "Unknown"
+    apps = []
+    for name, sigs in {
+        "Klaviyo": ["klaviyo"], "Judge.me": ["judge.me"], "Yotpo": ["yotpo"],
+        "Loox": ["loox.io"], "ReConvert": ["reconvert"], "Recharge": ["rechargepayments"],
+        "Tidio": ["tidio"], "Gorgias": ["gorgias"],
         "Facebook Pixel": ["connect.facebook.net", "fbq("],
         "Google Analytics": ["google-analytics.com", "gtag("],
-        "TikTok Pixel": ["analytics.tiktok.com"],
-    }
-    for app_name, sigs in app_signatures.items():
-        for sig in sigs:
-            if sig in html.lower():
-                detected_apps.append(app_name); break
-    report["checks"]["detected_apps"] = detected_apps
-    
-    has_analytics = any('Pixel' in a or 'Analytics' in a for a in detected_apps)
+        "TikTok Pixel": ["analytics.tiktok.com"]
+    }.items():
+        for s in sigs:
+            if s in html.lower(): apps.append(name); break
+    report["checks"]["detected_apps"] = apps
+    has_analytics = any('Pixel' in a or 'Analytics' in a for a in apps)
     if not has_analytics:
-        report["issues"].append({
-            "title": "No Tracking Pixel Detected",
-            "description": "Store has no Facebook Pixel or Google Analytics installed. You're losing ad optimization data.",
-            "recommendation": "Install Facebook Pixel and Google Analytics via Shopify App Store.",
-            "severity": "high"
-        })
-    
-    scores = {}
+        report["issues"].append({"title": "No Tracking Pixel", "description": "No Facebook/Google Analytics.", "recommendation": "Install tracking via Shopify App Store.", "severity": "high"})
     trust = 0
     if has_email or has_phone: trust += 30
-    trust += int((policies_found[0] / 4) * 40)
+    trust += int((pf[0] / 4) * 40)
     if len(socials) >= 2: trust += 20
     elif len(socials) == 1: trust += 10
-    if is_shopify: trust += 10
-    scores["trust_score"] = min(trust, 100)
-    
+    if is_shop: trust += 10
+    report["scores"]["trust_score"] = min(trust, 100)
     tech = 0
     if report["checks"].get("https"): tech += 25
     if report["checks"].get("http_status") == 200: tech += 25
@@ -476,20 +492,16 @@ def audit_store(domain, case_id):
     if lt < 1.5: tech += 25
     elif lt < 3: tech += 15
     elif lt < 5: tech += 5
-    scores["technical_score"] = tech
-    
-    mkt = 0
-    mkt += min(len(detected_apps) * 8, 40)
+    report["scores"]["technical_score"] = tech
+    mkt = min(len(apps) * 8, 40)
     if len(socials) >= 3: mkt += 30
     elif len(socials) >= 1: mkt += 15
     pc = report["checks"].get("product_count") or 0
     if pc >= 10: mkt += 20
     elif pc >= 5: mkt += 10
     if has_analytics: mkt += 10
-    scores["marketing_score"] = min(mkt, 100)
-    
-    scores["overall_score"] = int((scores["trust_score"] + scores["technical_score"] + scores["marketing_score"]) / 3)
-    report["scores"] = scores
+    report["scores"]["marketing_score"] = min(mkt, 100)
+    report["scores"]["overall_score"] = int((report["scores"]["trust_score"] + report["scores"]["technical_score"] + report["scores"]["marketing_score"]) / 3)
     return report
 
 # ==========================================
@@ -518,6 +530,7 @@ NAVBAR = '''
 <div class="drawer" id="drawer">
 <div class="drawer-header"><span>📧 Menu</span><button class="drawer-close" onclick="toggleDrawer()">×</button></div>
 <a href="/" onclick="closeDrawer()">🔍 Email Finder</a>
+<a href="/discover" onclick="closeDrawer()">🎯 Store Discovery</a>
 <a href="/verify" onclick="closeDrawer()">✅ Verify Emails</a>
 <a href="/scout" onclick="closeDrawer()">📨 Email Scout</a>
 <a href="/audit" onclick="closeDrawer()">🛡️ Security Analysis</a>
@@ -632,6 +645,142 @@ async function findBulkEmails(){
     return render_page("Finder", body)
 
 # ==========================================
+# STORE DISCOVERY PAGE
+# ==========================================
+@app.route('/discover')
+@login_required
+def discover_page():
+    body = '''<div style="max-width:900px;margin:20px auto;padding:20px">
+<div style="background:#8b5cf6;color:white;padding:20px;border-radius:10px;margin-bottom:20px">
+<h1 style="margin:0">🎯 Store Discovery</h1>
+<p style="margin:5px 0 0 0">Find new Shopify stores using multiple methods</p>
+</div>
+
+<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
+<h3 style="margin-top:0">🔎 Discovery Methods</h3>
+<p style="color:#666;font-size:14px">All methods combine and deduplicate results. Saved to your database automatically.</p>
+<button onclick="runDiscovery('shodan')" style="background:#8b5cf6;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">🔍 Shodan IP Scan</button>
+<button onclick="runDiscovery('google')" style="background:#3b82f6;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">🌐 Search Engine</button>
+<button onclick="runDiscovery('all')" style="background:#0d9488;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">⚡ Run All</button>
+<div id="discoveryStatus" style="margin-top:12px"></div>
+</div>
+
+<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
+<h3 style="margin-top:0">📋 Discovered Stores (<span id="storeCount">0</span>)</h3>
+<div id="storeList" style="margin-top:10px">Loading...</div>
+<button onclick="loadStores()" style="background:#3b82f6;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px;margin-top:10px">🔄 Refresh</button>
+<button onclick="clearStores()" style="background:#ef4444;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px;margin-top:10px;margin-left:8px">🗑️ Clear All</button>
+</div>
+</div>
+<script>
+async function runDiscovery(method){
+  const status=document.getElementById('discoveryStatus');
+  status.innerHTML='<p style="color:#666">⏳ Running '+method+' discovery... this may take 30-60 seconds</p>';
+  try{
+    const res=await fetch('/run-discovery',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({method:method})});
+    const data=await res.json();
+    if(data.success){
+      status.innerHTML='<p style="color:green">✅ Found '+data.found+' new stores (saved: '+data.saved+')</p>';
+      loadStores();
+    } else {
+      status.innerHTML='<p style="color:red">Error: '+(data.error||'Unknown error')+'</p>';
+    }
+  }catch(e){status.innerHTML='<p style="color:red">Error: '+e+'</p>'}
+}
+async function loadStores(){
+  const res=await fetch('/get-discovered');
+  const data=await res.json();
+  document.getElementById('storeCount').textContent=data.stores.length;
+  const c=document.getElementById('storeList');
+  if(data.stores.length===0){c.innerHTML='<p style="color:#666">No stores discovered yet. Run a discovery method above.</p>';return}
+  let html='';
+  data.stores.forEach(s=>{
+    html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid #8b5cf6;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
+    html+='<div><b>'+s.domain+'</b><br><span style="font-size:12px;color:#666">Source: '+s.source+' · '+s.discovered_at+'</span></div>';
+    html+='<div style="display:flex;gap:6px;flex-wrap:wrap">';
+    html+='<button onclick="actFindEmail(\\''+s.domain+'\\')" style="background:#667eea;color:white;padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">📧 Email</button>';
+    html+='<button onclick="actAudit(\\''+s.domain+'\\')" style="background:#65a30d;color:white;padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">🛡️ Audit</button>';
+    html+='<button onclick="actScout(\\''+s.domain+'\\')" style="background:#0d9488;color:white;padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">📨 Scout</button>';
+    html+='</div></div>';
+  });
+  c.innerHTML=html;
+}
+function actFindEmail(d){
+  window.location.href='/';
+  setTimeout(()=>{const ta=document.getElementById('urls');if(ta)ta.value=d},500);
+}
+function actAudit(d){
+  window.location.href='/audit?url='+encodeURIComponent(d);
+}
+function actScout(d){
+  window.location.href='/scout?add='+encodeURIComponent(d);
+}
+async function clearStores(){
+  if(!confirm('Delete all discovered stores?'))return;
+  await fetch('/clear-discovered',{method:'POST'});
+  loadStores();
+}
+window.onload=loadStores;
+</script>'''
+    return render_page("Store Discovery", body)
+
+# ==========================================
+# DISCOVERY API
+# ==========================================
+@app.route('/run-discovery', methods=['POST'])
+@login_required
+def run_discovery():
+    user_email = session.get('user_id')
+    method = request.json.get('method', 'all')
+    all_found = []
+    try:
+        if method in ['shodan', 'all']:
+            shodan_results = discover_via_shodan(SHOPIFY_IPS, limit=5)
+            all_found.extend(shodan_results)
+        if method in ['google', 'all']:
+            google_results = discover_via_google('', limit=20)
+            all_found.extend(google_results)
+        # Deduplicate by domain
+        unique = {}
+        for s in all_found:
+            unique[s['domain']] = s
+        found_list = list(unique.values())
+        saved = save_discovered(user_email, found_list) if found_list else 0
+        return jsonify({'success': True, 'found': len(found_list), 'saved': saved})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/get-discovered')
+@login_required
+def get_discovered():
+    user_email = session.get('user_id')
+    conn = get_db()
+    if not conn: return jsonify({'stores': []})
+    try:
+        cur = conn.cursor()
+        cur.execute("""SELECT domain, source, discovered_at FROM discovered_stores
+            WHERE user_email = %s ORDER BY discovered_at DESC LIMIT 200""", (user_email,))
+        rows = cur.fetchall(); cur.close()
+        stores = [{'domain': r[0], 'source': r[1], 'discovered_at': str(r[2])[:16]} for r in rows]
+        return jsonify({'stores': stores})
+    except: return jsonify({'stores': []})
+    finally: release_db(conn)
+
+@app.route('/clear-discovered', methods=['POST'])
+@login_required
+def clear_discovered():
+    user_email = session.get('user_id')
+    conn = get_db()
+    if not conn: return jsonify({'success': False})
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM discovered_stores WHERE user_email = %s", (user_email,))
+        conn.commit(); cur.close()
+        return jsonify({'success': True})
+    except: return jsonify({'success': False})
+    finally: release_db(conn)
+
+# ==========================================
 # VERIFY
 # ==========================================
 @app.route('/verify')
@@ -740,6 +889,7 @@ window.onload=function(){refreshJobs();setInterval(refreshJobs,10000)};
 @app.route('/scout')
 @login_required
 def scout():
+    preload = request.args.get('add', '')
     body = '''<div style="max-width:800px;margin:20px auto;padding:20px">
 <div style="background:#0d9488;color:white;padding:20px;border-radius:10px;margin-bottom:20px"><h1 style="margin:0">📨 Email Scout</h1></div>
 <div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
@@ -793,6 +943,8 @@ window.onload=async function(){
     if(data.message)document.getElementById('messageBody').value=data.message;
     if(data.count)scoutedEmails=data.count;
   }catch(e){}
+  const preload="''' + preload.replace('"','') + '''";
+  if(preload){const ta=document.getElementById('emailsInput');if(!ta.value)ta.value=preload;}
   syncRecipients();
 };
 function updateUI(){
@@ -841,15 +993,16 @@ function openBulk(){
     return render_page("Scout", body)
 
 # ==========================================
-# STORE AUDIT PAGE (with shield icon)
+# STORE AUDIT PAGE
 # ==========================================
 @app.route('/audit')
 @login_required
 def audit_page():
+    preload = request.args.get('url', '')
     body = '''<div style="max-width:900px;margin:20px auto;padding:20px">
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
 <label style="font-weight:bold">Store URL</label>
-<input type="text" id="auditUrl" placeholder="e.g. golfsociety.shop" style="width:100%;padding:12px;border:2px solid #ddd;border-radius:8px;font-size:16px;margin:10px 0;box-sizing:border-box">
+<input type="text" id="auditUrl" placeholder="e.g. golfsociety.shop" value="''' + preload.replace('"','') + '''" style="width:100%;padding:12px;border:2px solid #ddd;border-radius:8px;font-size:16px;margin:10px 0;box-sizing:border-box">
 <button onclick="runAudit()" style="background:#65a30d;color:white;padding:12px 30px;border:none;border-radius:8px;cursor:pointer;font-size:16px;width:100%">🔍 Run Audit</button>
 <div id="auditStatus" style="margin-top:10px"></div>
 </div>
@@ -872,137 +1025,62 @@ async function runAudit(){
   const status=document.getElementById('auditStatus');
   const result=document.getElementById('auditResult');
   status.innerHTML='<p style="color:#666">⏳ Analyzing '+url+'... (10-30 seconds)</p>';
-  result.innerHTML='<p style="color:#666;text-align:center;padding:30px">Please wait... checking store, products, policies, apps</p>';
-  
+  result.innerHTML='<p style="color:#666;text-align:center;padding:30px">Please wait...</p>';
   const controller=new AbortController();
   const timeoutId=setTimeout(()=>controller.abort(),90000);
-  
   try{
-    const res=await fetch('/run-audit',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({url:url}),
-      signal:controller.signal
-    });
+    const res=await fetch('/run-audit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:url}),signal:controller.signal});
     clearTimeout(timeoutId);
-    
-    if(!res.ok){
-      status.innerHTML='<p style="color:red">Server error: HTTP '+res.status+'</p>';
-      result.innerHTML='';
-      return;
-    }
+    if(!res.ok){status.innerHTML='<p style="color:red">Server error: HTTP '+res.status+'</p>';result.innerHTML='';return}
     const data=await res.json();
-    if(data.error){
-      status.innerHTML='<p style="color:red">Error: '+data.error+'</p>';
-      result.innerHTML='';
-      return;
-    }
+    if(data.error){status.innerHTML='<p style="color:red">Error: '+data.error+'</p>';result.innerHTML='';return}
     status.innerHTML='<p style="color:green">✅ Audit complete</p>';
     renderReport(data);
   }catch(e){
     clearTimeout(timeoutId);
-    if(e.name==='AbortError'){
-      status.innerHTML='<p style="color:red">⏱️ Timeout after 90s. Try again.</p>';
-    }else{
-      status.innerHTML='<p style="color:red">Error: '+e.message+'</p>';
-    }
+    status.innerHTML='<p style="color:red">'+(e.name==='AbortError'?'Timeout after 90s':'Error: '+e.message)+'</p>';
     result.innerHTML='';
   }
 }
-function scoreColor(score){
-  if(score>=75)return '#16a34a';
-  if(score>=50)return '#f59e0b';
-  return '#ef4444';
-}
+function scoreColor(score){if(score>=75)return '#16a34a';if(score>=50)return '#f59e0b';return '#ef4444'}
 function scoreBar(label,score){
-  const color=scoreColor(score);
-  return '<div style="margin:10px 0">'
-    +'<div style="display:flex;justify-content:space-between;margin-bottom:4px"><b>'+label+'</b><span style="color:'+color+';font-weight:bold">'+score+'%</span></div>'
-    +'<div style="background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+score+'%;height:12px;background:'+color+'"></div></div>'
-    +'</div>';
+  const c=scoreColor(score);
+  return '<div style="margin:10px 0"><div style="display:flex;justify-content:space-between;margin-bottom:4px"><b>'+label+'</b><span style="color:'+c+';font-weight:bold">'+score+'%</span></div><div style="background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+score+'%;height:12px;background:'+c+'"></div></div></div>';
 }
 function renderReport(r){
-  const checks=r.checks||{};
-  const scores=r.scores||{};
-  const issues=r.issues||[];
+  const checks=r.checks||{};const scores=r.scores||{};const issues=r.issues||[];
   let html='';
-  
-  html+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">';
-  html+='<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
-  html+='<div><h2 style="margin:0">Store Audit Overview</h2>';
-  html+='<div style="color:#666;font-size:13px;margin-top:6px">Store: <b>https://'+r.domain+'/</b></div></div>';
-  if(r.case_id){html+='<div style="background:#f3f4f6;padding:6px 12px;border-radius:6px;font-size:13px;color:#374151">Case ID: <b>'+r.case_id+'</b></div>';}
-  html+='</div></div>';
-  
-  html+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">';
-  html+='<h3 style="margin-top:0">📈 Scores</h3>';
-  html+=scoreBar('Overall',scores.overall_score||0);
-  html+=scoreBar('Trust',scores.trust_score||0);
-  html+=scoreBar('Technical',scores.technical_score||0);
-  html+=scoreBar('Marketing',scores.marketing_score||0);
-  html+='</div>';
-  
-  const highIssues=issues.filter(i=>i.severity==='high');
-  if(highIssues.length>0){
-    html+='<div style="background:#fef2f2;border-left:4px solid #ef4444;padding:15px;border-radius:8px;margin-bottom:20px">';
-    html+='<div style="color:#991b1b;font-weight:bold;font-size:16px;margin-bottom:6px">⚠️ Critical issues detected! Possible consequences: lost sales, fines, or trust damage.</div>';
-    html+='<div style="color:#7f1d1d;font-size:13px">'+highIssues.length+' high-priority issue(s) found. Review the detailed report below.</div>';
-    html+='</div>';
-  }
-  
+  html+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px"><div><h2 style="margin:0">Store Audit Overview</h2><div style="color:#666;font-size:13px;margin-top:6px">Store: <b>https://'+r.domain+'/</b></div></div>'+(r.case_id?'<div style="background:#f3f4f6;padding:6px 12px;border-radius:6px;font-size:13px;color:#374151">Case ID: <b>'+r.case_id+'</b></div>':'')+'</div></div>';
+  html+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><h3 style="margin-top:0">📈 Scores</h3>'+scoreBar('Overall',scores.overall_score||0)+scoreBar('Trust',scores.trust_score||0)+scoreBar('Technical',scores.technical_score||0)+scoreBar('Marketing',scores.marketing_score||0)+'</div>';
+  const hi=issues.filter(i=>i.severity==='high');
+  if(hi.length>0)html+='<div style="background:#fef2f2;border-left:4px solid #ef4444;padding:15px;border-radius:8px;margin-bottom:20px"><div style="color:#991b1b;font-weight:bold;font-size:16px;margin-bottom:6px">⚠️ Critical issues detected! Possible consequences: lost sales, fines, or trust damage.</div><div style="color:#7f1d1d;font-size:13px">'+hi.length+' high-priority issue(s) found.</div></div>';
   if(issues.length>0){
-    html+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">';
-    html+='<h3 style="margin-top:0;color:#991b1b">⚠️ Issues Found ('+issues.length+')</h3>';
-    issues.forEach(i=>{
-      const sevColor=i.severity==='high'?'#ef4444':(i.severity==='medium'?'#f59e0b':'#6b7280');
-      html+='<div style="background:#fef2f2;border-left:4px solid '+sevColor+';padding:15px;border-radius:8px;margin:10px 0">';
-      html+='<div style="font-weight:bold;font-size:15px;margin-bottom:6px">⚠️ '+i.title+'</div>';
-      html+='<div style="color:#374151;font-size:14px;margin-bottom:8px">'+i.description+'</div>';
-      html+='<div style="background:#fef3c7;padding:10px;border-radius:6px;font-size:13px;color:#78350f"><b>💡 Recommendation:</b> '+i.recommendation+'</div>';
-      html+='</div>';
-    });
+    html+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><h3 style="margin-top:0;color:#991b1b">⚠️ Issues Found ('+issues.length+')</h3>';
+    issues.forEach(i=>{const c=i.severity==='high'?'#ef4444':(i.severity==='medium'?'#f59e0b':'#6b7280');html+='<div style="background:#fef2f2;border-left:4px solid '+c+';padding:15px;border-radius:8px;margin:10px 0"><div style="font-weight:bold;font-size:15px;margin-bottom:6px">⚠️ '+i.title+'</div><div style="color:#374151;font-size:14px;margin-bottom:8px">'+i.description+'</div><div style="background:#fef3c7;padding:10px;border-radius:6px;font-size:13px;color:#78350f"><b>💡 Recommendation:</b> '+i.recommendation+'</div></div>'});
     html+='</div>';
-  } else {
-    html+='<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:15px;border-radius:8px;margin-bottom:20px">';
-    html+='<div style="color:#166534;font-weight:bold">✅ No critical issues detected</div>';
-    html+='</div>';
-  }
-  
-  if(r.positives&&r.positives.length>0){
-    html+='<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:15px;border-radius:8px;margin-bottom:20px">';
-    html+='<h3 style="margin-top:0;color:#166534">✅ What Works Well</h3>';
-    r.positives.forEach(p=>{html+='<div style="margin:6px 0;color:#14532d">✅ '+p+'</div>'});
-    html+='</div>';
-  }
-  
-  html+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">';
-  html+='<h3 style="margin-top:0">🔍 Detailed Checks</h3>';
-  html+='<table style="width:100%;border-collapse:collapse;font-size:14px">';
-  function row(label,val){
-    return '<tr><td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold">'+label+'</td><td style="padding:8px;border-bottom:1px solid #eee">'+val+'</td></tr>';
-  }
-  html+=row('Is Shopify Store', checks.is_shopify?'✅ Yes':'❌ Not detected');
-  html+=row('HTTPS', checks.https?'✅ Enabled':'❌ Disabled');
-  html+=row('HTTP Status', checks.http_status||'N/A');
-  html+=row('Load Time', checks.load_time_seconds?checks.load_time_seconds+'s':'N/A');
-  html+=row('Product Count', (checks.product_count!==null&&checks.product_count!==undefined)?checks.product_count+(checks.product_count_capped?'+':''):'N/A');
-  html+=row('Theme', checks.theme||'Unknown');
-  html+=row('Mobile Responsive', checks.mobile_responsive?'✅ Yes':'❌ No');
-  html+=row('Currency', checks.currency||'Unknown');
-  html+=row('Contact Page', checks.has_contact_page?'✅ Found':'❌ Not found');
-  html+=row('Email Link', checks.has_email_link?'✅ Found':'❌ Not found');
-  html+=row('Phone Link', checks.has_phone_link?'✅ Found':'❌ Not found');
-  html+=row('Policy Pages', checks.policy_pages_found||'0/4');
-  html+=row('Social Links', (checks.social_links&&checks.social_links.length>0)?checks.social_links.join(', '):'None found');
-  html+=row('Detected Apps', (checks.detected_apps&&checks.detected_apps.length>0)?checks.detected_apps.join(', '):'None detected');
+  } else html+='<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:15px;border-radius:8px;margin-bottom:20px"><div style="color:#166534;font-weight:bold">✅ No critical issues detected</div></div>';
+  if(r.positives&&r.positives.length>0){html+='<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:15px;border-radius:8px;margin-bottom:20px"><h3 style="margin-top:0;color:#166534">✅ What Works Well</h3>';r.positives.forEach(p=>{html+='<div style="margin:6px 0;color:#14532d">✅ '+p+'</div>'});html+='</div>'}
+  html+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px"><h3 style="margin-top:0">🔍 Detailed Checks</h3><table style="width:100%;border-collapse:collapse;font-size:14px">';
+  function row(l,v){return '<tr><td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold">'+l+'</td><td style="padding:8px;border-bottom:1px solid #eee">'+v+'</td></tr>'}
+  html+=row('Is Shopify Store',checks.is_shopify?'✅ Yes':'❌ Not detected');
+  html+=row('HTTPS',checks.https?'✅ Enabled':'❌ Disabled');
+  html+=row('HTTP Status',checks.http_status||'N/A');
+  html+=row('Load Time',checks.load_time_seconds?checks.load_time_seconds+'s':'N/A');
+  html+=row('Product Count',(checks.product_count!==null&&checks.product_count!==undefined)?checks.product_count+(checks.product_count_capped?'+':''):'N/A');
+  html+=row('Theme',checks.theme||'Unknown');
+  html+=row('Mobile Responsive',checks.mobile_responsive?'✅ Yes':'❌ No');
+  html+=row('Currency',checks.currency||'Unknown');
+  html+=row('Contact Page',checks.has_contact_page?'✅ Found':'❌ Not found');
+  html+=row('Email Link',checks.has_email_link?'✅ Found':'❌ Not found');
+  html+=row('Phone Link',checks.has_phone_link?'✅ Found':'❌ Not found');
+  html+=row('Policy Pages',checks.policy_pages_found||'0/4');
+  html+=row('Social Links',(checks.social_links&&checks.social_links.length>0)?checks.social_links.join(', '):'None found');
+  html+=row('Detected Apps',(checks.detected_apps&&checks.detected_apps.length>0)?checks.detected_apps.join(', '):'None detected');
   html+='</table></div>';
-  
-  html+='<div style="background:#eff6ff;border-left:4px solid #3b82f6;padding:15px;border-radius:8px;font-size:13px;color:#1e40af">';
-  html+='<b>ℹ️ Note:</b> This audit uses only publicly available data. Sales, customer counts, and checkout abandonment cannot be measured from outside a store.';
-  html+='</div>';
-  
+  html+='<div style="background:#eff6ff;border-left:4px solid #3b82f6;padding:15px;border-radius:8px;font-size:13px;color:#1e40af"><b>ℹ️ Note:</b> This audit uses only publicly available data. Sales, customer counts, and checkout abandonment cannot be measured from outside a store.</div>';
   document.getElementById('auditResult').innerHTML=html;
 }
+window.onload=function(){if(document.getElementById('auditUrl').value.trim())runAudit()};
 </script>'''
     return render_page("Security Analysis", body)
 
@@ -1015,8 +1093,7 @@ def run_audit():
     import traceback
     data = request.json
     url = data.get('url', '').strip()
-    if not url:
-        return jsonify({'error': 'No URL provided'})
+    if not url: return jsonify({'error': 'No URL provided'})
     case_id = generate_case_id()
     try:
         report = audit_store(url, case_id)
@@ -1026,13 +1103,10 @@ def run_audit():
             if conn:
                 try:
                     cur = conn.cursor()
-                    cur.execute("""INSERT INTO store_audits (user_email, domain, report)
-                        VALUES (%s, %s, %s)""", (user_email, url, json.dumps(report)))
+                    cur.execute("INSERT INTO store_audits (user_email, domain, report) VALUES (%s, %s, %s)", (user_email, url, json.dumps(report)))
                     conn.commit(); cur.close()
-                except Exception as e:
-                    print(f"save audit: {e}")
-                finally:
-                    release_db(conn)
+                except: pass
+                finally: release_db(conn)
         return jsonify(report)
     except Exception as e:
         print(f"AUDIT ERROR: {traceback.format_exc()}")
@@ -1051,8 +1125,7 @@ def verify_async():
     try:
         cur = conn.cursor()
         cur.execute("""INSERT INTO verify_jobs (user_email, job_name, total, remaining_emails, valid_emails, invalid_emails, status)
-            VALUES (%s, %s, %s, %s, '', '', 'pending') RETURNING id""",
-            (user_email, job_name, len(emails), '|||'.join(emails)))
+            VALUES (%s, %s, %s, %s, '', '', 'pending') RETURNING id""", (user_email, job_name, len(emails), '|||'.join(emails)))
         job_id = cur.fetchone()[0]
         conn.commit(); cur.close()
     finally:
@@ -1071,13 +1144,7 @@ def verify_status(job_id):
         cur.execute("SELECT id, job_name, total, processed, status, valid_emails, invalid_emails, created_at FROM verify_jobs WHERE id = %s", (job_id,))
         row = cur.fetchone(); cur.close()
         if not row: return jsonify({'error': 'Not found'}), 404
-        return jsonify({
-            'id': row[0], 'name': row[1], 'total': row[2], 'processed': row[3],
-            'status': row[4],
-            'valid': len(row[5].split('|||')) if row[5] else 0,
-            'invalid': len(row[6].split('|||')) if row[6] else 0,
-            'created_at': str(row[7])
-        })
+        return jsonify({'id': row[0], 'name': row[1], 'total': row[2], 'processed': row[3], 'status': row[4], 'valid': len(row[5].split('|||')) if row[5] else 0, 'invalid': len(row[6].split('|||')) if row[6] else 0, 'created_at': str(row[7])})
     finally: release_db(conn)
 
 @app.route('/verify-results/<int:job_id>')
@@ -1090,10 +1157,7 @@ def verify_results(job_id):
         cur.execute("SELECT valid_emails, invalid_emails FROM verify_jobs WHERE id = %s", (job_id,))
         row = cur.fetchone(); cur.close()
         if not row: return jsonify({'error': 'Not found'}), 404
-        return jsonify({
-            'valid': row[0].split('|||') if row[0] else [],
-            'invalid': row[1].split('|||') if row[1] else []
-        })
+        return jsonify({'valid': row[0].split('|||') if row[0] else [], 'invalid': row[1].split('|||') if row[1] else []})
     finally: release_db(conn)
 
 @app.route('/verify-jobs')
@@ -1104,30 +1168,10 @@ def verify_jobs_list():
     if not conn: return jsonify({'jobs': []})
     try:
         cur = conn.cursor()
-        cur.execute("""SELECT id, job_name, total, processed, status, created_at, valid_emails, invalid_emails
-            FROM verify_jobs WHERE user_email = %s ORDER BY created_at DESC LIMIT 3""", (user_email,))
+        cur.execute("""SELECT id, job_name, total, processed, status, created_at, valid_emails, invalid_emails FROM verify_jobs WHERE user_email = %s ORDER BY created_at DESC LIMIT 3""", (user_email,))
         rows = cur.fetchall(); cur.close()
-        jobs = []
-        for r in rows:
-            jobs.append({
-                'id': r[0], 'name': r[1], 'total': r[2], 'processed': r[3],
-                'status': r[4], 'created_at': str(r[5]),
-                'valid': len(r[6].split('|||')) if r[6] else 0,
-                'invalid': len(r[7].split('|||')) if r[7] else 0
-            })
+        jobs = [{'id': r[0], 'name': r[1], 'total': r[2], 'processed': r[3], 'status': r[4], 'created_at': str(r[5]), 'valid': len(r[6].split('|||')) if r[6] else 0, 'invalid': len(r[7].split('|||')) if r[7] else 0} for r in rows]
         return jsonify({'jobs': jobs})
-    finally: release_db(conn)
-
-@app.route('/verify-cancel/<int:job_id>', methods=['POST'])
-@login_required
-def verify_cancel(job_id):
-    conn = get_db()
-    if not conn: return jsonify({'error': 'No DB'}), 500
-    try:
-        cur = conn.cursor()
-        cur.execute("UPDATE verify_jobs SET status='cancelled' WHERE id=%s AND user_email=%s", (job_id, session.get('user_id')))
-        conn.commit(); cur.close()
-        return jsonify({'success': True})
     finally: release_db(conn)
 
 @app.route('/bulk-email', methods=['POST'])
@@ -1145,8 +1189,7 @@ def bulk_email():
     user_email = session.get('user_id')
     all_found = []
     for r in results: all_found.extend(r['emails'])
-    if user_email and all_found:
-        save_user_state(user_email, found_emails='|||'.join(all_found))
+    if user_email and all_found: save_user_state(user_email, found_emails='|||'.join(all_found))
     return jsonify({'success': bool(results), 'results': results})
 
 @app.route('/store-emails', methods=['POST'])
@@ -1184,12 +1227,7 @@ def save_scout_recipients():
 def load_scout_state():
     user_email = session.get('user_id')
     state = load_user_state(user_email) if user_email else {}
-    return jsonify({
-        'recipients': state.get('scout_recipients', []),
-        'subject': state.get('scout_subject', ''),
-        'message': state.get('scout_message', ''),
-        'count': state.get('scout_count', 0)
-    })
+    return jsonify({'recipients': state.get('scout_recipients', []), 'subject': state.get('scout_subject', ''), 'message': state.get('scout_message', ''), 'count': state.get('scout_count', 0)})
 
 @app.route('/save-scout-state', methods=['POST'])
 @login_required
@@ -1197,11 +1235,7 @@ def save_scout_state_route():
     user_email = session.get('user_id')
     data = request.json
     if user_email:
-        save_user_state(user_email,
-            scout_recipients='|||'.join(data.get('recipients', [])),
-            scout_subject=data.get('subject', ''),
-            scout_message=data.get('message', ''),
-            scout_count=data.get('count', 0))
+        save_user_state(user_email, scout_recipients='|||'.join(data.get('recipients', [])), scout_subject=data.get('subject', ''), scout_message=data.get('message', ''), scout_count=data.get('count', 0))
     return jsonify({'success': True})
 
 if __name__ == '__main__':
