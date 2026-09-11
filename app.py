@@ -97,13 +97,10 @@ def init_db():
             has_email BOOLEAN DEFAULT FALSE,
             discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_email, domain))""")
-        # NEW: Email scan history (last 3)
         cur.execute("""CREATE TABLE IF NOT EXISTS email_scans (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
-            emails TEXT, email_count INTEGER DEFAULT 0,
-            store_count INTEGER DEFAULT 0,
+            emails TEXT, email_count INTEGER DEFAULT 0, store_count INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        # NEW: Audit history (last 3)
         cur.execute("""CREATE TABLE IF NOT EXISTS audit_history (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             domain VARCHAR(255) NOT NULL, report JSONB,
@@ -200,7 +197,6 @@ def load_user_state(user_email):
 # EMAIL SCAN HISTORY (last 3)
 # ==========================================
 def save_email_scan(user_email, emails, store_count):
-    """Save scan to history, keep only latest 3"""
     conn = get_db()
     if not conn: return
     try:
@@ -208,7 +204,6 @@ def save_email_scan(user_email, emails, store_count):
         cur.execute("""INSERT INTO email_scans (user_email, emails, email_count, store_count)
             VALUES (%s, %s, %s, %s)""",
             (user_email, '|||'.join(emails), len(emails), store_count))
-        # Delete oldest beyond 3
         cur.execute("""DELETE FROM email_scans WHERE user_email = %s
             AND id NOT IN (SELECT id FROM email_scans WHERE user_email = %s
             ORDER BY created_at DESC LIMIT 3)""", (user_email, user_email))
@@ -217,7 +212,6 @@ def save_email_scan(user_email, emails, store_count):
     finally: release_db(conn)
 
 def get_email_scans(user_email):
-    """Get last 3 email scans"""
     conn = get_db()
     if not conn: return []
     try:
@@ -230,7 +224,6 @@ def get_email_scans(user_email):
     finally: release_db(conn)
 
 def get_email_scan_detail(scan_id, user_email):
-    """Get emails from a specific scan"""
     conn = get_db()
     if not conn: return []
     try:
@@ -617,7 +610,7 @@ NAVBAR = '''
 </style>
 <div class="navbar">
 <button class="hamburger" onclick="toggleDrawer()">☰</button>
-<span class="navbar-title">📧 Shopify Tools</span>
+<span class="navbar-title">Zegseg Shopify Tools</span>
 </div>
 <div class="drawer-overlay" id="drawerOverlay" onclick="toggleDrawer()"></div>
 <div class="drawer" id="drawer">
@@ -713,7 +706,6 @@ def home():
 <button onclick="findBulkEmails()" style="background:#667eea;color:white;padding:12px;border:none;border-radius:8px;cursor:pointer;font-size:16px;width:100%;margin:10px 0">Search All URLs</button>
 <div id="result" style="margin-top:20px;background:#f8f9fa;padding:15px;border-radius:8px;min-height:40px"></div>
 </div>
-
 <div style="background:white;padding:20px;border-radius:15px;box-shadow:0 4px 12px rgba(0,0,0,0.1)">
 <h3 style="margin-top:0;color:#333">📋 Last 3 Results</h3>
 <div id="historyList">Loading...</div>
@@ -782,7 +774,6 @@ def discover_page():
 <h1 style="margin:0">🎯 Store Discovery</h1>
 <p style="margin:5px 0 0 0">4 methods to find new Shopify stores</p>
 </div>
-
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
 <h3 style="margin-top:0">🔎 Discovery Methods</h3>
 <p style="color:#666;font-size:14px">Each method is independent. Run them one by one or use "Run All".</p>
@@ -793,7 +784,6 @@ def discover_page():
 <button onclick="runDiscovery('all')" style="background:#0d9488;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">⚡ Run All 4</button>
 <div id="discoveryStatus" style="margin-top:12px"></div>
 </div>
-
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
 <h3 style="margin-top:0">📋 Discovered Stores (<span id="storeCount">0</span>)</h3>
 <div id="storeList" style="margin-top:10px">Loading...</div>
@@ -946,13 +936,20 @@ async function startBackgroundVerify(){const emails=document.getElementById('ema
 async function refreshJobs(){const res=await fetch('/verify-jobs');const data=await res.json();const container=document.getElementById('jobsList');if(!data.jobs||data.jobs.length===0){container.innerHTML='<p style="color:#666">No jobs yet.</p>';return}let html='';data.jobs.forEach(job=>{const percent=job.total>0?Math.round((job.processed/job.total)*100):0;const sc=job.status==='completed'?'#0d9488':(job.status==='running'?'#f59e0b':'#ef4444');const si=job.status==='completed'?'✅':(job.status==='running'?'🔄':'⏹️');html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+sc+'"><div style="font-weight:bold">'+si+' '+job.name+' <span style="color:#666;font-weight:normal;font-size:13px">#'+job.id+'</span></div><div style="margin-top:8px;background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+percent+'%;height:16px;background:'+sc+';text-align:center;color:white;font-size:11px;line-height:16px">'+percent+'%</div></div><div style="font-size:13px;margin-top:6px">Processed: '+job.processed+' / '+job.total+' | ✅ '+job.valid+' | ❌ '+job.invalid+'</div><button onclick="loadResults('+job.id+')" style="background:#3b82f6;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:13px;margin-top:8px">View Results</button><div id="result-'+job.id+'" style="margin-top:10px"></div></div>'});container.innerHTML=html}
 async function loadResults(jobId){const res=await fetch('/verify-results/'+jobId);const data=await res.json();const container=document.getElementById('result-'+jobId);let html='<h4 style="margin:8px 0 4px 0">✅ Valid: '+data.valid.length+'</h4><div style="max-height:120px;overflow-y:auto;background:white;padding:8px;border-radius:5px;font-size:12px;word-break:break-all">';data.valid.slice(0,50).forEach(e=>{html+='<div style="color:#155724">'+e+'</div>'});html+='</div><h4 style="margin:8px 0 4px 0">❌ Invalid: '+data.invalid.length+'</h4><div style="max-height:80px;overflow-y:auto;background:white;padding:8px;border-radius:5px;font-size:12px;word-break:break-all">';data.invalid.slice(0,30).forEach(e=>{html+='<div style="color:#721c24">'+e+'</div>'});html+='</div><div style="margin-top:10px"><button onclick="downloadJob('+jobId+')" style="background:#0d9488;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px;margin-right:5px">⬇️ Download</button><button onclick="sendJobToScout('+jobId+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">📨 Send to Scout</button></div>';container.innerHTML=html}
 async function downloadJob(jobId){const res=await fetch('/verify-results/'+jobId);const data=await res.json();const csv='Email\\n'+data.valid.join('\\n');const b=new Blob([csv],{type:'text/csv'});const u=URL.createObjectURL(b);const a=document.createElement('a');a.href=u;a.download='valid_job_'+jobId+'.csv';a.click()}
-async function sendJobToScout(jobId){const res=await fetch('/verify-results/'+jobId);const data=await res.json();await fetch('/save-scout-recipients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients:data.valid})});window.location.href='/scout'}
+async function sendJobToScout(jobId){
+  const res=await fetch('/verify-results/'+jobId);
+  const data=await res.json();
+  if(!data.valid||data.valid.length===0){alert('No valid emails to send.');return}
+  await fetch('/save-scout-recipients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients:data.valid})});
+  localStorage.setItem('scoutRecipients', JSON.stringify(data.valid));
+  window.location.href='/scout';
+}
 window.onload=function(){refreshJobs();setInterval(refreshJobs,10000)};
 </script>'''
     return render_page("Verify", body)
 
 # ==========================================
-# SCOUT PAGE
+# SCOUT PAGE (fixed loading)
 # ==========================================
 @app.route('/scout')
 @login_required
@@ -998,26 +995,131 @@ def scout():
 </div></div>
 <script>
 let recipients=[],scoutedEmails=0,isRunning=false;
-function syncRecipients(){const val=document.getElementById('emailsInput').value;recipients=val.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);updateUI();saveState()}
-window.onload=async function(){try{const res=await fetch('/load-scout-state');const data=await res.json();if(data.recipients&&data.recipients.length>0){recipients=data.recipients;document.getElementById('emailsInput').value=recipients.join('\\n')}if(data.subject)document.getElementById('subjectLine').value=data.subject;if(data.message)document.getElementById('messageBody').value=data.message;if(data.count)scoutedEmails=data.count}catch(e){}const preload="''' + preload.replace('"','') + '''";if(preload){const ta=document.getElementById('emailsInput');if(!ta.value)ta.value=preload;}syncRecipients()}
-function updateUI(){document.getElementById('emailCount').textContent=recipients.length+' recipients';document.getElementById('totalScouted').textContent=scoutedEmails;document.getElementById('todayScouted').textContent=scoutedEmails;document.getElementById('workingRate').textContent=(recipients.length>0?Math.round((scoutedEmails/recipients.length)*100):0)+'%'}
-async function saveState(){try{await fetch('/save-scout-state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients:recipients,subject:document.getElementById('subjectLine').value,message:document.getElementById('messageBody').value,count:scoutedEmails})})}catch(e){}}
-async function loadFromFinder(){const res=await fetch('/get-stored-emails');const data=await res.json();if(data.emails&&data.emails.length>0){recipients=data.emails;document.getElementById('emailsInput').value=recipients.join('\\n');updateUI();saveState()}}
-async function loadFromVerified(){const res=await fetch('/get-verified-emails');const data=await res.json();if(data.valid&&data.valid.length>0){recipients=data.valid;document.getElementById('emailsInput').value=recipients.join('\\n');updateUI();saveState()}}
-function clearAll(){recipients=[];scoutedEmails=0;document.getElementById('emailsInput').value='';document.getElementById('subjectLine').value='';document.getElementById('messageBody').value='';updateUI();saveState();isRunning=false;document.getElementById('autoClickStatus').textContent='Off'}
+function syncRecipients(){
+  const val=document.getElementById('emailsInput').value;
+  recipients=val.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);
+  updateUI();
+  saveState();
+}
+window.onload=async function(){
+  // 1) Load from server FIRST
+  try{
+    const res=await fetch('/load-scout-state');
+    const data=await res.json();
+    if(data.recipients && data.recipients.length > 0){
+      recipients = data.recipients;
+      document.getElementById('emailsInput').value = recipients.join('\\n');
+    }
+    if(data.subject) document.getElementById('subjectLine').value = data.subject;
+    if(data.message) document.getElementById('messageBody').value = data.message;
+    if(data.count) scoutedEmails = data.count;
+  }catch(e){}
+  
+  // 2) Handle preload from URL param
+  const preload = new URLSearchParams(window.location.search).get('add');
+  if(preload){
+    const ta = document.getElementById('emailsInput');
+    if(ta && !ta.value) ta.value = preload;
+  }
+  
+  // 3) Fallback: load from localStorage if still empty
+  if(!recipients || recipients.length === 0){
+    try{
+      const saved = localStorage.getItem('scoutRecipients');
+      if(saved){
+        const arr = JSON.parse(saved);
+        if(arr && arr.length > 0){
+          recipients = arr;
+          document.getElementById('emailsInput').value = recipients.join('\\n');
+        }
+      }
+    }catch(e){}
+  }
+  
+  // 4) Sync recipients from textarea as last step
+  const currentValue = document.getElementById('emailsInput').value.trim();
+  if(currentValue){
+    recipients = currentValue.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);
+  }
+  
+  updateUI();
+};
+function updateUI(){
+  document.getElementById('emailCount').textContent=recipients.length+' recipients';
+  document.getElementById('totalScouted').textContent=scoutedEmails;
+  document.getElementById('todayScouted').textContent=scoutedEmails;
+  document.getElementById('workingRate').textContent=(recipients.length>0?Math.round((scoutedEmails/recipients.length)*100):0)+'%';
+}
+async function saveState(){
+  try{
+    localStorage.setItem('scoutRecipients', JSON.stringify(recipients));
+    await fetch('/save-scout-state',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        recipients:recipients,
+        subject:document.getElementById('subjectLine').value,
+        message:document.getElementById('messageBody').value,
+        count:scoutedEmails
+      })
+    });
+  }catch(e){}
+}
+async function loadFromFinder(){
+  const res=await fetch('/get-stored-emails');const data=await res.json();
+  if(data.emails&&data.emails.length>0){
+    recipients=data.emails;
+    document.getElementById('emailsInput').value=recipients.join('\\n');
+    updateUI();saveState();
+  } else { alert('No emails in Finder. Run a scan first.'); }
+}
+async function loadFromVerified(){
+  const res=await fetch('/get-verified-emails');const data=await res.json();
+  if(data.valid&&data.valid.length>0){
+    recipients=data.valid;
+    document.getElementById('emailsInput').value=recipients.join('\\n');
+    updateUI();saveState();
+  } else { alert('No verified emails yet.'); }
+}
+function clearAll(){
+  recipients=[];scoutedEmails=0;
+  document.getElementById('emailsInput').value='';
+  document.getElementById('subjectLine').value='';
+  document.getElementById('messageBody').value='';
+  localStorage.removeItem('scoutRecipients');
+  updateUI();saveState();
+  isRunning=false;
+  document.getElementById('autoClickStatus').textContent='Off';
+}
 function insertPh(t){document.getElementById('messageBody').value+=t;saveState()}
 function generatePreview(){const s=document.getElementById('subjectLine').value;const m=document.getElementById('messageBody').value;const p=document.getElementById('preview');p.innerHTML='<b>Subject:</b> '+s+'<br><br><b>Message:</b><br>'+m.replace('{name}','John Doe').replace('{email}','john@store.com');p.style.display='block'}
 function startCampaign(){if(recipients.length===0){alert('Add recipients first');return}isRunning=true;document.getElementById('autoClickStatus').textContent='On';document.getElementById('launchStatus').innerHTML='<p style="color:green">🚀 Started</p>';openNextEmail()}
 function stopCampaign(){isRunning=false;document.getElementById('autoClickStatus').textContent='Off';document.getElementById('launchStatus').innerHTML='<p style="color:red">⏹️ Stopped</p>';saveState()}
-function openNextEmail(){if(!isRunning)return;if(scoutedEmails>=recipients.length){isRunning=false;document.getElementById('autoClickStatus').textContent='Off';document.getElementById('launchStatus').innerHTML='<p style="color:blue">🎉 Complete</p>';saveState();return}const email=recipients[scoutedEmails];const subj=document.getElementById('subjectLine').value;const msg=document.getElementById('messageBody').value;const body=msg.replace('{name}','Store Owner').replace('{email}',email);window.location.href='mailto:'+email+'?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(body);const log=document.getElementById('log');log.innerHTML+='<div>📨 '+email+'</div>';log.scrollTop=log.scrollHeight;scoutedEmails++;updateUI();saveState()}
+function openNextEmail(){
+  if(!isRunning)return;
+  if(scoutedEmails>=recipients.length){isRunning=false;document.getElementById('autoClickStatus').textContent='Off';document.getElementById('launchStatus').innerHTML='<p style="color:blue">🎉 Complete</p>';saveState();return}
+  const email=recipients[scoutedEmails];const subj=document.getElementById('subjectLine').value;const msg=document.getElementById('messageBody').value;
+  const body=msg.replace('{name}','Store Owner').replace('{email}',email);
+  window.location.href='mailto:'+email+'?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(body);
+  const log=document.getElementById('log');log.innerHTML+='<div>📨 '+email+'</div>';log.scrollTop=log.scrollHeight;
+  scoutedEmails++;updateUI();saveState();
+}
 document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible'&&isRunning)setTimeout(openNextEmail,2000)});
 document.addEventListener('click',function(e){if(isRunning&&scoutedEmails<recipients.length&&!e.target.closest('button'))setTimeout(openNextEmail,2000)});
-function openBulk(){const subj=document.getElementById('subjectLine').value;const msg=document.getElementById('messageBody').value;for(let i=0;i<Math.min(10,recipients.length-scoutedEmails);i++){const email=recipients[scoutedEmails+i];const body=msg.replace('{name}','Store Owner').replace('{email}',email);window.open('mailto:'+email+'?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(body),'_blank')}scoutedEmails+=Math.min(10,recipients.length-scoutedEmails);updateUI();saveState()}
+function openBulk(){
+  const subj=document.getElementById('subjectLine').value;const msg=document.getElementById('messageBody').value;
+  for(let i=0;i<Math.min(10,recipients.length-scoutedEmails);i++){
+    const email=recipients[scoutedEmails+i];
+    const body=msg.replace('{name}','Store Owner').replace('{email}',email);
+    window.open('mailto:'+email+'?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(body),'_blank');
+  }
+  scoutedEmails+=Math.min(10,recipients.length-scoutedEmails);updateUI();saveState();
+}
 </script>'''
     return render_page("Scout", body)
 
 # ==========================================
-# AUDIT PAGE (with history)
+# AUDIT PAGE
 # ==========================================
 @app.route('/audit')
 @login_required
@@ -1035,7 +1137,6 @@ def audit_page():
 <div><h1 style="margin:0;font-size:24px">Security Analysis</h1><p style="margin:4px 0 0 0;font-size:14px;opacity:0.9">Real audit of any Shopify store</p></div>
 </div>
 <div id="auditResult"></div>
-
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-top:20px">
 <h3 style="margin-top:0">📋 Last 3 Audits</h3>
 <div id="auditHistory">Loading...</div>
