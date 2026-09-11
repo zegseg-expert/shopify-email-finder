@@ -71,7 +71,12 @@ def init_db():
         cur = conn.cursor()
         cur.execute("""CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY, email VARCHAR(255) UNIQUE NOT NULL,
-            password_hash VARCHAR(255) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+            password_hash VARCHAR(255) NOT NULL,
+            sender_name VARCHAR(255) DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS sender_name VARCHAR(255) DEFAULT ''")
+        except: pass
         cur.execute("""CREATE TABLE IF NOT EXISTS scraped_stores (
             id SERIAL PRIMARY KEY, domain VARCHAR(255) UNIQUE NOT NULL,
             emails TEXT, scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
@@ -139,6 +144,27 @@ def root_domain(hostname):
             return '.'.join(parts[-3:])
     return '.'.join(parts[-2:])
 
+def get_user_sender_name(user_email):
+    conn = get_db()
+    if not conn: return ''
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT sender_name FROM users WHERE email = %s", (user_email,))
+        row = cur.fetchone(); cur.close()
+        return row[0] if row and row[0] else ''
+    except: return ''
+    finally: release_db(conn)
+
+def set_user_sender_name(user_email, name):
+    conn = get_db()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET sender_name = %s WHERE email = %s", (name, user_email))
+        conn.commit(); cur.close()
+    except: pass
+    finally: release_db(conn)
+
 def get_cached_emails(domain):
     conn = get_db()
     if not conn: return None
@@ -198,15 +224,13 @@ def load_user_state(user_email):
     finally: release_db(conn)
 
 # ==========================================
-# EMAIL SCAN HISTORY (fixed with fallback)
+# EMAIL SCAN HISTORY
 # ==========================================
 def save_email_scan(user_email, results, store_count):
-    """results = [{'store': 'x.com', 'emails': ['a@x.com','b@x.com']}, ...]"""
     conn = get_db()
     if not conn: return
     try:
         total_emails = sum(len(r.get('emails', [])) for r in results)
-        # Also build flat email list for backward compat
         flat_emails = []
         for r in results:
             flat_emails.extend(r.get('emails', []))
@@ -234,7 +258,6 @@ def get_email_scans(user_email):
     finally: release_db(conn)
 
 def get_email_scan_detail(scan_id, user_email):
-    """Returns results list. Falls back to old 'emails' field if results is empty."""
     conn = get_db()
     if not conn: return []
     try:
@@ -242,7 +265,6 @@ def get_email_scan_detail(scan_id, user_email):
         cur.execute("SELECT results, emails FROM email_scans WHERE id = %s AND user_email = %s", (scan_id, user_email))
         row = cur.fetchone(); cur.close()
         if not row: return []
-        # Try JSON results first
         if row[0]:
             try:
                 parsed = json.loads(row[0]) if isinstance(row[0], str) else row[0]
@@ -250,10 +272,8 @@ def get_email_scan_detail(scan_id, user_email):
                     return parsed
             except Exception as e:
                 print(f"results parse error: {e}")
-        # Fallback to old flat emails field
         if row[1]:
             flat = row[1].split(',') if isinstance(row[1], str) else row[1]
-            # Convert flat list to results format with "unknown" store
             return [{'store': '(old format)', 'emails': [e for e in flat if e.strip()]}]
         return []
     except Exception as e:
@@ -300,7 +320,11 @@ def get_audit_detail(audit_id, user_email):
         cur = conn.cursor()
         cur.execute("SELECT report FROM audit_history WHERE id = %s AND user_email = %s", (audit_id, user_email))
         row = cur.fetchone(); cur.close()
-        return json.loads(row[0]) if row and row[0] else None
+        if row and row[0]:
+            try:
+                return json.loads(row[0]) if isinstance(row[0], str) else row[0]
+            except: return None
+        return None
     except: return None
     finally: release_db(conn)
 
@@ -522,7 +546,7 @@ def save_discovered(user_email, stores):
     return saved
 
 # ==========================================
-# AUDIT (Enhanced)
+# AUDIT
 # ==========================================
 def audit_store(domain, case_id):
     raw = domain.strip().lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
@@ -657,7 +681,7 @@ def audit_store(domain, case_id):
     report["checks"]["meta_title"] = page_title[:100] + ("..." if len(page_title) > 100 else "")
     report["checks"]["meta_title_length"] = len(page_title)
     report["checks"]["meta_description_length"] = len(page_desc)
-    if len(page_title) == 0: report["issues"].append({"title": "Missing Page Title", "description": "No `<title>` tag.", "recommendation": "Add SEO title (50-60 chars).", "severity": "high"})
+    if len(page_title) == 0: report["issues"].append({"title": "Missing Page Title", "description": "No title tag.", "recommendation": "Add SEO title (50-60 chars).", "severity": "high"})
     elif len(page_title) > 70: report["issues"].append({"title": "Meta Title Too Long", "description": f"Title is {len(page_title)} chars.", "recommendation": "Shorten to 50-60 chars.", "severity": "low"})
     if len(page_desc) == 0: report["issues"].append({"title": "Missing Meta Description", "description": "No description for search engines.", "recommendation": "Add 150-160 char description.", "severity": "medium"})
     elif len(page_desc) > 170: report["issues"].append({"title": "Meta Description Too Long", "description": f"Description is {len(page_desc)} chars.", "recommendation": "Keep under 160 chars.", "severity": "low"})
@@ -718,35 +742,29 @@ def audit_store(domain, case_id):
     return report
 
 # ==========================================
-# EMAIL GENERATOR (Smart Templates)
+# EMAIL GENERATOR (with sender name)
 # ==========================================
-def generate_outreach_email(report, tone='friendly'):
-    """Generate a personalized outreach email based on audit issues"""
+def generate_outreach_email(report, tone='friendly', sender_name=''):
     domain = report.get('domain', '')
     brand = domain.split('.')[0].title() if domain else 'there'
     issues = report.get('issues', [])
-    positives = report.get('positives', [])
     scores = report.get('scores', {})
     checks = report.get('checks', {})
     overall = scores.get('overall_score', 0)
     
-    # Get top 3 highest-severity issues
     priority = {'high': 0, 'medium': 1, 'low': 2}
     sorted_issues = sorted(issues, key=lambda x: priority.get(x.get('severity', 'low'), 3))
     top_issues = sorted_issues[:3]
     
-    # Build issue bullets (with specific numbers)
     issue_bullets = []
     for i in top_issues:
         title = i.get('title', '')
-        # Add number if available
         if 'Product' in title and checks.get('product_count'):
             title = f"Only {checks['product_count']} products listed"
         elif 'Load Time' in title and checks.get('load_time_seconds'):
             title = f"Slow load time ({checks['load_time_seconds']}s)"
         issue_bullets.append(title)
     
-    # Subject line
     if overall < 50:
         subject = f"Found {len(issues)} issues on {domain}"
     elif overall < 75:
@@ -754,7 +772,6 @@ def generate_outreach_email(report, tone='friendly'):
     else:
         subject = f"Nice store! One thing I noticed on {domain}"
     
-    # Body — different tones
     if tone == 'friendly':
         greeting = f"Hi {brand} team,"
         opener = f"I was looking at {domain} today and noticed a few things that could be costing you sales."
@@ -765,7 +782,7 @@ def generate_outreach_email(report, tone='friendly'):
         opener = f"I recently analyzed {domain} and identified {len(issues)} optimization opportunities."
         closer = "Would it be worth a 15-minute call this week to discuss?"
         signoff = "I help Shopify stores improve conversion. Happy to walk you through it."
-    else:  # casual
+    else:
         greeting = f"Hey {brand},"
         opener = f"Took a look at {domain} — cool store! Noticed a few things though."
         closer = "Want me to send a quick checklist of fixes?"
@@ -781,7 +798,8 @@ Top 3 issues I found:
     for b in issue_bullets:
         body += f"• {b}\n"
     
-    body += f"\nOverall score: {overall}/100. Most are fixable in a day or two.\n\n{closer}\n\n{signoff}\n\nBest,\n[Your name]"
+    signature = sender_name.strip() if sender_name and sender_name.strip() else "[Your name]"
+    body += f"\nOverall score: {overall}/100. Most are fixable in a day or two.\n\n{closer}\n\n{signoff}\n\nBest,\n{signature}"
     
     return {'subject': subject, 'body': body, 'tone': tone}
 
@@ -815,6 +833,7 @@ NAVBAR = '''
 <a href="/verify" onclick="closeDrawer()">✅ Verify Emails</a>
 <a href="/scout" onclick="closeDrawer()">📨 Email Scout</a>
 <a href="/audit" onclick="closeDrawer()">🛡️ Security Analysis</a>
+<a href="/settings" onclick="closeDrawer()">⚙️ Settings</a>
 <hr style="border-color:#374151;margin:20px 0">
 <a href="/logout" onclick="closeDrawer()" style="color:#ef4444">🚪 Logout</a>
 </div>
@@ -833,7 +852,7 @@ def render_page(title, body):
 SIGNUP_HTML = '''<!DOCTYPE html><html><head><title>Sign Up</title><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>body{font-family:Arial;background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh;display:flex;justify-content:center;align-items:center;margin:0;padding:20px}.box{background:white;padding:40px;border-radius:15px;box-shadow:0 10px 30px rgba(0,0,0,0.3);width:100%;max-width:400px}h2{text-align:center}input{width:100%;padding:12px;margin:8px 0;border:2px solid #ddd;border-radius:8px;font-size:16px;box-sizing:border-box}button{width:100%;padding:12px;background:#667eea;color:white;border:none;border-radius:8px;font-size:16px;cursor:pointer;margin-top:10px}.error{color:#721c24;background:#f8d7da;padding:10px;border-radius:5px;margin-bottom:15px}.link{text-align:center;margin-top:15px}.link a{color:#667eea}</style></head><body>
 <div class="box"><h2>📧 Sign Up</h2>{% if error %}<div class="error">{{ error }}</div>{% endif %}
-<form method="POST"><input type="email" name="email" placeholder="Email" required><input type="password" name="password" placeholder="Password (min 6)" required minlength="6"><button>Sign Up</button></form>
+<form method="POST"><input type="email" name="email" placeholder="Email" required><input type="text" name="sender_name" placeholder="Your name (for emails)" required><input type="password" name="password" placeholder="Password (min 6)" required minlength="6"><button>Sign Up</button></form>
 <div class="link">Have account? <a href="/login">Log in</a></div></div></body></html>'''
 
 LOGIN_HTML = '''<!DOCTYPE html><html><head><title>Login</title><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -847,12 +866,13 @@ def signup():
     if request.method == 'POST':
         email = request.form.get('email', '').strip().lower()
         password = request.form.get('password', '')
+        sender_name = request.form.get('sender_name', '').strip()
         if not email or not password: return render_template_string(SIGNUP_HTML, error="Fill all fields")
         conn = get_db()
         if not conn: return render_template_string(SIGNUP_HTML, error="DB not available")
         try:
             cur = conn.cursor()
-            cur.execute("INSERT INTO users (email, password_hash) VALUES (%s, %s)", (email, hash_password(password)))
+            cur.execute("INSERT INTO users (email, password_hash, sender_name) VALUES (%s, %s, %s)", (email, hash_password(password), sender_name))
             conn.commit(); cur.close()
             session['user_id'] = email
             return redirect('/')
@@ -886,6 +906,36 @@ def login():
 @app.route('/logout')
 def logout():
     session.clear(); return redirect('/login')
+
+# ==========================================
+# SETTINGS
+# ==========================================
+@app.route('/settings', methods=['GET', 'POST'])
+@login_required
+def settings():
+    user_email = session.get('user_id')
+    msg = ''
+    if request.method == 'POST':
+        name = request.form.get('sender_name', '').strip()
+        set_user_sender_name(user_email, name)
+        msg = '✅ Saved!'
+    current_name = get_user_sender_name(user_email)
+    body = f'''<div style="max-width:600px;margin:20px auto;padding:20px">
+<div style="background:#1f2937;color:white;padding:20px;border-radius:10px;margin-bottom:20px">
+<h1 style="margin:0">⚙️ Settings</h1>
+<p style="margin:5px 0 0 0">Your profile info</p>
+</div>
+<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1)">
+<h3 style="margin-top:0">Your Name (used in generated emails)</h3>
+<form method="POST">
+<input type="text" name="sender_name" placeholder="e.g. Daniel Phillips" value="{current_name}" style="width:100%;padding:12px;border:2px solid #ddd;border-radius:8px;font-size:16px;box-sizing:border-box;margin-bottom:10px">
+<button type="submit" style="background:#0d9488;color:white;padding:12px 30px;border:none;border-radius:8px;cursor:pointer;font-size:16px;width:100%">Save</button>
+</form>
+{f'<p style="color:green;margin-top:10px">{msg}</p>' if msg else ''}
+<p style="color:#666;font-size:13px;margin-top:15px">This name appears at the end of every email you generate from the Security Analysis page.</p>
+</div>
+</div>'''
+    return render_page("Settings", body)
 
 # ==========================================
 # HOME
@@ -1236,11 +1286,13 @@ function openBulk(){const subj=document.getElementById('subjectLine').value;cons
     return render_page("Scout", body)
 
 # ==========================================
-# AUDIT PAGE (with Generate Email)
+# AUDIT PAGE
 # ==========================================
 @app.route('/audit')
 @login_required
 def audit_page():
+    user_email = session.get('user_id')
+    sender_name = get_user_sender_name(user_email) or ''
     preload = request.args.get('url', '')
     body = '''<div style="max-width:900px;margin:20px auto;padding:20px">
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
@@ -1253,11 +1305,16 @@ def audit_page():
 <svg width="56" height="56" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" style="flex-shrink:0"><path d="M32 4L8 14V30C8 45 19 57 32 60C45 57 56 45 56 30V14L32 4Z" fill="white" opacity="0.25" stroke="white" stroke-width="2" stroke-linejoin="round"/><path d="M22 32L29 39L43 25" stroke="white" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg>
 <div><h1 style="margin:0;font-size:24px">Security Analysis</h1><p style="margin:4px 0 0 0;font-size:14px;opacity:0.9">Real audit of any Shopify store</p></div>
 </div>
+<div id="currentAuditLabel" style="display:none;color:#65a30d;font-weight:bold;margin-bottom:10px">▼ Current audit</div>
 <div id="auditResult"></div>
 
 <div id="outreachSection" style="display:none;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-top:20px">
 <h3 style="margin-top:0">✉️ Generate Outreach Email</h3>
 <p style="color:#666;font-size:13px">Uses your audit findings to write a personalized email.</p>
+<div style="margin-bottom:10px">
+<label style="font-weight:bold;font-size:13px">Your name:</label>
+<input type="text" id="senderName" value="''' + sender_name.replace('"','') + '''" placeholder="e.g. Daniel Phillips" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:5px;margin:5px 0 10px 0;box-sizing:border-box;font-size:14px">
+</div>
 <div style="margin-bottom:10px">
 <button onclick="generateEmail('friendly')" style="background:#0d9488;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;margin-right:5px">😊 Friendly</button>
 <button onclick="generateEmail('professional')" style="background:#3b82f6;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;margin-right:5px">💼 Professional</button>
@@ -1275,7 +1332,7 @@ def audit_page():
 </div>
 
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-top:20px">
-<h3 style="margin-top:0">📋 Last 3 Audits</h3>
+<h3 style="margin-top:0">📋 Last 3 Audits (Previous)</h3>
 <div id="auditHistory">Loading...</div>
 </div>
 </div>
@@ -1289,6 +1346,7 @@ async function runAudit(){
   status.innerHTML='<p style="color:#666">⏳ Analyzing... this may take 30-45 seconds</p>';
   result.innerHTML='<p style="color:#666;text-align:center;padding:30px">Please wait... checking store, products, policies, apps, payments, SEO</p>';
   document.getElementById('outreachSection').style.display='none';
+  document.getElementById('currentAuditLabel').style.display='none';
   const c=new AbortController();const t=setTimeout(()=>c.abort(),120000);
   try{
     const res=await fetch('/run-audit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:url}),signal:c.signal});
@@ -1298,6 +1356,7 @@ async function runAudit(){
     if(data.error){status.innerHTML='<p style="color:red">'+data.error+'</p>';result.innerHTML='';return}
     currentReport = data;
     status.innerHTML='<p style="color:green">✅ Complete</p>';
+    document.getElementById('currentAuditLabel').style.display='block';
     renderReport(data);
     document.getElementById('outreachSection').style.display='block';
     loadAuditHistory();
@@ -1344,11 +1403,12 @@ function renderReport(r){
 
 async function generateEmail(tone){
   if(!currentReport){alert('Run an audit first');return}
+  const senderName = document.getElementById('senderName').value.trim();
   try{
     const res = await fetch('/generate-email', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({report: currentReport, tone: tone})
+      body:JSON.stringify({report: currentReport, tone: tone, sender_name: senderName})
     });
     const data = await res.json();
     if(data.success){
@@ -1356,6 +1416,9 @@ async function generateEmail(tone){
       document.getElementById('genBody').value = data.body;
       document.getElementById('emailPreview').style.display = 'block';
       document.getElementById('copyStatus').textContent = '';
+      if(senderName){
+        fetch('/save-sender-name',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sender_name:senderName})});
+      }
     } else {
       alert('Error: ' + (data.error || 'Unknown'));
     }
@@ -1384,38 +1447,49 @@ async function sendToScout(){
 async function loadAuditHistory(){
   const res=await fetch('/get-audit-history');const data=await res.json();
   const c=document.getElementById('auditHistory');
-  if(!data.audits||data.audits.length===0){c.innerHTML='<p style="color:#666">No audits yet. Run one above.</p>';return}
+  if(!data.audits||data.audits.length===0){c.innerHTML='<p style="color:#666">No previous audits.</p>';return}
   let html='';
   data.audits.forEach(a=>{
     const color=scoreColor(a.score);
     html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+color+'">';
     html+='<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
     html+='<div><b><a href="https://'+a.domain+'" target="_blank" style="color:#3b82f6;text-decoration:none">'+a.domain+'</a></b> <span style="color:'+color+';font-weight:bold">'+a.score+'%</span><br><span style="font-size:12px;color:#666">'+a.created_at+'</span></div>';
-    html+='<button onclick="viewAudit('+a.id+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">View</button>';
-    html+='</div><div id="audit-view-'+a.id+'" style="margin-top:10px"></div></div>';
+    html+='<button onclick="toggleViewAudit('+a.id+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">View</button>';
+    html+='</div><div id="audit-view-'+a.id+'" style="display:none;margin-top:10px"></div></div>';
   });
   c.innerHTML=html;
 }
-async function viewAudit(id){
-  const res=await fetch('/get-audit-detail/'+id);const data=await res.json();
+async function toggleViewAudit(id){
   const c=document.getElementById('audit-view-'+id);
-  if(!data.report){c.innerHTML='<p style="color:#666">Not found.</p>';return}
-  const r=data.report;const sc=r.scores||{};
-  let html='<div style="background:white;padding:12px;border-radius:6px;font-size:13px">';
-  html+='<b>Overall:</b> '+scoreBar('',sc.overall_score||0);
-  html+='<div style="margin-top:8px"><b>Case ID:</b> '+(r.case_id||'N/A')+'</div>';
-  html+='<div style="margin-top:4px"><b>Issues:</b> '+(r.issues?.length||0)+'</div>';
-  html+='<button onclick="reloadThisAudit('+JSON.stringify(JSON.stringify(r)).replace(/"/g,'&quot;')+')" style="background:#0d9488;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px;margin-top:8px">Show Full Report</button>';
-  html+='</div>';
-  c.innerHTML=html;
-}
-function reloadThisAudit(jsonStr){
+  if(c.style.display==='block'){c.style.display='none';return}
+  c.style.display='block';
+  c.innerHTML='<p style="color:#666;font-size:12px">Loading...</p>';
   try{
-    currentReport = JSON.parse(jsonStr);
+    const res=await fetch('/get-audit-detail/'+id);
+    const data=await res.json();
+    if(!data.report){c.innerHTML='<p style="color:#666;font-size:12px">Not found.</p>';return}
+    const r=data.report;const sc=r.scores||{};
+    let html='<div style="background:white;padding:12px;border-radius:6px;font-size:13px">';
+    html+='<b>Overall Score:</b> '+scoreBar('',sc.overall_score||0);
+    html+='<div style="margin-top:8px"><b>Case ID:</b> '+(r.case_id||'N/A')+'</div>';
+    html+='<div style="margin-top:4px"><b>Products:</b> '+(r.checks&&r.checks.product_count!==undefined?r.checks.product_count:'N/A')+'</div>';
+    html+='<div style="margin-top:4px"><b>Issues:</b> '+(r.issues?r.issues.length:0)+'</div>';
+    html+='<button onclick="loadFullAudit('+id+')" style="background:#65a30d;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px;margin-top:10px">Load Full Report</button>';
+    html+='</div>';
+    c.innerHTML=html;
+  }catch(e){c.innerHTML='<p style="color:red;font-size:12px">Error loading</p>'}
+}
+async function loadFullAudit(id){
+  try{
+    const res=await fetch('/get-audit-detail/'+id);
+    const data=await res.json();
+    if(!data.report){alert('Not found');return}
+    currentReport = data.report;
+    document.getElementById('currentAuditLabel').style.display='block';
     renderReport(currentReport);
     document.getElementById('outreachSection').style.display='block';
     window.scrollTo({top:0,behavior:'smooth'});
-  }catch(e){alert('Error loading report')}
+  }catch(e){alert('Error loading')}
 }
 window.onload=function(){loadAuditHistory();if(document.getElementById('auditUrl').value.trim())runAudit()};
 </script>'''
@@ -1424,16 +1498,28 @@ window.onload=function(){loadAuditHistory();if(document.getElementById('auditUrl
 # ==========================================
 # API ROUTES
 # ==========================================
+@app.route('/save-sender-name', methods=['POST'])
+@login_required
+def save_sender_name():
+    user_email = session.get('user_id')
+    name = request.json.get('sender_name', '').strip()
+    if user_email and name:
+        set_user_sender_name(user_email, name)
+    return jsonify({'success': True})
+
 @app.route('/generate-email', methods=['POST'])
 @login_required
 def generate_email_route():
     data = request.json
     report = data.get('report', {})
     tone = data.get('tone', 'friendly')
+    sender_name = data.get('sender_name', '').strip()
+    if not sender_name:
+        sender_name = get_user_sender_name(session.get('user_id')) or ''
     if not report:
         return jsonify({'success': False, 'error': 'No report data'})
     try:
-        result = generate_outreach_email(report, tone)
+        result = generate_outreach_email(report, tone, sender_name)
         return jsonify({'success': True, 'subject': result['subject'], 'body': result['body']})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
