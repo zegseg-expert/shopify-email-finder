@@ -127,6 +127,25 @@ def init_db():
             email VARCHAR(255) NOT NULL,
             sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_email, email))""")
+        # ----- EDIT 1: New tables for master/subjob system -----
+        cur.execute("""CREATE TABLE IF NOT EXISTS email_finder_master (
+            id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
+            total INTEGER DEFAULT 0, processed INTEGER DEFAULT 0,
+            emails_found INTEGER DEFAULT 0,
+            status VARCHAR(50) DEFAULT 'running',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS email_finder_subjobs (
+            id SERIAL PRIMARY KEY, master_id INTEGER,
+            user_email VARCHAR(255) NOT NULL,
+            sub_index INTEGER DEFAULT 0,
+            total INTEGER DEFAULT 0, processed INTEGER DEFAULT 0,
+            emails_found INTEGER DEFAULT 0,
+            remaining_urls TEXT, results TEXT,
+            status VARCHAR(50) DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        # ----- /EDIT 1 -----
         cur.execute("""CREATE TABLE IF NOT EXISTS hf_imports (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             requested INTEGER DEFAULT 0,
@@ -136,7 +155,7 @@ def init_db():
             offset_after INTEGER DEFAULT 0,
             domains TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        # NEW: Email Finder background jobs
+        # Legacy email_finder_jobs table (kept for backward compatibility)
         cur.execute("""CREATE TABLE IF NOT EXISTS email_finder_jobs (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             total INTEGER DEFAULT 0, processed INTEGER DEFAULT 0,
@@ -153,6 +172,13 @@ def init_db():
 try:
     init_pool(); init_db()
 except: pass
+
+# ----- EDIT 4: Resume unfinished masters on startup -----
+try:
+    resume_unfinished_masters()
+except:
+    pass
+# ----- /EDIT 4 -----
 
 def hash_password(p): return hashlib.sha256(p.encode()).hexdigest()
 
@@ -280,117 +306,157 @@ def load_user_state(user_email):
     finally: release_db(conn)
 
 # ==========================================
-# EMAIL FINDER BACKGROUND JOBS
+# EMAIL FINDER BACKGROUND JOBS (MASTER + SUBJOBS)
 # ==========================================
-def background_email_finder_worker(job_id):
-    """Runs in background thread - processes URLs and saves results"""
-    print(f"📧 Email Finder Job #{job_id} started")
+# ----- EDIT 2: process_subjob, trigger_next_subjob, resume_unfinished_masters -----
+def process_subjob(subjob_id):
     conn = get_db()
     if not conn: return
     try:
         cur = conn.cursor()
-        cur.execute("SELECT remaining_urls, results, total, user_email FROM email_finder_jobs WHERE id = %s", (job_id,))
+        cur.execute("SELECT remaining_urls, results, master_id, sub_index, user_email FROM email_finder_subjobs WHERE id = %s", (subjob_id,))
         row = cur.fetchone(); cur.close()
         if not row: return
         remaining = row[0].split('|||') if row[0] else []
-        results_json = row[1] or '[]'
-        try: results = json.loads(results_json)
+        try: results = json.loads(row[1]) if row[1] else []
         except: results = []
-        user_email = row[3]
+        master_id = row[2]
+        sub_index = row[3]
+        user_email = row[4]
     finally: release_db(conn)
-
-    CHUNK_SIZE = 5  # Process 5 URLs at a time to control memory
-    while remaining:
-        # Check if cancelled
-        conn = get_db()
-        if not conn: break
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT status FROM email_finder_jobs WHERE id = %s", (job_id,))
-            sr = cur.fetchone(); cur.close()
-            if not sr or sr[0] == 'cancelled':
-                print(f"⏹️ Email Finder Job #{job_id} cancelled")
-                return
-        finally: release_db(conn)
-
-        chunk = remaining[:CHUNK_SIZE]
-        remaining = remaining[CHUNK_SIZE:]
-
-        # Process chunk with limited workers
-        chunk_results = []
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            futures = {ex.submit(find_emails, url): url for url in chunk}
-            for f in as_completed(futures):
-                url = futures[f]
-                try:
-                    emails = f.result()
-                    if emails:
-                        chunk_results.append({'store': url, 'emails': emails})
-                except: pass
-
-        # Merge with existing results
-        results.extend(chunk_results)
-        total_emails = sum(len(r.get('emails', [])) for r in results)
-
-        # Save progress after each chunk
-        conn = get_db()
-        if not conn: break
-        try:
-            cur = conn.cursor()
-            new_status = 'completed' if not remaining else 'running'
-            cur.execute("""UPDATE email_finder_jobs SET processed=%s, emails_found=%s,
-                stores_with_email=%s, results=%s, remaining_urls=%s, status=%s, updated_at=NOW()
-                WHERE id=%s""",
-                (len(results) + (len(chunk) - len(chunk_results)) if False else 0,  # dummy
-                 total_emails, len(results), json.dumps(results), '|||'.join(remaining), new_status, job_id))
-            conn.commit(); cur.close()
-        finally: release_db(conn)
-
-    # Final save - mark completed
     conn = get_db()
     if conn:
         try:
             cur = conn.cursor()
-            cur.execute("""UPDATE email_finder_jobs SET status='completed', updated_at=NOW() WHERE id=%s""", (job_id,))
+            cur.execute("UPDATE email_finder_subjobs SET status='running' WHERE id=%s", (subjob_id,))
+            cur.execute("UPDATE email_finder_master SET status='running' WHERE id=%s", (master_id,))
             conn.commit(); cur.close()
-        except: pass
         finally: release_db(conn)
+    while remaining:
+        chunk = remaining[:5]; remaining = remaining[5:]
+        chunk_results = []
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            futures = {ex.submit(find_emails, u): u for u in chunk}
+            for f in as_completed(futures):
+                try:
+                    emails = f.result()
+                    if emails: chunk_results.append({'store': futures[f], 'emails': emails})
+                except: pass
+        results.extend(chunk_results)
+        total = sum(len(r.get('emails', [])) for r in results)
+        conn = get_db()
+        if not conn: break
+        try:
+            cur = conn.cursor()
+            cur.execute("""UPDATE email_finder_subjobs SET processed=%s, emails_found=%s,
+                results=%s, remaining_urls=%s, status=%s WHERE id=%s""",
+                (len(results), total, json.dumps(results), '|||'.join(remaining),
+                 'running' if remaining else 'completed', subjob_id))
+            conn.commit(); cur.close()
+        finally: release_db(conn)
+    conn = get_db()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("UPDATE email_finder_subjobs SET status='completed' WHERE id=%s", (subjob_id,))
+            conn.commit(); cur.close()
+        finally: release_db(conn)
+    trigger_next_subjob(master_id, sub_index + 1, user_email)
 
-    # Also save the found emails to user_state for "From Finder" on other pages
-    if user_email:
-        all_emails = []
-        for r in results:
-            all_emails.extend(r.get('emails', []))
-        if all_emails:
-            save_user_state(user_email, found_emails='|||'.join(all_emails))
+def trigger_next_subjob(master_id, next_index, user_email):
+    conn = get_db()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM email_finder_subjobs WHERE master_id=%s AND sub_index=%s AND status='pending'", (master_id, next_index))
+        row = cur.fetchone(); cur.close()
+    finally: release_db(conn)
+    if row:
+        time.sleep(1)
+        threading.Thread(target=process_subjob, args=(row[0],), daemon=True).start()
+    else:
+        conn = get_db()
+        if not conn: return
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM email_finder_subjobs WHERE master_id=%s AND status!='completed'", (master_id,))
+            pending = cur.fetchone()[0]; cur.close()
+        finally: release_db(conn)
+        if pending == 0:
+            all_results = []
+            conn = get_db()
+            if conn:
+                try:
+                    cur = conn.cursor()
+                    cur.execute("SELECT results FROM email_finder_subjobs WHERE master_id=%s ORDER BY sub_index ASC", (master_id,))
+                    rows = cur.fetchall()
+                    for r in rows:
+                        if r[0]:
+                            try: all_results.extend(json.loads(r[0]))
+                            except: pass
+                    total = sum(len(r.get('emails', [])) for r in all_results)
+                    cur.execute("UPDATE email_finder_master SET status='completed', processed=%s, emails_found=%s WHERE id=%s", (len(all_results), total, master_id))
+                    conn.commit(); cur.close()
+                finally: release_db(conn)
+            if user_email:
+                all_emails = []
+                for r in all_results: all_emails.extend(r.get('emails', []))
+                if all_emails: save_user_state(user_email, found_emails='|||'.join(all_emails))
 
-    print(f"✅ Email Finder Job #{job_id} complete")
+def resume_unfinished_masters():
+    conn = get_db()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, user_email FROM email_finder_master WHERE status IN ('running','pending')")
+        rows = cur.fetchall(); cur.close()
+    finally: release_db(conn)
+    for mid, ue in rows:
+        conn = get_db()
+        if not conn: continue
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM email_finder_subjobs WHERE master_id=%s AND status!='completed' ORDER BY sub_index ASC LIMIT 1", (mid,))
+            row = cur.fetchone(); cur.close()
+        finally: release_db(conn)
+        if row:
+            threading.Thread(target=process_subjob, args=(row[0],), daemon=True).start()
+# ----- /EDIT 2 -----
 
-def get_email_finder_jobs(user_email):
+# ----- Helper functions for the new master/subjob tables -----
+def get_email_finder_masters(user_email):
     conn = get_db()
     if not conn: return []
     try:
         cur = conn.cursor()
-        cur.execute("""SELECT id, total, emails_found, stores_with_email, status, created_at
-            FROM email_finder_jobs WHERE user_email = %s ORDER BY created_at DESC LIMIT 3""", (user_email,))
+        cur.execute("""SELECT id, total, emails_found, status, created_at
+            FROM email_finder_master WHERE user_email = %s ORDER BY created_at DESC LIMIT 3""", (user_email,))
         rows = cur.fetchall(); cur.close()
-        return [{'id': r[0], 'total': r[1], 'emails': r[2], 'stores': r[3], 'status': r[4], 'created_at': str(r[5])[:16]} for r in rows]
+        return [{'id': r[0], 'total': r[1], 'emails': r[2], 'stores': 0, 'status': r[3], 'created_at': str(r[4])[:16]} for r in rows]
     except: return []
     finally: release_db(conn)
 
-def get_email_finder_job_detail(job_id, user_email):
+def get_email_finder_master_detail(job_id, user_email):
     conn = get_db()
     if not conn: return None
     try:
         cur = conn.cursor()
-        cur.execute("SELECT results, status, total FROM email_finder_jobs WHERE id = %s AND user_email = %s", (job_id, user_email))
+        cur.execute("SELECT id, total, status FROM email_finder_master WHERE id = %s AND user_email = %s", (job_id, user_email))
         row = cur.fetchone(); cur.close()
         if not row: return None
         results = []
-        if row[0]:
-            try: results = json.loads(row[0])
-            except: results = []
-        return {'results': results, 'status': row[1], 'total': row[2]}
+        conn2 = get_db()
+        if conn2:
+            try:
+                cur2 = conn2.cursor()
+                cur2.execute("SELECT results FROM email_finder_subjobs WHERE master_id=%s ORDER BY sub_index ASC", (job_id,))
+                subs = cur2.fetchall(); cur2.close()
+                for s in subs:
+                    if s[0]:
+                        try: results.extend(json.loads(s[0]))
+                        except: pass
+            finally: release_db(conn2)
+        return {'results': results, 'status': row[2], 'total': row[1]}
     except: return None
     finally: release_db(conn)
 
@@ -1192,7 +1258,7 @@ async function loadJobs(){
       else if(j.status === 'cancelled'){ color = '#ef4444'; icon = '⏹️'; }
       html += '<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+color+'">';
       html += '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
-      html += '<div><b>'+icon+' Job #'+j.id+'</b> — '+j.emails+' emails from '+j.stores+'/'+j.total+' stores<br><span style="font-size:12px;color:#666">'+j.created_at+'</span></div>';
+      html += '<div><b>'+icon+' Job #'+j.id+'</b> — '+j.emails+' emails from '+j.total+' stores<br><span style="font-size:12px;color:#666">'+j.created_at+'</span></div>';
       html += '<div style="display:flex;gap:6px;flex-wrap:wrap">';
       html += '<button onclick="viewJob('+j.id+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">View Results</button>';
       if(j.status === 'completed' && j.emails > 0){
@@ -1237,7 +1303,6 @@ async function sendJobToVerify(id){
     const allEmails = [];
     data.results.forEach(r => { (r.emails||[]).forEach(e => allEmails.push(e)); });
     if(allEmails.length === 0){ alert('No emails found in this job'); return; }
-    // Save to user_state so Verify can load from Finder
     await fetch('/store-emails', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({emails: allEmails})});
     alert('✅ '+allEmails.length+' emails saved. Go to Verify page and click "From Finder".');
   }catch(e){ alert('Error: '+e.message); }
@@ -1248,43 +1313,53 @@ window.onload = function(){ loadJobs(); setInterval(loadJobs, 5000); };
     return render_page("Finder", body)
 
 # ==========================================
-# EMAIL FINDER JOB API
+# EMAIL FINDER JOB API (MASTER + SUBJOBS)
 # ==========================================
+# ----- EDIT 3: Replaced route body for /start-email-finder-job -----
 @app.route('/start-email-finder-job', methods=['POST'])
 @login_required
 def start_email_finder_job():
     user_email = session.get('user_id')
     urls = request.json.get('urls', [])
     if not urls: return jsonify({'success': False, 'error': 'No URLs'})
-    if len(urls) > 500: urls = urls[:500]
     conn = get_db()
     if not conn: return jsonify({'success': False, 'error': 'No DB'})
     try:
         cur = conn.cursor()
-        cur.execute("""INSERT INTO email_finder_jobs (user_email, total, remaining_urls, results, status)
-            VALUES (%s, %s, %s, '[]', 'pending') RETURNING id""",
-            (user_email, len(urls), '|||'.join(urls)))
-        job_id = cur.fetchone()[0]
+        cur.execute("INSERT INTO email_finder_master (user_email, total, status) VALUES (%s, %s, 'running') RETURNING id", (user_email, len(urls)))
+        master_id = cur.fetchone()[0]
+        for i in range(0, len(urls), 100):
+            chunk = urls[i:i+100]
+            cur.execute("""INSERT INTO email_finder_subjobs (master_id, user_email, sub_index, total, remaining_urls, results, status)
+                VALUES (%s, %s, %s, %s, %s, '[]', 'pending')""",
+                (master_id, user_email, i//100, len(chunk), '|||'.join(chunk)))
         conn.commit(); cur.close()
     finally: release_db(conn)
-    # Start background thread
-    thread = threading.Thread(target=background_email_finder_worker, args=(job_id,), daemon=True)
-    thread.start()
-    return jsonify({'success': True, 'job_id': job_id, 'total': len(urls)})
+    conn = get_db()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM email_finder_subjobs WHERE master_id=%s ORDER BY sub_index ASC LIMIT 1", (master_id,))
+            row = cur.fetchone(); cur.close()
+        finally: release_db(conn)
+        if row:
+            threading.Thread(target=process_subjob, args=(row[0],), daemon=True).start()
+    return jsonify({'success': True, 'job_id': master_id, 'total': len(urls)})
 
 @app.route('/get-email-finder-jobs')
 @login_required
 def get_email_finder_jobs_route():
     user_email = session.get('user_id')
-    return jsonify({'jobs': get_email_finder_jobs(user_email)})
+    return jsonify({'jobs': get_email_finder_masters(user_email)})
 
 @app.route('/get-email-finder-job/<int:job_id>')
 @login_required
 def get_email_finder_job_route(job_id):
     user_email = session.get('user_id')
-    detail = get_email_finder_job_detail(job_id, user_email)
-    if not detail: return jsonify({'results': []})
-    return jsonify({'results': detail['results'], 'status': detail['status']})
+    detail = get_email_finder_master_detail(job_id, user_email)
+    if not detail: return jsonify({'results': [], 'subjobs': []})
+    return jsonify(detail)
+# ----- /EDIT 3 -----
 
 @app.route('/store-emails', methods=['POST'])
 @login_required
