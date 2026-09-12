@@ -122,7 +122,6 @@ def init_db():
             email VARCHAR(255) NOT NULL,
             sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_email, email))""")
-        # NEW: Hugging Face imports history
         cur.execute("""CREATE TABLE IF NOT EXISTS hf_imports (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             requested INTEGER DEFAULT 0,
@@ -267,10 +266,10 @@ def load_user_state(user_email):
     finally: release_db(conn)
 
 # ==========================================
-# HUGGING FACE IMPORT
+# HUGGING FACE IMPORT (FIXED - LOOPS 100 AT A TIME)
 # ==========================================
-def fetch_hf_rows(offset, length):
-    """Fetch rows from Hugging Face dataset server"""
+def fetch_hf_batch(offset, length):
+    """Fetch up to 100 rows from Hugging Face (API max per call)"""
     try:
         url = f"https://datasets-server.huggingface.co/rows?dataset={requests.utils.quote(HF_DATASET)}&config=default&split=train&offset={offset}&length={length}"
         r = requests.get(url, timeout=20)
@@ -279,36 +278,61 @@ def fetch_hf_rows(offset, length):
             rows = data.get('rows', [])
             total = data.get('num_rows_total', 0)
             return rows, total
-        return [], 0
+        else:
+            print(f"HF API returned {r.status_code}")
+            return [], 0
     except Exception as e:
         print(f"HF fetch error: {e}")
         return [], 0
 
 def do_hf_import(user_email, requested):
-    """Fetch from HF, dedupe, save to discovered_stores + hf_imports history"""
+    """Fetch from HF in 100-row chunks, dedupe, save to discovered_stores + hf_imports history"""
     offset = get_hf_offset(user_email)
-    rows, total = fetch_hf_rows(offset, requested)
-    if not rows:
-        return {'success': False, 'error': 'No rows fetched from Hugging Face', 'added': 0, 'skipped': 0}
+    all_rows = []
+    total_available = 0
+    fetched = 0
+    MAX_PER_CALL = 100
     
-    # Extract domains and dedupe against existing
+    # Loop fetching 100 at a time until we have enough or hit the end
+    while fetched < requested:
+        batch_size = min(MAX_PER_CALL, requested - fetched)
+        rows, total = fetch_hf_batch(offset + fetched, batch_size)
+        if total > 0: total_available = total
+        if not rows:
+            # No more data available
+            break
+        all_rows.extend(rows)
+        fetched += len(rows)
+        if len(rows) < batch_size:
+            # Hit the end of available data
+            break
+        time.sleep(0.3)  # Be respectful to API
+    
+    if not all_rows:
+        return {'success': False, 'error': 'No rows fetched from Hugging Face', 'added': 0, 'skipped': 0, 'offset_after': offset}
+    
+    # Now dedupe + save
     conn = get_db()
     if not conn:
-        return {'success': False, 'error': 'DB not available', 'added': 0, 'skipped': 0}
+        return {'success': False, 'error': 'DB not available', 'added': 0, 'skipped': 0, 'offset_after': offset}
     
     added = 0
     skipped = 0
     added_domains = []
+    seen_in_this_batch = set()
     try:
         cur = conn.cursor()
-        for item in rows:
+        for item in all_rows:
             row_data = item.get('row', {})
             store_url = row_data.get('url', '')
             if not store_url: continue
             clean = store_url.replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0].strip().lower()
             if not clean or '.' not in clean: continue
-            if "shopify" in clean and "myshopify" not in clean: continue
-            # Skip if already exists
+            if clean in seen_in_this_batch:
+                skipped += 1
+                continue
+            seen_in_this_batch.add(clean)
+            # Skip if already exists in user's discovered_stores
             cur.execute("SELECT id FROM discovered_stores WHERE user_email = %s AND domain = %s", (user_email, clean))
             if cur.fetchone():
                 skipped += 1
@@ -324,13 +348,14 @@ def do_hf_import(user_email, requested):
         conn.commit(); cur.close()
     except Exception as e:
         print(f"HF import error: {e}")
-        return {'success': False, 'error': str(e), 'added': 0, 'skipped': 0}
+        return {'success': False, 'error': str(e), 'added': 0, 'skipped': 0, 'offset_after': offset}
     finally:
         release_db(conn)
     
     # Update offset
-    new_offset = offset + len(rows)
-    if new_offset >= total: new_offset = 0  # wrap when exhausted
+    new_offset = offset + len(all_rows)
+    if total_available > 0 and new_offset >= total_available:
+        new_offset = 0  # Wrap when exhausted
     set_hf_offset(user_email, new_offset)
     
     # Save import to history
@@ -349,12 +374,12 @@ def do_hf_import(user_email, requested):
         finally: release_db(conn)
     
     return {
-        'success': True, 
-        'added': added, 
+        'success': True,
+        'added': added,
         'skipped': skipped,
         'offset_before': offset,
         'offset_after': new_offset,
-        'total_available': total
+        'total_available': total_available
     }
 
 def get_hf_history(user_email):
@@ -1019,7 +1044,7 @@ def settings():
     return render_page("Settings", body)
 
 # ==========================================
-# HOME (Email Finder)
+# HOME
 # ==========================================
 @app.route('/')
 @login_required
@@ -1091,7 +1116,7 @@ window.onload=loadHistory;
     return render_page("Finder", body)
 
 # ==========================================
-# STORE DISCOVERY (with HF Import)
+# STORE DISCOVERY
 # ==========================================
 @app.route('/discover')
 @login_required
@@ -1138,7 +1163,7 @@ async function importFromHF(){
   const count = parseInt(document.getElementById('hfCount').value) || 200;
   if(count < 10 || count > 1000){ alert('Enter 10-1000'); return; }
   const status = document.getElementById('hfStatus');
-  status.innerHTML = '<p style="color:white">⏳ Importing '+count+' stores from Hugging Face...</p>';
+  status.innerHTML = '<p style="color:white">⏳ Importing '+count+' stores... (this may take up to 30s)</p>';
   try{
     const res = await fetch('/import-from-huggingface', {
       method:'POST', headers:{'Content-Type':'application/json'},
