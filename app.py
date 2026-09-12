@@ -26,7 +26,7 @@ SHOPIFY_IPS = ["23.227.38.32","23.227.38.36","23.227.38.65","23.227.38.66","23.2
 # ==========================================
 # MEMORY FIX: Reduced worker count
 # ==========================================
-MAX_WORKERS = 10  # Was 20 - reduces memory usage by ~50%
+MAX_WORKERS = 10
 
 # ==========================================
 # DB POOL
@@ -127,7 +127,7 @@ def init_db():
             email VARCHAR(255) NOT NULL,
             sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_email, email))""")
-        # ----- EDIT 1: New tables for master/subjob system -----
+        # ----- EDIT 1: Master/subjob tables -----
         cur.execute("""CREATE TABLE IF NOT EXISTS email_finder_master (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             total INTEGER DEFAULT 0, processed INTEGER DEFAULT 0,
@@ -155,7 +155,6 @@ def init_db():
             offset_after INTEGER DEFAULT 0,
             domains TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        # Legacy email_finder_jobs table (kept for backward compatibility)
         cur.execute("""CREATE TABLE IF NOT EXISTS email_finder_jobs (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             total INTEGER DEFAULT 0, processed INTEGER DEFAULT 0,
@@ -172,13 +171,6 @@ def init_db():
 try:
     init_pool(); init_db()
 except: pass
-
-# ----- EDIT 4: Resume unfinished masters on startup -----
-try:
-    resume_unfinished_masters()
-except:
-    pass
-# ----- /EDIT 4 -----
 
 def hash_password(p): return hashlib.sha256(p.encode()).hexdigest()
 
@@ -308,7 +300,6 @@ def load_user_state(user_email):
 # ==========================================
 # EMAIL FINDER BACKGROUND JOBS (MASTER + SUBJOBS)
 # ==========================================
-# ----- EDIT 2: process_subjob, trigger_next_subjob, resume_unfinished_masters -----
 def process_subjob(subjob_id):
     conn = get_db()
     if not conn: return
@@ -421,9 +412,7 @@ def resume_unfinished_masters():
         finally: release_db(conn)
         if row:
             threading.Thread(target=process_subjob, args=(row[0],), daemon=True).start()
-# ----- /EDIT 2 -----
 
-# ----- Helper functions for the new master/subjob tables -----
 def get_email_finder_masters(user_email):
     conn = get_db()
     if not conn: return []
@@ -1194,7 +1183,7 @@ def home():
     body = '''<div style="max-width:700px;margin:20px auto;padding:20px">
 <div style="background:white;padding:30px;border-radius:15px;box-shadow:0 4px 12px rgba(0,0,0,0.1);margin-bottom:20px">
 <h2 style="color:#333;margin-top:0">🔍 Email Finder</h2>
-<p style="color:#666">Paste up to <b>100 store URLs</b> (one per line). Search runs in background — you can close the browser.</p>
+<p style="color:#666">Paste any number of store URLs (one per line). Search runs in background — you can close the browser. Jobs are auto-split into batches of 100.</p>
 <textarea id="urls" style="width:100%;height:180px;padding:12px;border:2px solid #ddd;border-radius:8px;font-size:14px;font-family:monospace;box-sizing:border-box" placeholder="deluxura.shop&#10;hipchik.com">''' + preload.replace('<','&lt;') + '''</textarea>
 <button onclick="startBackgroundSearch()" style="background:#667eea;color:white;padding:12px;border:none;border-radius:8px;cursor:pointer;font-size:16px;width:100%;margin:10px 0">🚀 Search All URLs (Background)</button>
 <button onclick="importFromDiscovery()" style="background:#8b5cf6;color:white;padding:12px;border:none;border-radius:8px;cursor:pointer;font-size:16px;width:100%;margin-bottom:10px">📥 Import from Discovery</button>
@@ -1211,13 +1200,13 @@ async function startBackgroundSearch(){
   const result=document.getElementById('result');
   const stores=input.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);
   if(stores.length===0){alert('Enter URL');return}
-  if(stores.length > 100){alert('Max 100 URLs per job. Please split into batches.');return}
-  result.innerHTML='<p style="color:#666">⏳ Starting background job for '+stores.length+' URLs...</p>';
+  const batches = Math.ceil(stores.length / 100);
+  result.innerHTML='<p style="color:#666">⏳ Starting background job for '+stores.length+' URLs in '+batches+' batch(es)...</p>';
   try{
     const res=await fetch('/start-email-finder-job',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({urls: stores})});
     const data=await res.json();
     if(data.success){
-      result.innerHTML='<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:12px;border-radius:5px;color:#166534"><b>✅ Job #'+data.job_id+' started!</b><br>Processing '+stores.length+' URLs in the background.<br><br><b>You can close the browser now.</b><br>Come back later to see results.</div>';
+      result.innerHTML='<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:12px;border-radius:5px;color:#166534"><b>✅ Job #'+data.job_id+' started!</b><br>Processing '+stores.length+' URLs in '+batches+' batch(es) of 100 in the background.<br><br><b>You can close the browser now.</b><br>Come back later to see results.</div>';
       document.getElementById('urls').value='';
       loadJobs();
     } else {
@@ -1236,7 +1225,7 @@ async function importFromDiscovery(){
       result.innerHTML = '<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">No discovered stores yet. Go to Store Discovery first.</div>';
       return;
     }
-    const domains = data.stores.map(s=>s.domain).slice(0, 100);
+    const domains = data.stores.map(s=>s.domain);
     document.getElementById('urls').value = domains.join('\\n');
     result.innerHTML = '<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:10px;border-radius:5px;color:#166534">✅ Loaded '+domains.length+' store URLs from Discovery. Click "Search All URLs (Background)" to find emails.</div>';
   }catch(e){
@@ -1315,7 +1304,6 @@ window.onload = function(){ loadJobs(); setInterval(loadJobs, 5000); };
 # ==========================================
 # EMAIL FINDER JOB API (MASTER + SUBJOBS)
 # ==========================================
-# ----- EDIT 3: Replaced route body for /start-email-finder-job -----
 @app.route('/start-email-finder-job', methods=['POST'])
 @login_required
 def start_email_finder_job():
@@ -1359,7 +1347,6 @@ def get_email_finder_job_route(job_id):
     detail = get_email_finder_master_detail(job_id, user_email)
     if not detail: return jsonify({'results': [], 'subjobs': []})
     return jsonify(detail)
-# ----- /EDIT 3 -----
 
 @app.route('/store-emails', methods=['POST'])
 @login_required
@@ -1482,7 +1469,7 @@ async function sendImportToFinder(id){
   const res = await fetch('/get-hf-import/'+id);
   const data = await res.json();
   if(!data.domains || data.domains.length === 0){ alert('No domains in this import'); return; }
-  const text = data.domains.slice(0, 100).join('\\n');
+  const text = data.domains.join('\\n');
   window.location.href = '/?url=' + encodeURIComponent(text);
 }
 
@@ -1504,7 +1491,7 @@ async function sendAllToFinder(){
   const res = await fetch('/get-discovered');
   const data = await res.json();
   if(!data.stores || data.stores.length===0){ alert('No stores'); return; }
-  const domains = data.stores.map(s=>s.domain).slice(0,100);
+  const domains = data.stores.map(s=>s.domain);
   window.location.href = '/?url=' + encodeURIComponent(domains.join('\\n'));
 }
 
@@ -1679,7 +1666,7 @@ def get_discovered():
     if not conn: return jsonify({'stores': []})
     try:
         cur = conn.cursor()
-        cur.execute("SELECT domain, source, discovered_at FROM discovered_stores WHERE user_email = %s ORDER BY discovered_at DESC LIMIT 500", (user_email,))
+        cur.execute("SELECT domain, source, discovered_at FROM discovered_stores WHERE user_email = %s ORDER BY discovered_at DESC LIMIT 10000", (user_email,))
         rows = cur.fetchall(); cur.close()
         return jsonify({'stores': [{'domain': r[0], 'source': r[1], 'discovered_at': str(r[2])[:16]} for r in rows]})
     except: return jsonify({'stores': []})
@@ -2260,6 +2247,14 @@ def save_scout_state_route():
     if user_email:
         save_user_state(user_email, scout_recipients='|||'.join(data.get('recipients', [])), scout_subject=data.get('subject', ''), scout_message=data.get('message', ''), scout_count=data.get('count', 0))
     return jsonify({'success': True})
+
+# ==========================================
+# STARTUP RESUME (must be at the bottom)
+# ==========================================
+try:
+    resume_unfinished_masters()
+except Exception as e:
+    print(f"⚠️ resume_unfinished_masters: {e}")
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
