@@ -124,7 +124,8 @@ def init_db():
             UNIQUE(user_email, email))""")
         cur.execute("""CREATE TABLE IF NOT EXISTS hf_imports (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
-            requested INTEGER DEFAULT 0, added INTEGER DEFAULT 0,
+            requested INTEGER DEFAULT 0,
+            added INTEGER DEFAULT 0,
             skipped INTEGER DEFAULT 0,
             offset_before INTEGER DEFAULT 0,
             offset_after INTEGER DEFAULT 0,
@@ -265,7 +266,7 @@ def load_user_state(user_email):
     finally: release_db(conn)
 
 # ==========================================
-# HUGGING FACE IMPORT (FIXED - LOOPS 100 AT A TIME)
+# HUGGING FACE IMPORT
 # ==========================================
 def fetch_hf_batch(offset, length):
     try:
@@ -273,12 +274,8 @@ def fetch_hf_batch(offset, length):
         r = requests.get(url, timeout=20)
         if r.status_code == 200:
             data = r.json()
-            rows = data.get('rows', [])
-            total = data.get('num_rows_total', 0)
-            return rows, total
-        else:
-            print(f"HF API returned {r.status_code}")
-            return [], 0
+            return data.get('rows', []), data.get('num_rows_total', 0)
+        return [], 0
     except Exception as e:
         print(f"HF fetch error: {e}")
         return [], 0
@@ -289,30 +286,20 @@ def do_hf_import(user_email, requested):
     total_available = 0
     fetched = 0
     MAX_PER_CALL = 100
-    
     while fetched < requested:
         batch_size = min(MAX_PER_CALL, requested - fetched)
         rows, total = fetch_hf_batch(offset + fetched, batch_size)
         if total > 0: total_available = total
-        if not rows:
-            break
+        if not rows: break
         all_rows.extend(rows)
         fetched += len(rows)
-        if len(rows) < batch_size:
-            break
+        if len(rows) < batch_size: break
         time.sleep(0.3)
-    
     if not all_rows:
-        return {'success': False, 'error': 'No rows fetched from Hugging Face', 'added': 0, 'skipped': 0, 'offset_after': offset}
-    
+        return {'success': False, 'error': 'No rows fetched', 'added': 0, 'skipped': 0, 'offset_after': offset}
     conn = get_db()
-    if not conn:
-        return {'success': False, 'error': 'DB not available', 'added': 0, 'skipped': 0, 'offset_after': offset}
-    
-    added = 0
-    skipped = 0
-    added_domains = []
-    seen_in_this_batch = set()
+    if not conn: return {'success': False, 'error': 'No DB', 'added': 0, 'skipped': 0, 'offset_after': offset}
+    added = 0; skipped = 0; added_domains = []; seen = set()
     try:
         cur = conn.cursor()
         for item in all_rows:
@@ -321,34 +308,23 @@ def do_hf_import(user_email, requested):
             if not store_url: continue
             clean = store_url.replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0].strip().lower()
             if not clean or '.' not in clean: continue
-            if clean in seen_in_this_batch:
-                skipped += 1
-                continue
-            seen_in_this_batch.add(clean)
+            if clean in seen: skipped += 1; continue
+            seen.add(clean)
             cur.execute("SELECT id FROM discovered_stores WHERE user_email = %s AND domain = %s", (user_email, clean))
-            if cur.fetchone():
-                skipped += 1
-                continue
+            if cur.fetchone(): skipped += 1; continue
             try:
                 cur.execute("""INSERT INTO discovered_stores (user_email, domain, source)
                     VALUES (%s, %s, 'huggingface') ON CONFLICT (user_email, domain) DO NOTHING""",
                     (user_email, clean))
-                if cur.rowcount > 0:
-                    added += 1
-                    added_domains.append(clean)
+                if cur.rowcount > 0: added += 1; added_domains.append(clean)
             except: pass
         conn.commit(); cur.close()
     except Exception as e:
-        print(f"HF import error: {e}")
         return {'success': False, 'error': str(e), 'added': 0, 'skipped': 0, 'offset_after': offset}
-    finally:
-        release_db(conn)
-    
+    finally: release_db(conn)
     new_offset = offset + len(all_rows)
-    if total_available > 0 and new_offset >= total_available:
-        new_offset = 0
+    if total_available > 0 and new_offset >= total_available: new_offset = 0
     set_hf_offset(user_email, new_offset)
-    
     conn = get_db()
     if conn:
         try:
@@ -357,25 +333,18 @@ def do_hf_import(user_email, requested):
                 VALUES (%s, %s, %s, %s, %s, %s, %s)""",
                 (user_email, requested, added, skipped, offset, new_offset, '|||'.join(added_domains)))
             cur.execute("""DELETE FROM hf_imports WHERE user_email = %s
-                AND id NOT IN (SELECT id FROM hf_imports WHERE user_email = %s
-                ORDER BY created_at DESC LIMIT 3)""", (user_email, user_email))
+                AND id NOT IN (SELECT id FROM hf_imports WHERE user_email = %s ORDER BY created_at DESC LIMIT 3)""", (user_email, user_email))
             conn.commit(); cur.close()
         except Exception as e: print(f"save hf history: {e}")
         finally: release_db(conn)
-    
-    return {
-        'success': True, 'added': added, 'skipped': skipped,
-        'offset_before': offset, 'offset_after': new_offset,
-        'total_available': total_available
-    }
+    return {'success': True, 'added': added, 'skipped': skipped, 'offset_before': offset, 'offset_after': new_offset, 'total_available': total_available}
 
 def get_hf_history(user_email):
     conn = get_db()
     if not conn: return []
     try:
         cur = conn.cursor()
-        cur.execute("""SELECT id, requested, added, skipped, offset_after, created_at
-            FROM hf_imports WHERE user_email = %s ORDER BY created_at DESC LIMIT 3""", (user_email,))
+        cur.execute("SELECT id, requested, added, skipped, offset_after, created_at FROM hf_imports WHERE user_email = %s ORDER BY created_at DESC LIMIT 3", (user_email,))
         rows = cur.fetchall(); cur.close()
         return [{'id': r[0], 'requested': r[1], 'added': r[2], 'skipped': r[3], 'offset': r[4], 'created_at': str(r[5])[:16]} for r in rows]
     except: return []
@@ -407,8 +376,7 @@ def add_to_queue(user_email, emails):
             domain = domain_from_email(email)
             if not domain: continue
             cur.execute("SELECT id FROM sent_log WHERE user_email = %s AND email = %s", (user_email, email))
-            if cur.fetchone():
-                skipped += 1; continue
+            if cur.fetchone(): skipped += 1; continue
             try:
                 cur.execute("""INSERT INTO audit_queue (user_email, email, domain, status)
                     VALUES (%s, %s, %s, 'pending') ON CONFLICT (user_email, email) DO NOTHING""",
@@ -425,15 +393,10 @@ def get_queue(user_email):
     if not conn: return []
     try:
         cur = conn.cursor()
-        cur.execute("""SELECT id, email, domain, status, report, subject, message
-            FROM audit_queue WHERE user_email = %s
-            ORDER BY CASE status WHEN 'pending' THEN 1 WHEN 'current' THEN 2 WHEN 'done' THEN 3 WHEN 'skipped' THEN 4 ELSE 5 END, added_at ASC""",
-            (user_email,))
+        cur.execute("""SELECT id, email, domain, status, report, subject, message FROM audit_queue WHERE user_email = %s
+            ORDER BY CASE status WHEN 'pending' THEN 1 WHEN 'current' THEN 2 WHEN 'done' THEN 3 WHEN 'skipped' THEN 4 ELSE 5 END, added_at ASC""", (user_email,))
         rows = cur.fetchall(); cur.close()
-        results = []
-        for r in rows:
-            results.append({'id': r[0], 'email': r[1], 'domain': r[2], 'status': r[3], 'has_report': bool(r[4]), 'subject': r[5] or '', 'message': r[6] or ''})
-        return results
+        return [{'id': r[0], 'email': r[1], 'domain': r[2], 'status': r[3], 'has_report': bool(r[4]), 'subject': r[5] or '', 'message': r[6] or ''} for r in rows]
     except: return []
     finally: release_db(conn)
 
@@ -498,8 +461,7 @@ def get_next_pending_item(user_email):
     if not conn: return None
     try:
         cur = conn.cursor()
-        cur.execute("""SELECT id, email, domain, status, report, subject, message FROM audit_queue
-            WHERE user_email = %s AND status = 'pending' ORDER BY added_at ASC LIMIT 1""", (user_email,))
+        cur.execute("SELECT id, email, domain, status, report, subject, message FROM audit_queue WHERE user_email = %s AND status = 'pending' ORDER BY added_at ASC LIMIT 1", (user_email,))
         row = cur.fetchone(); cur.close()
         if not row: return None
         report = None
@@ -519,12 +481,10 @@ def save_email_scan(user_email, results, store_count):
     try:
         total_emails = sum(len(r.get('emails', [])) for r in results)
         flat_emails = []
-        for r in results:
-            flat_emails.extend(r.get('emails', []))
+        for r in results: flat_emails.extend(r.get('emails', []))
         cur = conn.cursor()
         cur.execute("""INSERT INTO email_scans (user_email, results, emails, email_count, store_count)
-            VALUES (%s, %s, %s, %s, %s)""",
-            (user_email, json.dumps(results), ','.join(flat_emails), total_emails, store_count))
+            VALUES (%s, %s, %s, %s, %s)""", (user_email, json.dumps(results), ','.join(flat_emails), total_emails, store_count))
         cur.execute("""DELETE FROM email_scans WHERE user_email = %s
             AND id NOT IN (SELECT id FROM email_scans WHERE user_email = %s ORDER BY created_at DESC LIMIT 3)""", (user_email, user_email))
         conn.commit(); cur.close()
@@ -770,8 +730,7 @@ def audit_store(domain, case_id):
     payment_sigs = {"PayPal": ["paypal.com/sdk", "paypal-button", "paypalobjects"],"Stripe": ["js.stripe.com", "stripe.com/v3"],"Klarna": ["klarna.com", "klarna-checkout"],"Afterpay": ["afterpay.com", "afterpay"],"Apple Pay": ["apple-pay", "applepay"],"Google Pay": ["google-pay", "googlepay"],"Shop Pay": ["shop-pay", "shop_pay", "shoppay"],"Amazon Pay": ["amazonpay", "amazon-pay"],"Affirm": ["affirm.com", "affirm-"],"Zip": ["zip.co", "zip-payments"]}
     for name, sigs in payment_sigs.items():
         for s in sigs:
-            if s in html_low:
-                payments.append(name); break
+            if s in html_low: payments.append(name); break
     report["checks"]["payment_methods"] = payments
     if len(payments) >= 2: report["positives"].append(f"{len(payments)} payment options")
     elif len(payments) <= 1: report["issues"].append({"title": "Limited Payment Options", "description": f"Only {len(payments)} method(s).", "recommendation": "Add PayPal, Shop Pay, Apple Pay.", "severity": "medium"})
@@ -1031,7 +990,7 @@ def settings():
     return render_page("Settings", body)
 
 # ==========================================
-# HOME
+# HOME (Email Finder) — with View/Hide toggle
 # ==========================================
 @app.route('/')
 @login_required
@@ -1080,30 +1039,50 @@ async function loadHistory(){
     html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid #667eea">';
     html+='<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
     html+='<div><b>'+s.count+' emails</b> from '+s.stores+' stores<br><span style="font-size:12px;color:#666">'+s.created_at+'</span></div>';
-    html+='<button onclick="viewScan('+s.id+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">View</button>';
-    html+='</div><div id="scan-'+s.id+'" style="margin-top:10px"></div></div>';
+    html+='<button id="scanbtn-'+s.id+'" onclick="toggleScanView('+s.id+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">View</button>';
+    html+='</div>';
+    html+='<div id="scan-'+s.id+'" style="display:none;margin-top:10px"></div>';
+    html+='</div>';
   });
   c.innerHTML=html;
 }
-async function viewScan(id){
-  const res=await fetch('/get-email-scan/'+id);const data=await res.json();
-  const c=document.getElementById('scan-'+id);
-  if(!data.results || data.results.length===0){c.innerHTML='<p style="color:#666">No results.</p>';return}
-  let html='<div style="background:white;padding:10px;border-radius:6px;max-height:300px;overflow-y:auto;font-size:13px">';
-  data.results.forEach(r=>{
-    html+='<div style="padding:8px 0;border-bottom:1px solid #eee"><div style="font-weight:bold;margin-bottom:4px">📦 <a href="https://'+r.store+'" target="_blank" style="color:#3b82f6;text-decoration:none">'+r.store+'</a></div>';
-    (r.emails||[]).forEach(e=>{html+='<div style="padding-left:16px;color:#333;word-break:break-all">📧 '+e+'</div>'});
-    html+='</div>';
-  });
-  html+='</div>';
-  c.innerHTML=html;
+async function toggleScanView(id){
+  const c = document.getElementById('scan-'+id);
+  const btn = document.getElementById('scanbtn-'+id);
+  if(c.style.display === 'block'){
+    c.style.display = 'none';
+    btn.textContent = 'View';
+    btn.style.background = '#3b82f6';
+    return;
+  }
+  // Load if not loaded
+  if(c.dataset.loaded !== '1'){
+    const res=await fetch('/get-email-scan/'+id);
+    const data=await res.json();
+    if(!data.results || data.results.length===0){
+      c.innerHTML='<p style="color:#666">No results.</p>';
+    } else {
+      let html='<div style="background:white;padding:10px;border-radius:6px;max-height:300px;overflow-y:auto;font-size:13px">';
+      data.results.forEach(r=>{
+        html+='<div style="padding:8px 0;border-bottom:1px solid #eee"><div style="font-weight:bold;margin-bottom:4px">📦 <a href="https://'+r.store+'" target="_blank" style="color:#3b82f6;text-decoration:none">'+r.store+'</a></div>';
+        (r.emails||[]).forEach(e=>{html+='<div style="padding-left:16px;color:#333;word-break:break-all">📧 '+e+'</div>'});
+        html+='</div>';
+      });
+      html+='</div>';
+      c.innerHTML = html;
+    }
+    c.dataset.loaded = '1';
+  }
+  c.style.display = 'block';
+  btn.textContent = 'Hide';
+  btn.style.background = '#6b7280';
 }
 window.onload=loadHistory;
 </script>'''
     return render_page("Finder", body)
 
 # ==========================================
-# STORE DISCOVERY
+# STORE DISCOVERY — with View/Hide toggle
 # ==========================================
 @app.route('/discover')
 @login_required
@@ -1150,15 +1129,12 @@ async function importFromHF(){
   const count = parseInt(document.getElementById('hfCount').value) || 200;
   if(count < 10 || count > 1000){ alert('Enter 10-1000'); return; }
   const status = document.getElementById('hfStatus');
-  status.innerHTML = '<p style="color:white">⏳ Importing '+count+' stores... (this may take up to 30s)</p>';
+  status.innerHTML = '<p style="color:white">⏳ Importing '+count+' stores... (may take 30s)</p>';
   try{
-    const res = await fetch('/import-from-huggingface', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({count: count})
-    });
+    const res = await fetch('/import-from-huggingface', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({count: count})});
     const data = await res.json();
     if(data.success){
-      status.innerHTML = '<p style="color:white">✅ Imported '+data.added+' new stores (skipped '+data.skipped+' already known) · New offset: '+data.offset_after+'</p>';
+      status.innerHTML = '<p style="color:white">✅ Imported '+data.added+' (skipped '+data.skipped+') · New offset: '+data.offset_after+'</p>';
       document.getElementById('currentOffset').textContent = data.offset_after;
       loadStores(); loadHFHistory();
     } else {
@@ -1188,31 +1164,28 @@ async function loadHFHistory(){
 async function toggleHFView(id){
   const c = document.getElementById('hf-'+id);
   const btn = document.getElementById('hfbtn-'+id);
-  // If already visible, hide it
   if(c.style.display === 'block'){
     c.style.display = 'none';
-    if(btn){ btn.textContent = 'View'; btn.style.background = '#3b82f6'; }
+    btn.textContent = 'View';
+    btn.style.background = '#3b82f6';
     return;
   }
-  // Otherwise fetch, render, and show
-  c.innerHTML = '<p style="color:#666;font-size:12px">Loading...</p>';
-  c.style.display = 'block';
-  if(btn){ btn.textContent = 'Hide'; btn.style.background = '#6b7280'; }
-  try{
+  if(c.dataset.loaded !== '1'){
     const res = await fetch('/get-hf-import/'+id);
     const data = await res.json();
     if(!data.domains || data.domains.length===0){
-      c.innerHTML = '<p style="color:#666;font-size:12px">No domains.</p>';
-      return;
+      c.innerHTML='<p style="color:#666">No domains.</p>';
+    } else {
+      let html = '<div style="background:white;padding:10px;border-radius:6px;max-height:250px;overflow-y:auto;font-size:12px;word-break:break-all">';
+      data.domains.forEach(d=>{ html += '<div style="padding:3px 0">• <a href="https://'+d+'" target="_blank" style="color:#3b82f6">'+d+'</a></div>'; });
+      html += '</div>';
+      c.innerHTML = html;
     }
-    let html = '<div style="background:white;padding:10px;border-radius:6px;max-height:250px;overflow-y:auto;font-size:12px;word-break:break-all">';
-    data.domains.forEach(d=>{ html += '<div style="padding:3px 0">• <a href="https://'+d+'" target="_blank" style="color:#3b82f6">'+d+'</a></div>'; });
-    html += '</div>';
-    html += '<button onclick="toggleHFView('+id+')" style="background:#6b7280;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px;margin-top:6px">🔼 Hide</button>';
-    c.innerHTML = html;
-  }catch(e){
-    c.innerHTML = '<p style="color:#red;font-size:12px">Error loading.</p>';
+    c.dataset.loaded = '1';
   }
+  c.style.display = 'block';
+  btn.textContent = 'Hide';
+  btn.style.background = '#6b7280';
 }
 
 async function loadStores(){
