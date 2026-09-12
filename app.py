@@ -124,8 +124,7 @@ def init_db():
             UNIQUE(user_email, email))""")
         cur.execute("""CREATE TABLE IF NOT EXISTS hf_imports (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
-            requested INTEGER DEFAULT 0,
-            added INTEGER DEFAULT 0,
+            requested INTEGER DEFAULT 0, added INTEGER DEFAULT 0,
             skipped INTEGER DEFAULT 0,
             offset_before INTEGER DEFAULT 0,
             offset_after INTEGER DEFAULT 0,
@@ -269,7 +268,6 @@ def load_user_state(user_email):
 # HUGGING FACE IMPORT (FIXED - LOOPS 100 AT A TIME)
 # ==========================================
 def fetch_hf_batch(offset, length):
-    """Fetch up to 100 rows from Hugging Face (API max per call)"""
     try:
         url = f"https://datasets-server.huggingface.co/rows?dataset={requests.utils.quote(HF_DATASET)}&config=default&split=train&offset={offset}&length={length}"
         r = requests.get(url, timeout=20)
@@ -286,32 +284,27 @@ def fetch_hf_batch(offset, length):
         return [], 0
 
 def do_hf_import(user_email, requested):
-    """Fetch from HF in 100-row chunks, dedupe, save to discovered_stores + hf_imports history"""
     offset = get_hf_offset(user_email)
     all_rows = []
     total_available = 0
     fetched = 0
     MAX_PER_CALL = 100
     
-    # Loop fetching 100 at a time until we have enough or hit the end
     while fetched < requested:
         batch_size = min(MAX_PER_CALL, requested - fetched)
         rows, total = fetch_hf_batch(offset + fetched, batch_size)
         if total > 0: total_available = total
         if not rows:
-            # No more data available
             break
         all_rows.extend(rows)
         fetched += len(rows)
         if len(rows) < batch_size:
-            # Hit the end of available data
             break
-        time.sleep(0.3)  # Be respectful to API
+        time.sleep(0.3)
     
     if not all_rows:
         return {'success': False, 'error': 'No rows fetched from Hugging Face', 'added': 0, 'skipped': 0, 'offset_after': offset}
     
-    # Now dedupe + save
     conn = get_db()
     if not conn:
         return {'success': False, 'error': 'DB not available', 'added': 0, 'skipped': 0, 'offset_after': offset}
@@ -332,7 +325,6 @@ def do_hf_import(user_email, requested):
                 skipped += 1
                 continue
             seen_in_this_batch.add(clean)
-            # Skip if already exists in user's discovered_stores
             cur.execute("SELECT id FROM discovered_stores WHERE user_email = %s AND domain = %s", (user_email, clean))
             if cur.fetchone():
                 skipped += 1
@@ -352,13 +344,11 @@ def do_hf_import(user_email, requested):
     finally:
         release_db(conn)
     
-    # Update offset
     new_offset = offset + len(all_rows)
     if total_available > 0 and new_offset >= total_available:
-        new_offset = 0  # Wrap when exhausted
+        new_offset = 0
     set_hf_offset(user_email, new_offset)
     
-    # Save import to history
     conn = get_db()
     if conn:
         try:
@@ -374,11 +364,8 @@ def do_hf_import(user_email, requested):
         finally: release_db(conn)
     
     return {
-        'success': True,
-        'added': added,
-        'skipped': skipped,
-        'offset_before': offset,
-        'offset_after': new_offset,
+        'success': True, 'added': added, 'skipped': skipped,
+        'offset_before': offset, 'offset_after': new_offset,
         'total_available': total_available
     }
 
@@ -1191,22 +1178,41 @@ async function loadHFHistory(){
       html += '<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid #ff7e5f">';
       html += '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
       html += '<div><b>'+h.added+' new stores</b> (skipped '+h.skipped+')<br><span style="font-size:12px;color:#666">'+h.created_at+' · offset now '+h.offset+'</span></div>';
-      html += '<button onclick="viewHFImport('+h.id+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">View</button>';
-      html += '</div><div id="hf-'+h.id+'" style="margin-top:10px"></div></div>';
+      html += '<button id="hfbtn-'+h.id+'" onclick="toggleHFView('+h.id+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">View</button>';
+      html += '</div><div id="hf-'+h.id+'" style="display:none;margin-top:10px"></div></div>';
     });
     c.innerHTML = html;
   }catch(e){ console.error(e); }
 }
 
-async function viewHFImport(id){
-  const res = await fetch('/get-hf-import/'+id);
-  const data = await res.json();
+async function toggleHFView(id){
   const c = document.getElementById('hf-'+id);
-  if(!data.domains || data.domains.length===0){ c.innerHTML='<p style="color:#666">No domains.</p>'; return; }
-  let html = '<div style="background:white;padding:10px;border-radius:6px;max-height:250px;overflow-y:auto;font-size:12px;word-break:break-all">';
-  data.domains.forEach(d=>{ html += '<div style="padding:3px 0">• <a href="https://'+d+'" target="_blank" style="color:#3b82f6">'+d+'</a></div>'; });
-  html += '</div>';
-  c.innerHTML = html;
+  const btn = document.getElementById('hfbtn-'+id);
+  // If already visible, hide it
+  if(c.style.display === 'block'){
+    c.style.display = 'none';
+    if(btn){ btn.textContent = 'View'; btn.style.background = '#3b82f6'; }
+    return;
+  }
+  // Otherwise fetch, render, and show
+  c.innerHTML = '<p style="color:#666;font-size:12px">Loading...</p>';
+  c.style.display = 'block';
+  if(btn){ btn.textContent = 'Hide'; btn.style.background = '#6b7280'; }
+  try{
+    const res = await fetch('/get-hf-import/'+id);
+    const data = await res.json();
+    if(!data.domains || data.domains.length===0){
+      c.innerHTML = '<p style="color:#666;font-size:12px">No domains.</p>';
+      return;
+    }
+    let html = '<div style="background:white;padding:10px;border-radius:6px;max-height:250px;overflow-y:auto;font-size:12px;word-break:break-all">';
+    data.domains.forEach(d=>{ html += '<div style="padding:3px 0">• <a href="https://'+d+'" target="_blank" style="color:#3b82f6">'+d+'</a></div>'; });
+    html += '</div>';
+    html += '<button onclick="toggleHFView('+id+')" style="background:#6b7280;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px;margin-top:6px">🔼 Hide</button>';
+    c.innerHTML = html;
+  }catch(e){
+    c.innerHTML = '<p style="color:#red;font-size:12px">Error loading.</p>';
+  }
 }
 
 async function loadStores(){
