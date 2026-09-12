@@ -1256,7 +1256,7 @@ def start_email_finder_job():
     user_email = session.get('user_id')
     urls = request.json.get('urls', [])
     if not urls: return jsonify({'success': False, 'error': 'No URLs'})
-    if len(urls) > 100: urls = urls[:100]
+    if len(urls) > 1000: urls = urls[:1000]
     conn = get_db()
     if not conn: return jsonify({'success': False, 'error': 'No DB'})
     try:
