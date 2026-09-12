@@ -19,6 +19,7 @@ app = Flask(__name__)
 app.secret_key = 'super_secret_key_12345_change_this'
 DATABASE_URL = os.environ.get('DATABASE_URL')
 SHODAN_API_KEY = 'W5LL903l5aFfMROHmpBQGNm7mMkCimWq'
+HF_DATASET = "snncn/shopify-websites"
 
 SHOPIFY_IPS = ["23.227.38.32","23.227.38.36","23.227.38.65","23.227.38.66","23.227.38.67","23.227.38.68","23.227.38.69","23.227.38.70","23.227.38.71","23.227.38.72","23.227.38.73","23.227.38.74","23.227.39.20"]
 
@@ -73,8 +74,11 @@ def init_db():
             id SERIAL PRIMARY KEY, email VARCHAR(255) UNIQUE NOT NULL,
             password_hash VARCHAR(255) NOT NULL,
             sender_name VARCHAR(255) DEFAULT '',
+            hf_offset INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
         try: cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS sender_name VARCHAR(255) DEFAULT ''")
+        except: pass
+        try: cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS hf_offset INTEGER DEFAULT 0")
         except: pass
         cur.execute("""CREATE TABLE IF NOT EXISTS scraped_stores (
             id SERIAL PRIMARY KEY, domain VARCHAR(255) UNIQUE NOT NULL,
@@ -107,8 +111,7 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
         cur.execute("""CREATE TABLE IF NOT EXISTS audit_queue (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
-            email VARCHAR(255) NOT NULL,
-            domain VARCHAR(255) NOT NULL,
+            email VARCHAR(255) NOT NULL, domain VARCHAR(255) NOT NULL,
             status VARCHAR(50) DEFAULT 'pending',
             report JSONB, subject TEXT, message TEXT,
             added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -119,6 +122,16 @@ def init_db():
             email VARCHAR(255) NOT NULL,
             sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_email, email))""")
+        # NEW: Hugging Face imports history
+        cur.execute("""CREATE TABLE IF NOT EXISTS hf_imports (
+            id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
+            requested INTEGER DEFAULT 0,
+            added INTEGER DEFAULT 0,
+            skipped INTEGER DEFAULT 0,
+            offset_before INTEGER DEFAULT 0,
+            offset_after INTEGER DEFAULT 0,
+            domains TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
         conn.commit(); cur.close()
         print("✅ DB ready")
     except Exception as e: print(f"❌ DB: {e}")
@@ -170,6 +183,27 @@ def set_user_sender_name(user_email, name):
     try:
         cur = conn.cursor()
         cur.execute("UPDATE users SET sender_name = %s WHERE email = %s", (name, user_email))
+        conn.commit(); cur.close()
+    except: pass
+    finally: release_db(conn)
+
+def get_hf_offset(user_email):
+    conn = get_db()
+    if not conn: return 0
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT hf_offset FROM users WHERE email = %s", (user_email,))
+        row = cur.fetchone(); cur.close()
+        return row[0] if row and row[0] else 0
+    except: return 0
+    finally: release_db(conn)
+
+def set_hf_offset(user_email, offset):
+    conn = get_db()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET hf_offset = %s WHERE email = %s", (offset, user_email))
         conn.commit(); cur.close()
     except: pass
     finally: release_db(conn)
@@ -233,13 +267,126 @@ def load_user_state(user_email):
     finally: release_db(conn)
 
 # ==========================================
-# AUDIT QUEUE HELPERS
+# HUGGING FACE IMPORT
+# ==========================================
+def fetch_hf_rows(offset, length):
+    """Fetch rows from Hugging Face dataset server"""
+    try:
+        url = f"https://datasets-server.huggingface.co/rows?dataset={requests.utils.quote(HF_DATASET)}&config=default&split=train&offset={offset}&length={length}"
+        r = requests.get(url, timeout=20)
+        if r.status_code == 200:
+            data = r.json()
+            rows = data.get('rows', [])
+            total = data.get('num_rows_total', 0)
+            return rows, total
+        return [], 0
+    except Exception as e:
+        print(f"HF fetch error: {e}")
+        return [], 0
+
+def do_hf_import(user_email, requested):
+    """Fetch from HF, dedupe, save to discovered_stores + hf_imports history"""
+    offset = get_hf_offset(user_email)
+    rows, total = fetch_hf_rows(offset, requested)
+    if not rows:
+        return {'success': False, 'error': 'No rows fetched from Hugging Face', 'added': 0, 'skipped': 0}
+    
+    # Extract domains and dedupe against existing
+    conn = get_db()
+    if not conn:
+        return {'success': False, 'error': 'DB not available', 'added': 0, 'skipped': 0}
+    
+    added = 0
+    skipped = 0
+    added_domains = []
+    try:
+        cur = conn.cursor()
+        for item in rows:
+            row_data = item.get('row', {})
+            store_url = row_data.get('url', '')
+            if not store_url: continue
+            clean = store_url.replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0].strip().lower()
+            if not clean or '.' not in clean: continue
+            if "shopify" in clean and "myshopify" not in clean: continue
+            # Skip if already exists
+            cur.execute("SELECT id FROM discovered_stores WHERE user_email = %s AND domain = %s", (user_email, clean))
+            if cur.fetchone():
+                skipped += 1
+                continue
+            try:
+                cur.execute("""INSERT INTO discovered_stores (user_email, domain, source)
+                    VALUES (%s, %s, 'huggingface') ON CONFLICT (user_email, domain) DO NOTHING""",
+                    (user_email, clean))
+                if cur.rowcount > 0:
+                    added += 1
+                    added_domains.append(clean)
+            except: pass
+        conn.commit(); cur.close()
+    except Exception as e:
+        print(f"HF import error: {e}")
+        return {'success': False, 'error': str(e), 'added': 0, 'skipped': 0}
+    finally:
+        release_db(conn)
+    
+    # Update offset
+    new_offset = offset + len(rows)
+    if new_offset >= total: new_offset = 0  # wrap when exhausted
+    set_hf_offset(user_email, new_offset)
+    
+    # Save import to history
+    conn = get_db()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("""INSERT INTO hf_imports (user_email, requested, added, skipped, offset_before, offset_after, domains)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (user_email, requested, added, skipped, offset, new_offset, '|||'.join(added_domains)))
+            cur.execute("""DELETE FROM hf_imports WHERE user_email = %s
+                AND id NOT IN (SELECT id FROM hf_imports WHERE user_email = %s
+                ORDER BY created_at DESC LIMIT 3)""", (user_email, user_email))
+            conn.commit(); cur.close()
+        except Exception as e: print(f"save hf history: {e}")
+        finally: release_db(conn)
+    
+    return {
+        'success': True, 
+        'added': added, 
+        'skipped': skipped,
+        'offset_before': offset,
+        'offset_after': new_offset,
+        'total_available': total
+    }
+
+def get_hf_history(user_email):
+    conn = get_db()
+    if not conn: return []
+    try:
+        cur = conn.cursor()
+        cur.execute("""SELECT id, requested, added, skipped, offset_after, created_at
+            FROM hf_imports WHERE user_email = %s ORDER BY created_at DESC LIMIT 3""", (user_email,))
+        rows = cur.fetchall(); cur.close()
+        return [{'id': r[0], 'requested': r[1], 'added': r[2], 'skipped': r[3], 'offset': r[4], 'created_at': str(r[5])[:16]} for r in rows]
+    except: return []
+    finally: release_db(conn)
+
+def get_hf_import_detail(import_id, user_email):
+    conn = get_db()
+    if not conn: return []
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT domains FROM hf_imports WHERE id = %s AND user_email = %s", (import_id, user_email))
+        row = cur.fetchone(); cur.close()
+        return row[0].split('|||') if row and row[0] else []
+    except: return []
+    finally: release_db(conn)
+
+# ==========================================
+# QUEUE
 # ==========================================
 def add_to_queue(user_email, emails):
     conn = get_db()
     if not conn: return 0, 0
-    added = 0
-    skipped = 0
+    added = 0; skipped = 0
     try:
         cur = conn.cursor()
         for email in emails:
@@ -249,21 +396,16 @@ def add_to_queue(user_email, emails):
             if not domain: continue
             cur.execute("SELECT id FROM sent_log WHERE user_email = %s AND email = %s", (user_email, email))
             if cur.fetchone():
-                skipped += 1
-                continue
+                skipped += 1; continue
             try:
                 cur.execute("""INSERT INTO audit_queue (user_email, email, domain, status)
-                    VALUES (%s, %s, %s, 'pending')
-                    ON CONFLICT (user_email, email) DO NOTHING""",
+                    VALUES (%s, %s, %s, 'pending') ON CONFLICT (user_email, email) DO NOTHING""",
                     (user_email, email, domain))
-                if cur.rowcount > 0:
-                    added += 1
+                if cur.rowcount > 0: added += 1
             except: pass
         conn.commit(); cur.close()
-    except Exception as e:
-        print(f"add_to_queue: {e}")
-    finally:
-        release_db(conn)
+    except Exception as e: print(f"add_to_queue: {e}")
+    finally: release_db(conn)
     return added, skipped
 
 def get_queue(user_email):
@@ -278,12 +420,7 @@ def get_queue(user_email):
         rows = cur.fetchall(); cur.close()
         results = []
         for r in rows:
-            has_report = bool(r[4])
-            results.append({
-                'id': r[0], 'email': r[1], 'domain': r[2], 'status': r[3],
-                'has_report': has_report,
-                'subject': r[5] or '', 'message': r[6] or ''
-            })
+            results.append({'id': r[0], 'email': r[1], 'domain': r[2], 'status': r[3], 'has_report': bool(r[4]), 'subject': r[5] or '', 'message': r[6] or ''})
         return results
     except: return []
     finally: release_db(conn)
@@ -350,8 +487,7 @@ def get_next_pending_item(user_email):
     try:
         cur = conn.cursor()
         cur.execute("""SELECT id, email, domain, status, report, subject, message FROM audit_queue
-            WHERE user_email = %s AND status = 'pending'
-            ORDER BY added_at ASC LIMIT 1""", (user_email,))
+            WHERE user_email = %s AND status = 'pending' ORDER BY added_at ASC LIMIT 1""", (user_email,))
         row = cur.fetchone(); cur.close()
         if not row: return None
         report = None
@@ -378,8 +514,7 @@ def save_email_scan(user_email, results, store_count):
             VALUES (%s, %s, %s, %s, %s)""",
             (user_email, json.dumps(results), ','.join(flat_emails), total_emails, store_count))
         cur.execute("""DELETE FROM email_scans WHERE user_email = %s
-            AND id NOT IN (SELECT id FROM email_scans WHERE user_email = %s
-            ORDER BY created_at DESC LIMIT 3)""", (user_email, user_email))
+            AND id NOT IN (SELECT id FROM email_scans WHERE user_email = %s ORDER BY created_at DESC LIMIT 3)""", (user_email, user_email))
         conn.commit(); cur.close()
     except Exception as e: print(f"save_email_scan: {e}")
     finally: release_db(conn)
@@ -389,8 +524,7 @@ def get_email_scans(user_email):
     if not conn: return []
     try:
         cur = conn.cursor()
-        cur.execute("""SELECT id, email_count, store_count, created_at
-            FROM email_scans WHERE user_email = %s ORDER BY created_at DESC LIMIT 3""", (user_email,))
+        cur.execute("SELECT id, email_count, store_count, created_at FROM email_scans WHERE user_email = %s ORDER BY created_at DESC LIMIT 3", (user_email,))
         rows = cur.fetchall(); cur.close()
         return [{'id': r[0], 'count': r[1], 'stores': r[2], 'created_at': str(r[3])[:16]} for r in rows]
     except: return []
@@ -407,8 +541,7 @@ def get_email_scan_detail(scan_id, user_email):
         if row[0]:
             try:
                 parsed = json.loads(row[0]) if isinstance(row[0], str) else row[0]
-                if parsed and len(parsed) > 0:
-                    return parsed
+                if parsed and len(parsed) > 0: return parsed
             except: pass
         if row[1]:
             flat = row[1].split(',') if isinstance(row[1], str) else row[1]
@@ -427,26 +560,9 @@ def save_audit_history(user_email, domain, report):
         cur = conn.cursor()
         cur.execute("INSERT INTO audit_history (user_email, domain, report) VALUES (%s, %s, %s)", (user_email, domain, json.dumps(report)))
         cur.execute("""DELETE FROM audit_history WHERE user_email = %s
-            AND id NOT IN (SELECT id FROM audit_history WHERE user_email = %s
-            ORDER BY created_at DESC LIMIT 3)""", (user_email, user_email))
+            AND id NOT IN (SELECT id FROM audit_history WHERE user_email = %s ORDER BY created_at DESC LIMIT 3)""", (user_email, user_email))
         conn.commit(); cur.close()
     except: pass
-    finally: release_db(conn)
-
-def get_audit_history(user_email):
-    conn = get_db()
-    if not conn: return []
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT id, domain, report, created_at FROM audit_history WHERE user_email = %s ORDER BY created_at DESC LIMIT 3", (user_email,))
-        rows = cur.fetchall(); cur.close()
-        results = []
-        for r in rows:
-            try: score = json.loads(r[2]).get('scores', {}).get('overall_score', 0) if r[2] else 0
-            except: score = 0
-            results.append({'id': r[0], 'domain': r[1], 'score': score, 'created_at': str(r[3])[:16]})
-        return results
-    except: return []
     finally: release_db(conn)
 
 # ==========================================
@@ -667,7 +783,6 @@ def audit_store(domain, case_id):
     desc_match = re.search(r'<meta[^>]*name=["\']description["\'][^>]*content=["\'](.*?)["\']', html, re.IGNORECASE | re.DOTALL)
     page_title = title_match.group(1).strip() if title_match else ""
     page_desc = desc_match.group(1).strip() if desc_match else ""
-    report["checks"]["meta_title"] = page_title[:100] + ("..." if len(page_title) > 100 else "")
     report["checks"]["meta_title_length"] = len(page_title)
     report["checks"]["meta_description_length"] = len(page_desc)
     if len(page_title) == 0: report["issues"].append({"title": "Missing Page Title", "description": "No title tag.", "recommendation": "Add SEO title.", "severity": "high"})
@@ -881,9 +996,6 @@ def login():
 def logout():
     session.clear(); return redirect('/login')
 
-# ==========================================
-# SETTINGS
-# ==========================================
 @app.route('/settings', methods=['GET', 'POST'])
 @login_required
 def settings():
@@ -897,7 +1009,7 @@ def settings():
     body = f'''<div style="max-width:600px;margin:20px auto;padding:20px">
 <div style="background:#1f2937;color:white;padding:20px;border-radius:10px;margin-bottom:20px"><h1 style="margin:0">⚙️ Settings</h1></div>
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1)">
-<h3 style="margin-top:0">Your Name (used in generated emails)</h3>
+<h3 style="margin-top:0">Your Name</h3>
 <form method="POST">
 <input type="text" name="sender_name" placeholder="e.g. Daniel Phillips" value="{current_name}" style="width:100%;padding:12px;border:2px solid #ddd;border-radius:8px;font-size:16px;box-sizing:border-box;margin-bottom:10px">
 <button type="submit" style="background:#0d9488;color:white;padding:12px 30px;border:none;border-radius:8px;cursor:pointer;font-size:16px;width:100%">Save</button>
@@ -907,16 +1019,17 @@ def settings():
     return render_page("Settings", body)
 
 # ==========================================
-# HOME
+# HOME (Email Finder)
 # ==========================================
 @app.route('/')
 @login_required
 def home():
+    preload = request.args.get('url', '')
     body = '''<div style="max-width:700px;margin:20px auto;padding:20px">
 <div style="background:white;padding:30px;border-radius:15px;box-shadow:0 4px 12px rgba(0,0,0,0.1);margin-bottom:20px">
 <h2 style="color:#333;margin-top:0">🔍 Email Finder</h2>
 <p style="color:#666">Paste up to <b>100 store URLs</b> (one per line).</p>
-<textarea id="urls" style="width:100%;height:180px;padding:12px;border:2px solid #ddd;border-radius:8px;font-size:14px;font-family:monospace;box-sizing:border-box" placeholder="deluxura.shop&#10;hipchik.com"></textarea>
+<textarea id="urls" style="width:100%;height:180px;padding:12px;border:2px solid #ddd;border-radius:8px;font-size:14px;font-family:monospace;box-sizing:border-box" placeholder="deluxura.shop&#10;hipchik.com">''' + preload.replace('<','&lt;') + '''</textarea>
 <button onclick="findBulkEmails()" style="background:#667eea;color:white;padding:12px;border:none;border-radius:8px;cursor:pointer;font-size:16px;width:100%;margin:10px 0">Search All URLs</button>
 <div id="result" style="margin-top:20px;background:#f8f9fa;padding:15px;border-radius:8px;min-height:40px"></div>
 </div>
@@ -978,27 +1091,121 @@ window.onload=loadHistory;
     return render_page("Finder", body)
 
 # ==========================================
-# DISCOVERY
+# STORE DISCOVERY (with HF Import)
 # ==========================================
 @app.route('/discover')
 @login_required
 def discover_page():
+    user_email = session.get('user_id')
+    hf_offset = get_hf_offset(user_email)
     body = '''<div style="max-width:900px;margin:20px auto;padding:20px">
 <div style="background:#8b5cf6;color:white;padding:20px;border-radius:10px;margin-bottom:20px"><h1 style="margin:0">🎯 Store Discovery</h1></div>
+
+<div style="background:linear-gradient(135deg,#ff7e5f,#feb47b);color:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
+<h3 style="margin-top:0">📦 Import from Hugging Face Dataset</h3>
+<p style="font-size:14px;margin:5px 0">10,000 real Shopify stores. Enter how many to import.</p>
+<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px">
+<input type="number" id="hfCount" value="200" min="10" max="1000" style="padding:10px;border:none;border-radius:5px;font-size:15px;width:120px;box-sizing:border-box">
+<button onclick="importFromHF()" style="background:white;color:#e85d3a;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;font-size:15px;font-weight:bold">🔍 Import Now</button>
+</div>
+<div style="font-size:12px;margin-top:8px;opacity:0.9">Current offset: <span id="currentOffset">''' + str(hf_offset) + '''</span> / 10000</div>
+<div id="hfStatus" style="margin-top:10px"></div>
+</div>
+
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
+<h3 style="margin-top:0">📋 Last 3 Hugging Face Imports</h3>
+<div id="hfHistory">Loading...</div>
+</div>
+
+<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
+<h3 style="margin-top:0">🔎 Other Discovery Methods</h3>
 <button onclick="runDiscovery('shodan')" style="background:#8b5cf6;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">🔍 Shodan</button>
 <button onclick="runDiscovery('theme')" style="background:#ec4899;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">🎨 Theme</button>
 <button onclick="runDiscovery('search')" style="background:#3b82f6;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">🌐 Search</button>
 <button onclick="runDiscovery('related')" style="background:#f59e0b;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">📚 Related</button>
-<button onclick="runDiscovery('all')" style="background:#0d9488;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">⚡ All</button>
 <div id="discoveryStatus" style="margin-top:12px"></div>
 </div>
+
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1)">
-<h3 style="margin-top:0">📋 Discovered (<span id="storeCount">0</span>)</h3>
+<h3 style="margin-top:0">📋 Discovered Stores (<span id="storeCount">0</span>)</h3>
 <div id="storeList">Loading...</div>
+<button onclick="sendToFinder()" style="background:#667eea;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;font-size:14px;margin-top:10px;margin-right:8px">📧 Send All to Email Finder</button>
 <button onclick="clearStores()" style="background:#ef4444;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px;margin-top:10px">🗑️ Clear</button>
-</div></div>
+</div>
+</div>
 <script>
+async function importFromHF(){
+  const count = parseInt(document.getElementById('hfCount').value) || 200;
+  if(count < 10 || count > 1000){ alert('Enter 10-1000'); return; }
+  const status = document.getElementById('hfStatus');
+  status.innerHTML = '<p style="color:white">⏳ Importing '+count+' stores from Hugging Face...</p>';
+  try{
+    const res = await fetch('/import-from-huggingface', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({count: count})
+    });
+    const data = await res.json();
+    if(data.success){
+      status.innerHTML = '<p style="color:white">✅ Imported '+data.added+' new stores (skipped '+data.skipped+' already known) · New offset: '+data.offset_after+'</p>';
+      document.getElementById('currentOffset').textContent = data.offset_after;
+      loadStores(); loadHFHistory();
+    } else {
+      status.innerHTML = '<p style="color:white">Error: '+(data.error||'Unknown')+'</p>';
+    }
+  }catch(e){ status.innerHTML = '<p style="color:white">Error: '+e.message+'</p>'; }
+}
+
+async function loadHFHistory(){
+  try{
+    const res = await fetch('/get-hf-history');
+    const data = await res.json();
+    const c = document.getElementById('hfHistory');
+    if(!data.history || data.history.length===0){ c.innerHTML='<p style="color:#666">No imports yet.</p>'; return; }
+    let html = '';
+    data.history.forEach(h=>{
+      html += '<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid #ff7e5f">';
+      html += '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
+      html += '<div><b>'+h.added+' new stores</b> (skipped '+h.skipped+')<br><span style="font-size:12px;color:#666">'+h.created_at+' · offset now '+h.offset+'</span></div>';
+      html += '<button onclick="viewHFImport('+h.id+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">View</button>';
+      html += '</div><div id="hf-'+h.id+'" style="margin-top:10px"></div></div>';
+    });
+    c.innerHTML = html;
+  }catch(e){ console.error(e); }
+}
+
+async function viewHFImport(id){
+  const res = await fetch('/get-hf-import/'+id);
+  const data = await res.json();
+  const c = document.getElementById('hf-'+id);
+  if(!data.domains || data.domains.length===0){ c.innerHTML='<p style="color:#666">No domains.</p>'; return; }
+  let html = '<div style="background:white;padding:10px;border-radius:6px;max-height:250px;overflow-y:auto;font-size:12px;word-break:break-all">';
+  data.domains.forEach(d=>{ html += '<div style="padding:3px 0">• <a href="https://'+d+'" target="_blank" style="color:#3b82f6">'+d+'</a></div>'; });
+  html += '</div>';
+  c.innerHTML = html;
+}
+
+async function loadStores(){
+  const res=await fetch('/get-discovered');const data=await res.json();
+  document.getElementById('storeCount').textContent=data.stores.length;
+  const c=document.getElementById('storeList');
+  if(data.stores.length===0){c.innerHTML='<p style="color:#666">No stores yet.</p>';return}
+  let html='';
+  data.stores.slice(0,50).forEach(s=>{
+    html+='<div style="background:#f9f9f9;padding:10px;border-radius:6px;margin:6px 0;border-left:4px solid #8b5cf6">';
+    html+='<b><a href="https://'+s.domain+'" target="_blank" style="color:#3b82f6">'+s.domain+'</a></b> <span style="font-size:11px;color:#666">('+s.source+')</span></div>';
+  });
+  if(data.stores.length > 50){ html += '<p style="color:#666;font-size:13px">... and '+(data.stores.length-50)+' more</p>'; }
+  c.innerHTML=html;
+}
+
+async function sendToFinder(){
+  const res = await fetch('/get-discovered');
+  const data = await res.json();
+  if(!data.stores || data.stores.length===0){ alert('No stores'); return; }
+  const domains = data.stores.map(s=>s.domain).slice(0,100);
+  window.location.href = '/?url=' + encodeURIComponent(domains.join('\\n'));
+}
+
 async function runDiscovery(method){
   const status=document.getElementById('discoveryStatus');
   status.innerHTML='<p style="color:#666">⏳ Running '+method+'...</p>';
@@ -1011,24 +1218,36 @@ async function runDiscovery(method){
     } else { status.innerHTML='<p style="color:red">Error: '+(data.error||'Unknown')+'</p>'; }
   }catch(e){status.innerHTML='<p style="color:red">Error: '+e+'</p>'}
 }
-async function loadStores(){
-  const res=await fetch('/get-discovered');const data=await res.json();
-  document.getElementById('storeCount').textContent=data.stores.length;
-  const c=document.getElementById('storeList');
-  if(data.stores.length===0){c.innerHTML='<p style="color:#666">No stores yet.</p>';return}
-  let html='';
-  data.stores.forEach(s=>{
-    html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid #8b5cf6;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
-    html+='<div><b><a href="https://'+s.domain+'" target="_blank" style="color:#3b82f6">'+s.domain+'</a></b><br><span style="font-size:12px;color:#666">'+s.source+' · '+s.discovered_at+'</span></div>';
-    html+='<div><button onclick="actAudit(\\''+s.domain+'\\')" style="background:#65a30d;color:white;padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">🛡️</button></div></div>';
-  });
-  c.innerHTML=html;
-}
-function actAudit(d){window.location.href='/audit?url='+encodeURIComponent(d)}
-async function clearStores(){if(!confirm('Delete all?'))return;await fetch('/clear-discovered',{method:'POST'});loadStores()}
-window.onload=loadStores;
+
+async function clearStores(){if(!confirm('Delete all discovered stores?'))return;await fetch('/clear-discovered',{method:'POST'});loadStores()}
+window.onload = function(){ loadStores(); loadHFHistory(); };
 </script>'''
     return render_page("Store Discovery", body)
+
+# ==========================================
+# DISCOVERY API
+# ==========================================
+@app.route('/import-from-huggingface', methods=['POST'])
+@login_required
+def import_from_hf():
+    user_email = session.get('user_id')
+    count = int(request.json.get('count', 200))
+    if count < 10: count = 10
+    if count > 1000: count = 1000
+    result = do_hf_import(user_email, count)
+    return jsonify(result)
+
+@app.route('/get-hf-history')
+@login_required
+def get_hf_history_route():
+    user_email = session.get('user_id')
+    return jsonify({'history': get_hf_history(user_email)})
+
+@app.route('/get-hf-import/<int:import_id>')
+@login_required
+def get_hf_import_detail_route(import_id):
+    user_email = session.get('user_id')
+    return jsonify({'domains': get_hf_import_detail(import_id, user_email)})
 
 @app.route('/run-discovery', methods=['POST'])
 @login_required
@@ -1052,34 +1271,6 @@ def run_discovery():
         return jsonify({'success': True, 'found': len(found_list), 'saved': saved, 'by_method': by_method})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
-
-@app.route('/get-discovered')
-@login_required
-def get_discovered():
-    user_email = session.get('user_id')
-    conn = get_db()
-    if not conn: return jsonify({'stores': []})
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT domain, source, discovered_at FROM discovered_stores WHERE user_email = %s ORDER BY discovered_at DESC LIMIT 500", (user_email,))
-        rows = cur.fetchall(); cur.close()
-        return jsonify({'stores': [{'domain': r[0], 'source': r[1], 'discovered_at': str(r[2])[:16]} for r in rows]})
-    except: return jsonify({'stores': []})
-    finally: release_db(conn)
-
-@app.route('/clear-discovered', methods=['POST'])
-@login_required
-def clear_discovered():
-    user_email = session.get('user_id')
-    conn = get_db()
-    if not conn: return jsonify({'success': False})
-    try:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM discovered_stores WHERE user_email = %s", (user_email,))
-        conn.commit(); cur.close()
-        return jsonify({'success': True})
-    except: return jsonify({'success': False})
-    finally: release_db(conn)
 
 def discover_via_shodan(limit=5):
     discovered = []; seen_roots = set()
@@ -1134,21 +1325,6 @@ def discover_via_search(keyword=''):
                 seen_roots.add(root)
                 discovered.append({'domain': root, 'source': 'search'})
     except: pass
-    if not discovered:
-        try:
-            query = f'"Powered by Shopify" {keyword}'.strip()
-            url = f"https://www.bing.com/search?q={requests.utils.quote(query)}"
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-            r = requests.get(url, headers=headers, timeout=15)
-            if r.status_code == 200:
-                for link in re.findall(r'<a href="(https?://[^"]+)"', r.text)[:30]:
-                    clean = link.replace("https://", "").replace("http://", "").split("/")[0]
-                    root = root_domain(clean)
-                    if "bing.com" in root or "microsoft" in root or "shopify.com" in root: continue
-                    if root in seen_roots: continue
-                    seen_roots.add(root)
-                    discovered.append({'domain': root, 'source': 'search'})
-        except: pass
     return discovered
 
 def discover_via_related(user_email):
@@ -1192,6 +1368,34 @@ def save_discovered(user_email, stores):
     except: pass
     finally: release_db(conn)
     return saved
+
+@app.route('/get-discovered')
+@login_required
+def get_discovered():
+    user_email = session.get('user_id')
+    conn = get_db()
+    if not conn: return jsonify({'stores': []})
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT domain, source, discovered_at FROM discovered_stores WHERE user_email = %s ORDER BY discovered_at DESC LIMIT 500", (user_email,))
+        rows = cur.fetchall(); cur.close()
+        return jsonify({'stores': [{'domain': r[0], 'source': r[1], 'discovered_at': str(r[2])[:16]} for r in rows]})
+    except: return jsonify({'stores': []})
+    finally: release_db(conn)
+
+@app.route('/clear-discovered', methods=['POST'])
+@login_required
+def clear_discovered():
+    user_email = session.get('user_id')
+    conn = get_db()
+    if not conn: return jsonify({'success': False})
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM discovered_stores WHERE user_email = %s", (user_email,))
+        conn.commit(); cur.close()
+        return jsonify({'success': True})
+    except: return jsonify({'success': False})
+    finally: release_db(conn)
 
 # ==========================================
 # EMAIL SCAN API
@@ -1274,14 +1478,13 @@ document.addEventListener('visibilitychange',function(){if(document.visibilitySt
     return render_page("Scout", body)
 
 # ==========================================
-# ANALYZE & SEND (with FIXED Auto mode)
+# ANALYZE & SEND
 # ==========================================
 @app.route('/audit')
 @login_required
 def audit_page():
     user_email = session.get('user_id')
     sender_name = get_user_sender_name(user_email) or ''
-    preload = request.args.get('url', '')
     body = '''<div style="max-width:900px;margin:20px auto;padding:20px">
 
 <div style="background:#65a30d;color:white;padding:20px;border-radius:10px;margin-bottom:20px;display:flex;align-items:center;gap:16px">
@@ -1353,11 +1556,8 @@ let currentItem = null;
 let currentAuditReport = null;
 let autoMode = false;
 let autoTone = 'friendly';
-let pendingAction = false; // Guard against double-processing
+let pendingAction = false;
 
-// ============================================
-// QUEUE
-// ============================================
 async function loadQueue(){
   try{
     const res = await fetch('/get-audit-queue');
@@ -1398,10 +1598,7 @@ async function importFrom(source){
   const status = document.getElementById('importStatus');
   status.innerHTML = '<p style="color:#666">⏳ Importing...</p>';
   try{
-    const res = await fetch('/import-to-queue', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({source: source})
-    });
+    const res = await fetch('/import-to-queue', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({source: source})});
     const data = await res.json();
     if(data.success){
       status.innerHTML = '<p style="color:green">✅ Added '+data.added+' (skipped '+data.skipped+')</p>';
@@ -1410,10 +1607,7 @@ async function importFrom(source){
   }catch(e){ status.innerHTML = '<p style="color:red">Error: '+e.message+'</p>'; }
 }
 
-function toggleManual(){
-  const el = document.getElementById('manualPaste');
-  el.style.display = el.style.display === 'none' ? 'block' : 'none';
-}
+function toggleManual(){ const el = document.getElementById('manualPaste'); el.style.display = el.style.display === 'none' ? 'block' : 'none'; }
 async function addManual(){
   const text = document.getElementById('manualEmails').value;
   const emails = text.split('\\n').map(s=>s.trim()).filter(s=>s.includes('@'));
@@ -1426,27 +1620,10 @@ async function addManual(){
     loadQueue();
   }
 }
+async function clearQueue(){ if(!confirm('Clear all pending items?')) return; await fetch('/clear-queue', {method:'POST'}); loadQueue(); }
+async function skipItem(id){ await fetch('/update-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id, status:'skipped'})}); loadQueue(); if(autoMode) nextAuto(); }
+async function resetItem(id){ await fetch('/update-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id, status:'pending'})}); loadQueue(); }
 
-async function clearQueue(){
-  if(!confirm('Clear all pending items?')) return;
-  await fetch('/clear-queue', {method:'POST'});
-  loadQueue();
-}
-
-async function skipItem(id){
-  await fetch('/update-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id, status:'skipped'})});
-  loadQueue();
-  if(autoMode) nextAuto();
-}
-
-async function resetItem(id){
-  await fetch('/update-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id, status:'pending'})});
-  loadQueue();
-}
-
-// ============================================
-// ANALYZE
-// ============================================
 async function analyzeItem(id){
   document.getElementById('auditSection').style.display = 'block';
   document.getElementById('auditResult').innerHTML = '<p style="color:#666;padding:20px;text-align:center">⏳ Running audit... 30-45 seconds</p>';
@@ -1462,16 +1639,11 @@ async function analyzeItem(id){
       document.getElementById('currentEmailLabel').textContent = '📧 ' + currentItem.email + '  →  ' + currentItem.domain;
       renderReport(data.item.report);
       document.getElementById('outreachSection').style.display = 'block';
-      // Auto-generate email with the chosen tone
       await generateEmail(autoTone);
       loadQueue();
-      // If in auto mode, auto-proceed after a short delay
       if(autoMode && !pendingAction){
         pendingAction = true;
-        setTimeout(async()=>{
-          pendingAction = false;
-          await autoSend();
-        }, 1500);
+        setTimeout(async()=>{ pendingAction = false; await autoSend(); }, 1500);
       }
     } else {
       document.getElementById('auditResult').innerHTML = '<p style="color:red">Error: '+(data.error||'Unknown')+'</p>';
@@ -1498,17 +1670,11 @@ function renderReport(r){
   document.getElementById('auditResult').innerHTML=h;
 }
 
-// ============================================
-// EMAIL GEN
-// ============================================
 async function generateEmail(tone){
   if(!currentAuditReport){ return; }
   const senderName = document.getElementById('senderName').value.trim();
   try{
-    const res = await fetch('/generate-email', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({report: currentAuditReport, tone: tone, sender_name: senderName})
-    });
+    const res = await fetch('/generate-email', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({report: currentAuditReport, tone: tone, sender_name: senderName})});
     const data = await res.json();
     if(data.success){
       document.getElementById('genSubject').value = data.subject;
@@ -1521,25 +1687,18 @@ async function generateEmail(tone){
   }catch(e){ console.error(e); }
 }
 
-async function regenerateEmail(tone){
-  autoTone = tone;
-  await generateEmail(tone);
-}
+async function regenerateEmail(tone){ autoTone = tone; await generateEmail(tone); }
 
 async function sendToScoutAndOpen(){
   if(!currentItem){ alert('No active item'); return; }
   const subj = document.getElementById('genSubject').value;
   const body = document.getElementById('genBody').value;
   if(!subj || !body){ alert('Generate email first'); return; }
-  // Save subject + message
   await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentItem.id, subject:subj, message:body})});
-  // Add to Scout
   await fetch('/save-scout-recipients', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [currentItem.email]})});
   await fetch('/save-scout-state', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [currentItem.email], subject:subj, message:body, count:0})});
-  // Mark done + sent
   await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentItem.id, status:'done'})});
   await fetch('/mark-sent', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({email: currentItem.email})});
-  // Open Gmail
   const mailto = 'mailto:' + currentItem.email + '?subject=' + encodeURIComponent(subj) + '&body=' + encodeURIComponent(body);
   window.location.href = mailto;
 }
@@ -1553,9 +1712,6 @@ async function skipCurrent(){
   if(autoMode) nextAuto();
 }
 
-// ============================================
-// AUTO MODE (FULLY AUTOMATED)
-// ============================================
 async function startManualMode(){
   autoMode = false;
   document.getElementById('modeStatus').innerHTML = '<p style="color:blue">▶️ Manual mode: click each email to analyze</p>';
@@ -1568,7 +1724,7 @@ async function startAutoMode(){
   else if(tone === '3') autoTone = 'casual';
   else autoTone = 'friendly';
   autoMode = true;
-  document.getElementById('modeStatus').innerHTML = '<p style="color:green">⚡ Auto mode ON ('+autoTone+') — processing queue</p>';
+  document.getElementById('modeStatus').innerHTML = '<p style="color:green">⚡ Auto mode ON ('+autoTone+')</p>';
   document.getElementById('stopBtn').style.display = 'inline-block';
   nextAuto();
 }
@@ -1596,39 +1752,32 @@ async function nextAuto(){
   }catch(e){ console.error(e); if(autoMode) setTimeout(nextAuto, 3000); }
 }
 
-// The KEY fix: autoSend for auto mode
 async function autoSend(){
   if(!autoMode) return;
   if(!currentItem) { nextAuto(); return; }
   const subj = document.getElementById('genSubject').value;
   const body = document.getElementById('genBody').value;
   if(!subj || !body){
-    // Skip on failure
     await fetch('/update-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentItem.id, status:'skipped'})});
     nextAuto();
     return;
   }
-  // Save + mark done + open Gmail
   await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentItem.id, subject:subj, message:body})});
   await fetch('/save-scout-recipients', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [currentItem.email]})});
   await fetch('/save-scout-state', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [currentItem.email], subject:subj, message:body, count:0})});
   await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentItem.id, status:'done'})});
   await fetch('/mark-sent', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({email: currentItem.email})});
   loadQueue();
-  // Open Gmail
   const mailto = 'mailto:' + currentItem.email + '?subject=' + encodeURIComponent(subj) + '&body=' + encodeURIComponent(body);
-  // Store the id we just sent so we know when user comes back
   localStorage.setItem('lastAutoSentId', currentItem.id.toString());
   window.location.href = mailto;
 }
 
-// When user returns to the app after Gmail, advance to next email
 document.addEventListener('visibilitychange', function(){
   if(document.visibilityState === 'visible' && autoMode){
     const lastSent = localStorage.getItem('lastAutoSentId');
     if(lastSent){
       localStorage.removeItem('lastAutoSentId');
-      // User came back from Gmail — advance to next
       currentItem = null;
       setTimeout(nextAuto, 1500);
     }
@@ -1673,8 +1822,7 @@ def import_to_queue():
                     finally: release_db(conn)
         else:
             return jsonify({'success': False, 'error': 'Unknown source'})
-        if not emails:
-            return jsonify({'success': False, 'error': 'No emails available'})
+        if not emails: return jsonify({'success': False, 'error': 'No emails available'})
         added, skipped = add_to_queue(user_email, emails)
         return jsonify({'success': True, 'added': added, 'skipped': skipped})
     except Exception as e:
