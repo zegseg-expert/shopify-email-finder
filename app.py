@@ -24,6 +24,11 @@ HF_DATASET = "snncn/shopify-websites"
 SHOPIFY_IPS = ["23.227.38.32","23.227.38.36","23.227.38.65","23.227.38.66","23.227.38.67","23.227.38.68","23.227.38.69","23.227.38.70","23.227.38.71","23.227.38.72","23.227.38.73","23.227.38.74","23.227.39.20"]
 
 # ==========================================
+# MEMORY FIX: Reduced worker count
+# ==========================================
+MAX_WORKERS = 10  # Was 20 - reduces memory usage by ~50%
+
+# ==========================================
 # DB POOL
 # ==========================================
 _db_pool = None
@@ -32,7 +37,7 @@ def init_pool():
     global _db_pool
     if not DATABASE_URL: return
     try:
-        _db_pool = pool.SimpleConnectionPool(1, 10, DATABASE_URL, sslmode='require')
+        _db_pool = pool.SimpleConnectionPool(1, 5, DATABASE_URL, sslmode='require')
         print("✅ Pool ready")
     except Exception as e:
         print(f"⚠️ Pool: {e}")
@@ -131,6 +136,15 @@ def init_db():
             offset_after INTEGER DEFAULT 0,
             domains TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        # NEW: Email Finder background jobs
+        cur.execute("""CREATE TABLE IF NOT EXISTS email_finder_jobs (
+            id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
+            total INTEGER DEFAULT 0, processed INTEGER DEFAULT 0,
+            emails_found INTEGER DEFAULT 0, stores_with_email INTEGER DEFAULT 0,
+            results TEXT, remaining_urls TEXT,
+            status VARCHAR(50) DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
         conn.commit(); cur.close()
         print("✅ DB ready")
     except Exception as e: print(f"❌ DB: {e}")
@@ -266,6 +280,121 @@ def load_user_state(user_email):
     finally: release_db(conn)
 
 # ==========================================
+# EMAIL FINDER BACKGROUND JOBS
+# ==========================================
+def background_email_finder_worker(job_id):
+    """Runs in background thread - processes URLs and saves results"""
+    print(f"📧 Email Finder Job #{job_id} started")
+    conn = get_db()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT remaining_urls, results, total, user_email FROM email_finder_jobs WHERE id = %s", (job_id,))
+        row = cur.fetchone(); cur.close()
+        if not row: return
+        remaining = row[0].split('|||') if row[0] else []
+        results_json = row[1] or '[]'
+        try: results = json.loads(results_json)
+        except: results = []
+        user_email = row[3]
+    finally: release_db(conn)
+
+    CHUNK_SIZE = 5  # Process 5 URLs at a time to control memory
+    while remaining:
+        # Check if cancelled
+        conn = get_db()
+        if not conn: break
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT status FROM email_finder_jobs WHERE id = %s", (job_id,))
+            sr = cur.fetchone(); cur.close()
+            if not sr or sr[0] == 'cancelled':
+                print(f"⏹️ Email Finder Job #{job_id} cancelled")
+                return
+        finally: release_db(conn)
+
+        chunk = remaining[:CHUNK_SIZE]
+        remaining = remaining[CHUNK_SIZE:]
+
+        # Process chunk with limited workers
+        chunk_results = []
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = {ex.submit(find_emails, url): url for url in chunk}
+            for f in as_completed(futures):
+                url = futures[f]
+                try:
+                    emails = f.result()
+                    if emails:
+                        chunk_results.append({'store': url, 'emails': emails})
+                except: pass
+
+        # Merge with existing results
+        results.extend(chunk_results)
+        total_emails = sum(len(r.get('emails', [])) for r in results)
+
+        # Save progress after each chunk
+        conn = get_db()
+        if not conn: break
+        try:
+            cur = conn.cursor()
+            new_status = 'completed' if not remaining else 'running'
+            cur.execute("""UPDATE email_finder_jobs SET processed=%s, emails_found=%s,
+                stores_with_email=%s, results=%s, remaining_urls=%s, status=%s, updated_at=NOW()
+                WHERE id=%s""",
+                (len(results) + (len(chunk) - len(chunk_results)) if False else 0,  # dummy
+                 total_emails, len(results), json.dumps(results), '|||'.join(remaining), new_status, job_id))
+            conn.commit(); cur.close()
+        finally: release_db(conn)
+
+    # Final save - mark completed
+    conn = get_db()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("""UPDATE email_finder_jobs SET status='completed', updated_at=NOW() WHERE id=%s""", (job_id,))
+            conn.commit(); cur.close()
+        except: pass
+        finally: release_db(conn)
+
+    # Also save the found emails to user_state for "From Finder" on other pages
+    if user_email:
+        all_emails = []
+        for r in results:
+            all_emails.extend(r.get('emails', []))
+        if all_emails:
+            save_user_state(user_email, found_emails='|||'.join(all_emails))
+
+    print(f"✅ Email Finder Job #{job_id} complete")
+
+def get_email_finder_jobs(user_email):
+    conn = get_db()
+    if not conn: return []
+    try:
+        cur = conn.cursor()
+        cur.execute("""SELECT id, total, emails_found, stores_with_email, status, created_at
+            FROM email_finder_jobs WHERE user_email = %s ORDER BY created_at DESC LIMIT 3""", (user_email,))
+        rows = cur.fetchall(); cur.close()
+        return [{'id': r[0], 'total': r[1], 'emails': r[2], 'stores': r[3], 'status': r[4], 'created_at': str(r[5])[:16]} for r in rows]
+    except: return []
+    finally: release_db(conn)
+
+def get_email_finder_job_detail(job_id, user_email):
+    conn = get_db()
+    if not conn: return None
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT results, status, total FROM email_finder_jobs WHERE id = %s AND user_email = %s", (job_id, user_email))
+        row = cur.fetchone(); cur.close()
+        if not row: return None
+        results = []
+        if row[0]:
+            try: results = json.loads(row[0])
+            except: results = []
+        return {'results': results, 'status': row[1], 'total': row[2]}
+    except: return None
+    finally: release_db(conn)
+
+# ==========================================
 # HUGGING FACE IMPORT
 # ==========================================
 def fetch_hf_batch(offset, length):
@@ -358,18 +487,6 @@ def get_hf_import_detail(import_id, user_email):
         cur.execute("SELECT domains FROM hf_imports WHERE id = %s AND user_email = %s", (import_id, user_email))
         row = cur.fetchone(); cur.close()
         return row[0].split('|||') if row and row[0] else []
-    except: return []
-    finally: release_db(conn)
-
-def get_all_discovered_domains(user_email):
-    """Get ALL discovered stores for a user (for Email Finder import)"""
-    conn = get_db()
-    if not conn: return []
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT domain FROM discovered_stores WHERE user_email = %s ORDER BY discovered_at DESC", (user_email,))
-        rows = cur.fetchall(); cur.close()
-        return [r[0] for r in rows]
     except: return []
     finally: release_db(conn)
 
@@ -595,7 +712,7 @@ def background_verify_worker(job_id):
         finally: release_db(conn)
         chunk = remaining[:CHUNK_SIZE]
         remaining = remaining[CHUNK_SIZE:]
-        with ThreadPoolExecutor(max_workers=20) as ex:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futures = {ex.submit(verify_email, e): e for e in chunk}
             for f in as_completed(futures):
                 email, ok, reason = f.result()
@@ -686,8 +803,8 @@ def audit_store(domain, case_id):
             elif pc < 10: report["issues"].append({"title": f"Only {pc} Products", "description": "Few products.", "recommendation": "Aim for 20+.", "severity": "medium"})
             else: report["positives"].append(f"{pc}+ products")
             max_img_kb = 0
-            for p in products_data[:10]:
-                for img in p.get('images', [])[:3]:
+            for p in products_data[:5]:
+                for img in p.get('images', [])[:2]:
                     src = img.get('src', '')
                     if src:
                         try:
@@ -1002,7 +1119,7 @@ def settings():
     return render_page("Settings", body)
 
 # ==========================================
-# HOME (Email Finder) — with Import from Discovery
+# HOME (Email Finder - Background Jobs)
 # ==========================================
 @app.route('/')
 @login_required
@@ -1011,37 +1128,36 @@ def home():
     body = '''<div style="max-width:700px;margin:20px auto;padding:20px">
 <div style="background:white;padding:30px;border-radius:15px;box-shadow:0 4px 12px rgba(0,0,0,0.1);margin-bottom:20px">
 <h2 style="color:#333;margin-top:0">🔍 Email Finder</h2>
-<p style="color:#666">Paste up to <b>100 store URLs</b> (one per line).</p>
+<p style="color:#666">Paste up to <b>100 store URLs</b> (one per line). Search runs in background — you can close the browser.</p>
 <textarea id="urls" style="width:100%;height:180px;padding:12px;border:2px solid #ddd;border-radius:8px;font-size:14px;font-family:monospace;box-sizing:border-box" placeholder="deluxura.shop&#10;hipchik.com">''' + preload.replace('<','&lt;') + '''</textarea>
-<button onclick="findBulkEmails()" style="background:#667eea;color:white;padding:12px;border:none;border-radius:8px;cursor:pointer;font-size:16px;width:100%;margin:10px 0">Search All URLs</button>
+<button onclick="startBackgroundSearch()" style="background:#667eea;color:white;padding:12px;border:none;border-radius:8px;cursor:pointer;font-size:16px;width:100%;margin:10px 0">🚀 Search All URLs (Background)</button>
 <button onclick="importFromDiscovery()" style="background:#8b5cf6;color:white;padding:12px;border:none;border-radius:8px;cursor:pointer;font-size:16px;width:100%;margin-bottom:10px">📥 Import from Discovery</button>
 <div id="result" style="margin-top:20px;background:#f8f9fa;padding:15px;border-radius:8px;min-height:40px"></div>
 </div>
 <div style="background:white;padding:20px;border-radius:15px;box-shadow:0 4px 12px rgba(0,0,0,0.1)">
-<h3 style="margin-top:0;color:#333">📋 Last 3 Results</h3>
-<div id="historyList">Loading...</div>
+<h3 style="margin-top:0;color:#333">📋 Last 3 Jobs</h3>
+<div id="jobsList">Loading...</div>
 </div>
 </div>
 <script>
-async function findBulkEmails(){
+async function startBackgroundSearch(){
   const input=document.getElementById('urls').value;
   const result=document.getElementById('result');
   const stores=input.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);
   if(stores.length===0){alert('Enter URL');return}
-  result.innerHTML='<p style="color:#666">Searching '+stores.length+' stores...</p>';
+  if(stores.length > 100){alert('Max 100 URLs per job. Please split into batches.');return}
+  result.innerHTML='<p style="color:#666">⏳ Starting background job for '+stores.length+' URLs...</p>';
   try{
-    const res=await fetch('/bulk-email',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({stores:stores})});
+    const res=await fetch('/start-email-finder-job',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({urls: stores})});
     const data=await res.json();
     if(data.success){
-      let html='<h4 style="color:#155724">✅ '+data.results.length+' stores found:</h4>';
-      data.results.forEach(item=>{
-        html+='<div style="font-weight:bold;margin-top:15px">📦 <a href="https://'+item.store+'" target="_blank" style="color:#333;text-decoration:none">'+item.store+'</a>:</div>';
-        item.emails.forEach(e=>{html+='<div style="background:white;padding:8px;margin:5px 0;border-radius:5px;border-left:4px solid #667eea;font-weight:bold;word-break:break-all">📧 '+e+'</div>'});
-      });
-      result.innerHTML=html;
-      loadHistory();
-    } else { result.innerHTML='<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">No emails found</div>'; }
-  }catch(e){result.innerHTML='<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">Error: '+e+'</div>'}
+      result.innerHTML='<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:12px;border-radius:5px;color:#166534"><b>✅ Job #'+data.job_id+' started!</b><br>Processing '+stores.length+' URLs in the background.<br><br><b>You can close the browser now.</b><br>Come back later to see results.</div>';
+      document.getElementById('urls').value='';
+      loadJobs();
+    } else {
+      result.innerHTML='<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">Error: '+(data.error||'Unknown')+'</div>';
+    }
+  }catch(e){result.innerHTML='<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">Error: '+e.message+'</div>'}
 }
 
 async function importFromDiscovery(){
@@ -1054,67 +1170,132 @@ async function importFromDiscovery(){
       result.innerHTML = '<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">No discovered stores yet. Go to Store Discovery first.</div>';
       return;
     }
-    const domains = data.stores.map(s=>s.domain);
-    // Fill the textarea
+    const domains = data.stores.map(s=>s.domain).slice(0, 100);
     document.getElementById('urls').value = domains.join('\\n');
-    result.innerHTML = '<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:10px;border-radius:5px;color:#166534">✅ Loaded '+domains.length+' store URLs from Discovery. Click "Search All URLs" to find emails.</div>';
+    result.innerHTML = '<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:10px;border-radius:5px;color:#166534">✅ Loaded '+domains.length+' store URLs from Discovery. Click "Search All URLs (Background)" to find emails.</div>';
   }catch(e){
     result.innerHTML = '<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">Error: '+e.message+'</div>';
   }
 }
 
-async function loadHistory(){
-  const res=await fetch('/get-email-scans');const data=await res.json();
-  const c=document.getElementById('historyList');
-  if(!data.scans || data.scans.length===0){c.innerHTML='<p style="color:#666">No scans yet.</p>';return}
-  let html='';
-  data.scans.forEach(s=>{
-    html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid #667eea">';
-    html+='<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
-    html+='<div><b>'+s.count+' emails</b> from '+s.stores+' stores<br><span style="font-size:12px;color:#666">'+s.created_at+'</span></div>';
-    html+='<button id="scanbtn-'+s.id+'" onclick="toggleScanView('+s.id+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">View</button>';
-    html+='</div>';
-    html+='<div id="scan-'+s.id+'" style="display:none;margin-top:10px"></div>';
-    html+='</div>';
-  });
-  c.innerHTML=html;
+async function loadJobs(){
+  try{
+    const res = await fetch('/get-email-finder-jobs');
+    const data = await res.json();
+    const c = document.getElementById('jobsList');
+    if(!data.jobs || data.jobs.length === 0){ c.innerHTML = '<p style="color:#666">No jobs yet.</p>'; return; }
+    let html = '';
+    data.jobs.forEach(j => {
+      let color = '#f59e0b';
+      let icon = '🔄';
+      if(j.status === 'completed'){ color = '#16a34a'; icon = '✅'; }
+      else if(j.status === 'cancelled'){ color = '#ef4444'; icon = '⏹️'; }
+      html += '<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+color+'">';
+      html += '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
+      html += '<div><b>'+icon+' Job #'+j.id+'</b> — '+j.emails+' emails from '+j.stores+'/'+j.total+' stores<br><span style="font-size:12px;color:#666">'+j.created_at+'</span></div>';
+      html += '<div style="display:flex;gap:6px;flex-wrap:wrap">';
+      html += '<button onclick="viewJob('+j.id+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">View Results</button>';
+      if(j.status === 'completed' && j.emails > 0){
+        html += '<button onclick="sendJobToVerify('+j.id+')" style="background:#f59e0b;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">📨 Send to Verify</button>';
+      }
+      html += '</div></div>';
+      html += '<div id="job-'+j.id+'" style="display:none;margin-top:10px"></div>';
+      html += '</div>';
+    });
+    c.innerHTML = html;
+  }catch(e){ console.error(e); }
 }
-async function toggleScanView(id){
-  const c = document.getElementById('scan-'+id);
-  const btn = document.getElementById('scanbtn-'+id);
-  if(c.style.display === 'block'){
-    c.style.display = 'none';
-    btn.textContent = 'View';
-    btn.style.background = '#3b82f6';
-    return;
-  }
-  if(c.dataset.loaded !== '1'){
-    const res=await fetch('/get-email-scan/'+id);
-    const data=await res.json();
-    if(!data.results || data.results.length===0){
-      c.innerHTML='<p style="color:#666">No results.</p>';
-    } else {
-      let html='<div style="background:white;padding:10px;border-radius:6px;max-height:300px;overflow-y:auto;font-size:13px">';
-      data.results.forEach(r=>{
-        html+='<div style="padding:8px 0;border-bottom:1px solid #eee"><div style="font-weight:bold;margin-bottom:4px">📦 <a href="https://'+r.store+'" target="_blank" style="color:#3b82f6;text-decoration:none">'+r.store+'</a></div>';
-        (r.emails||[]).forEach(e=>{html+='<div style="padding-left:16px;color:#333;word-break:break-all">📧 '+e+'</div>'});
-        html+='</div>';
-      });
-      html+='</div>';
-      c.innerHTML = html;
-    }
-    c.dataset.loaded = '1';
-  }
+
+async function viewJob(id){
+  const c = document.getElementById('job-'+id);
+  if(c.style.display === 'block'){ c.style.display = 'none'; return; }
+  c.innerHTML = '<p style="color:#666">Loading...</p>';
   c.style.display = 'block';
-  btn.textContent = 'Hide';
-  btn.style.background = '#6b7280';
+  try{
+    const res = await fetch('/get-email-finder-job/'+id);
+    const data = await res.json();
+    if(!data.results || data.results.length === 0){
+      c.innerHTML = '<p style="color:#666">No results yet. Job may still be running.</p>';
+      return;
+    }
+    let html = '<div style="background:white;padding:10px;border-radius:6px;max-height:300px;overflow-y:auto;font-size:13px">';
+    data.results.forEach(r => {
+      html += '<div style="padding:8px 0;border-bottom:1px solid #eee"><div style="font-weight:bold;margin-bottom:4px">📦 <a href="https://'+r.store+'" target="_blank" style="color:#3b82f6">'+r.store+'</a></div>';
+      (r.emails||[]).forEach(e => { html += '<div style="padding-left:16px;color:#333;word-break:break-all">📧 '+e+'</div>'; });
+      html += '</div>';
+    });
+    html += '</div>';
+    c.innerHTML = html;
+  }catch(e){ c.innerHTML = '<p style="color:red">Error loading results</p>'; }
 }
-window.onload=loadHistory;
+
+async function sendJobToVerify(id){
+  try{
+    const res = await fetch('/get-email-finder-job/'+id);
+    const data = await res.json();
+    if(!data.results) return;
+    const allEmails = [];
+    data.results.forEach(r => { (r.emails||[]).forEach(e => allEmails.push(e)); });
+    if(allEmails.length === 0){ alert('No emails found in this job'); return; }
+    // Save to user_state so Verify can load from Finder
+    await fetch('/store-emails', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({emails: allEmails})});
+    alert('✅ '+allEmails.length+' emails saved. Go to Verify page and click "From Finder".');
+  }catch(e){ alert('Error: '+e.message); }
+}
+
+window.onload = function(){ loadJobs(); setInterval(loadJobs, 5000); };
 </script>'''
     return render_page("Finder", body)
 
 # ==========================================
-# STORE DISCOVERY — with per-history Send to Email Finder
+# EMAIL FINDER JOB API
+# ==========================================
+@app.route('/start-email-finder-job', methods=['POST'])
+@login_required
+def start_email_finder_job():
+    user_email = session.get('user_id')
+    urls = request.json.get('urls', [])
+    if not urls: return jsonify({'success': False, 'error': 'No URLs'})
+    if len(urls) > 100: urls = urls[:100]
+    conn = get_db()
+    if not conn: return jsonify({'success': False, 'error': 'No DB'})
+    try:
+        cur = conn.cursor()
+        cur.execute("""INSERT INTO email_finder_jobs (user_email, total, remaining_urls, results, status)
+            VALUES (%s, %s, %s, '[]', 'pending') RETURNING id""",
+            (user_email, len(urls), '|||'.join(urls)))
+        job_id = cur.fetchone()[0]
+        conn.commit(); cur.close()
+    finally: release_db(conn)
+    # Start background thread
+    thread = threading.Thread(target=background_email_finder_worker, args=(job_id,), daemon=True)
+    thread.start()
+    return jsonify({'success': True, 'job_id': job_id, 'total': len(urls)})
+
+@app.route('/get-email-finder-jobs')
+@login_required
+def get_email_finder_jobs_route():
+    user_email = session.get('user_id')
+    return jsonify({'jobs': get_email_finder_jobs(user_email)})
+
+@app.route('/get-email-finder-job/<int:job_id>')
+@login_required
+def get_email_finder_job_route(job_id):
+    user_email = session.get('user_id')
+    detail = get_email_finder_job_detail(job_id, user_email)
+    if not detail: return jsonify({'results': []})
+    return jsonify({'results': detail['results'], 'status': detail['status']})
+
+@app.route('/store-emails', methods=['POST'])
+@login_required
+def store_emails():
+    user_email = session.get('user_id')
+    emails = request.json.get('emails', [])
+    if user_email: save_user_state(user_email, found_emails='|||'.join(emails))
+    return jsonify({'success': True})
+
+# ==========================================
+# STORE DISCOVERY
 # ==========================================
 @app.route('/discover')
 @login_required
@@ -1226,8 +1407,7 @@ async function sendImportToFinder(id){
   const res = await fetch('/get-hf-import/'+id);
   const data = await res.json();
   if(!data.domains || data.domains.length === 0){ alert('No domains in this import'); return; }
-  const text = data.domains.slice(0, 100).join('\\n'); // Limit 100 per Finder
-  // Navigate to Finder with the domains preloaded via URL param
+  const text = data.domains.slice(0, 100).join('\\n');
   window.location.href = '/?url=' + encodeURIComponent(text);
 }
 
@@ -1443,21 +1623,6 @@ def clear_discovered():
         return jsonify({'success': True})
     except: return jsonify({'success': False})
     finally: release_db(conn)
-
-# ==========================================
-# EMAIL SCAN API
-# ==========================================
-@app.route('/get-email-scans')
-@login_required
-def get_email_scans_route():
-    user_email = session.get('user_id')
-    return jsonify({'scans': get_email_scans(user_email)})
-
-@app.route('/get-email-scan/<int:scan_id>')
-@login_required
-def get_email_scan_detail_route(scan_id):
-    user_email = session.get('user_id')
-    return jsonify({'results': get_email_scan_detail(scan_id, user_email)})
 
 # ==========================================
 # VERIFY PAGE
@@ -1989,26 +2154,6 @@ def verify_jobs_list():
         rows = cur.fetchall(); cur.close()
         return jsonify({'jobs': [{'id': r[0], 'name': r[1], 'total': r[2], 'processed': r[3], 'status': r[4], 'created_at': str(r[5]), 'valid': len(r[6].split('|||')) if r[6] else 0, 'invalid': len(r[7].split('|||')) if r[7] else 0} for r in rows]})
     finally: release_db(conn)
-
-@app.route('/bulk-email', methods=['POST'])
-@login_required
-def bulk_email():
-    stores = request.json.get('stores', [])[:100]
-    results = []
-    with ThreadPoolExecutor(max_workers=20) as ex:
-        futures = {ex.submit(find_emails, s.strip()): s for s in stores if '.' in s}
-        for f in as_completed(futures):
-            try:
-                emails = f.result()
-                if emails: results.append({'store': futures[f], 'emails': emails})
-            except: continue
-    user_email = session.get('user_id')
-    all_found = []
-    for r in results: all_found.extend(r['emails'])
-    if user_email:
-        save_user_state(user_email, found_emails='|||'.join(all_found))
-        save_email_scan(user_email, results, len(results))
-    return jsonify({'success': bool(results), 'results': results})
 
 @app.route('/get-stored-emails')
 @login_required
