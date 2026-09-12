@@ -361,6 +361,18 @@ def get_hf_import_detail(import_id, user_email):
     except: return []
     finally: release_db(conn)
 
+def get_all_discovered_domains(user_email):
+    """Get ALL discovered stores for a user (for Email Finder import)"""
+    conn = get_db()
+    if not conn: return []
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT domain FROM discovered_stores WHERE user_email = %s ORDER BY discovered_at DESC", (user_email,))
+        rows = cur.fetchall(); cur.close()
+        return [r[0] for r in rows]
+    except: return []
+    finally: release_db(conn)
+
 # ==========================================
 # QUEUE
 # ==========================================
@@ -990,7 +1002,7 @@ def settings():
     return render_page("Settings", body)
 
 # ==========================================
-# HOME (Email Finder) — with View/Hide toggle
+# HOME (Email Finder) — with Import from Discovery
 # ==========================================
 @app.route('/')
 @login_required
@@ -1002,6 +1014,7 @@ def home():
 <p style="color:#666">Paste up to <b>100 store URLs</b> (one per line).</p>
 <textarea id="urls" style="width:100%;height:180px;padding:12px;border:2px solid #ddd;border-radius:8px;font-size:14px;font-family:monospace;box-sizing:border-box" placeholder="deluxura.shop&#10;hipchik.com">''' + preload.replace('<','&lt;') + '''</textarea>
 <button onclick="findBulkEmails()" style="background:#667eea;color:white;padding:12px;border:none;border-radius:8px;cursor:pointer;font-size:16px;width:100%;margin:10px 0">Search All URLs</button>
+<button onclick="importFromDiscovery()" style="background:#8b5cf6;color:white;padding:12px;border:none;border-radius:8px;cursor:pointer;font-size:16px;width:100%;margin-bottom:10px">📥 Import from Discovery</button>
 <div id="result" style="margin-top:20px;background:#f8f9fa;padding:15px;border-radius:8px;min-height:40px"></div>
 </div>
 <div style="background:white;padding:20px;border-radius:15px;box-shadow:0 4px 12px rgba(0,0,0,0.1)">
@@ -1030,6 +1043,26 @@ async function findBulkEmails(){
     } else { result.innerHTML='<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">No emails found</div>'; }
   }catch(e){result.innerHTML='<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">Error: '+e+'</div>'}
 }
+
+async function importFromDiscovery(){
+  const result=document.getElementById('result');
+  result.innerHTML='<p style="color:#666">⏳ Loading discovered stores...</p>';
+  try{
+    const res = await fetch('/get-discovered');
+    const data = await res.json();
+    if(!data.stores || data.stores.length === 0){
+      result.innerHTML = '<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">No discovered stores yet. Go to Store Discovery first.</div>';
+      return;
+    }
+    const domains = data.stores.map(s=>s.domain);
+    // Fill the textarea
+    document.getElementById('urls').value = domains.join('\\n');
+    result.innerHTML = '<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:10px;border-radius:5px;color:#166534">✅ Loaded '+domains.length+' store URLs from Discovery. Click "Search All URLs" to find emails.</div>';
+  }catch(e){
+    result.innerHTML = '<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">Error: '+e.message+'</div>';
+  }
+}
+
 async function loadHistory(){
   const res=await fetch('/get-email-scans');const data=await res.json();
   const c=document.getElementById('historyList');
@@ -1055,7 +1088,6 @@ async function toggleScanView(id){
     btn.style.background = '#3b82f6';
     return;
   }
-  // Load if not loaded
   if(c.dataset.loaded !== '1'){
     const res=await fetch('/get-email-scan/'+id);
     const data=await res.json();
@@ -1082,7 +1114,7 @@ window.onload=loadHistory;
     return render_page("Finder", body)
 
 # ==========================================
-# STORE DISCOVERY — with View/Hide toggle
+# STORE DISCOVERY — with per-history Send to Email Finder
 # ==========================================
 @app.route('/discover')
 @login_required
@@ -1120,7 +1152,7 @@ def discover_page():
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1)">
 <h3 style="margin-top:0">📋 Discovered Stores (<span id="storeCount">0</span>)</h3>
 <div id="storeList">Loading...</div>
-<button onclick="sendToFinder()" style="background:#667eea;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;font-size:14px;margin-top:10px;margin-right:8px">📧 Send All to Email Finder</button>
+<button onclick="sendAllToFinder()" style="background:#667eea;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;font-size:14px;margin-top:10px;margin-right:8px">📧 Send All to Email Finder</button>
 <button onclick="clearStores()" style="background:#ef4444;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px;margin-top:10px">🗑️ Clear</button>
 </div>
 </div>
@@ -1154,8 +1186,10 @@ async function loadHFHistory(){
       html += '<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid #ff7e5f">';
       html += '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">';
       html += '<div><b>'+h.added+' new stores</b> (skipped '+h.skipped+')<br><span style="font-size:12px;color:#666">'+h.created_at+' · offset now '+h.offset+'</span></div>';
+      html += '<div style="display:flex;gap:6px;flex-wrap:wrap">';
       html += '<button id="hfbtn-'+h.id+'" onclick="toggleHFView('+h.id+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">View</button>';
-      html += '</div><div id="hf-'+h.id+'" style="display:none;margin-top:10px"></div></div>';
+      html += '<button onclick="sendImportToFinder('+h.id+')" style="background:#667eea;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">📧 Send to Finder</button>';
+      html += '</div></div><div id="hf-'+h.id+'" style="display:none;margin-top:10px"></div></div>';
     });
     c.innerHTML = html;
   }catch(e){ console.error(e); }
@@ -1188,6 +1222,15 @@ async function toggleHFView(id){
   btn.style.background = '#6b7280';
 }
 
+async function sendImportToFinder(id){
+  const res = await fetch('/get-hf-import/'+id);
+  const data = await res.json();
+  if(!data.domains || data.domains.length === 0){ alert('No domains in this import'); return; }
+  const text = data.domains.slice(0, 100).join('\\n'); // Limit 100 per Finder
+  // Navigate to Finder with the domains preloaded via URL param
+  window.location.href = '/?url=' + encodeURIComponent(text);
+}
+
 async function loadStores(){
   const res=await fetch('/get-discovered');const data=await res.json();
   document.getElementById('storeCount').textContent=data.stores.length;
@@ -1202,7 +1245,7 @@ async function loadStores(){
   c.innerHTML=html;
 }
 
-async function sendToFinder(){
+async function sendAllToFinder(){
   const res = await fetch('/get-discovered');
   const data = await res.json();
   if(!data.stores || data.stores.length===0){ alert('No stores'); return; }
