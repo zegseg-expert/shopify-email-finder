@@ -34,6 +34,15 @@ MAX_WORKERS = 10
 SEND_LIMIT = 70
 
 # ==========================================
+# PUBLIC EMAIL PROVIDERS (for brand fallback)
+# ==========================================
+PUBLIC_EMAIL_DOMAINS = {
+    'gmail.com','yahoo.com','hotmail.com','outlook.com','aol.com','icloud.com',
+    'live.com','msn.com','protonmail.com','proton.me','mail.com','yandex.com',
+    'zoho.com','gmx.com','gmx.net','me.com','mac.com','qq.com','163.com'
+}
+
+# ==========================================
 # DB POOL
 # ==========================================
 _db_pool = None
@@ -306,6 +315,26 @@ def load_user_state(user_email):
     except: return {}
     finally: release_db(conn)
 
+def load_found_pairs(user_email):
+    """Return a list of (email, store) tuples from found_emails.
+    Handles both new format 'email:::store' and old format 'email' (store inferred from email)."""
+    state = load_user_state(user_email)
+    pairs = []
+    for item in state.get('found_emails', []):
+        if not item: continue
+        if ':::' in item:
+            parts = item.split(':::', 1)
+            email = parts[0].strip()
+            store = parts[1].strip() if len(parts) > 1 else ''
+            if email:
+                if not store: store = domain_from_email(email)
+                pairs.append((email, store))
+        else:
+            email = item.strip()
+            if email:
+                pairs.append((email, domain_from_email(email)))
+    return pairs
+
 # ==========================================
 # SESSION SEND COUNTER (MILESTONE SYSTEM)
 # ==========================================
@@ -351,7 +380,6 @@ def reset_session_sent_count(user_email):
     finally: release_db(conn)
 
 def counter_status(user_email):
-    """Return counter status with milestone info."""
     count = get_session_sent_count(user_email)
     at_milestone = (count > 0 and count % SEND_LIMIT == 0)
     next_milestone = ((count // SEND_LIMIT) + 1) * SEND_LIMIT
@@ -455,9 +483,13 @@ def trigger_next_subjob(master_id, next_index, user_email):
                     conn.commit(); cur.close()
                 finally: release_db(conn)
             if user_email:
-                all_emails = []
-                for r in all_results: all_emails.extend(r.get('emails', []))
-                if all_emails: save_user_state(user_email, found_emails='|||'.join(all_emails))
+                # Store as email:::store pairs
+                pairs = []
+                for r in all_results:
+                    store = r.get('store', '')
+                    for e in r.get('emails', []):
+                        pairs.append(f"{e}:::{store}")
+                if pairs: save_user_state(user_email, found_emails='|||'.join(pairs))
 
 def resume_unfinished_masters():
     conn = get_db()
@@ -613,23 +645,32 @@ def get_hf_import_detail(import_id, user_email):
 # ==========================================
 # QUEUE
 # ==========================================
-def add_to_queue(user_email, emails):
+def add_to_queue(user_email, pairs):
+    """pairs: list of (email, store) tuples"""
     conn = get_db()
     if not conn: return 0, 0
     added = 0; skipped = 0
     try:
         cur = conn.cursor()
-        for email in emails:
+        for item in pairs:
+            if isinstance(item, (list, tuple)):
+                email = item[0]; store = item[1] if len(item) > 1 else ''
+            else:
+                email = item; store = ''
             email = email.strip().lower()
             if not email or '@' not in email: continue
-            domain = domain_from_email(email)
-            if not domain: continue
+            # Use store domain if provided, otherwise fall back to email domain
+            if not store:
+                store = domain_from_email(email)
+            if not store:
+                skipped += 1
+                continue
             cur.execute("SELECT id FROM sent_log WHERE user_email = %s AND email = %s", (user_email, email))
             if cur.fetchone(): skipped += 1; continue
             try:
                 cur.execute("""INSERT INTO audit_queue (user_email, email, domain, status)
                     VALUES (%s, %s, %s, 'pending') ON CONFLICT (user_email, email) DO NOTHING""",
-                    (user_email, email, domain))
+                    (user_email, email, store))
                 if cur.rowcount > 0: added += 1
             except: pass
         conn.commit(); cur.close()
@@ -1077,9 +1118,14 @@ def audit_store(domain, case_id):
 # ==========================================
 # EMAIL GENERATOR
 # ==========================================
-def generate_outreach_email(report, tone='friendly', sender_name=''):
+def generate_outreach_email(report, tone='friendly', sender_name='', email=''):
     domain = report.get('domain', '')
-    brand = domain.split('.')[0].title() if domain else 'there'
+    # If domain is a public email provider (gmail.com, yahoo.com, etc.),
+    # and we know the actual email, use the email address as the brand instead
+    if domain and domain.lower() in PUBLIC_EMAIL_DOMAINS and email:
+        brand = email
+    else:
+        brand = domain.split('.')[0].title() if domain else 'there'
     issues = report.get('issues', [])
     scores = report.get('scores', {})
     checks = report.get('checks', {})
@@ -1368,11 +1414,13 @@ async function sendJobToVerify(id){
     const res = await fetch('/get-email-finder-job/'+id);
     const data = await res.json();
     if(!data.results) return;
-    const allEmails = [];
-    data.results.forEach(r => { (r.emails||[]).forEach(e => allEmails.push(e)); });
-    if(allEmails.length === 0){ alert('No emails found in this job'); return; }
-    await fetch('/store-emails', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({emails: allEmails})});
-    alert('✅ '+allEmails.length+' emails saved. Go to Verify page and click "From Finder".');
+    const pairs = [];
+    data.results.forEach(r => {
+      (r.emails||[]).forEach(e => pairs.push({email: e, store: r.store || ''}));
+    });
+    if(pairs.length === 0){ alert('No emails found in this job'); return; }
+    await fetch('/store-emails', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({pairs: pairs})});
+    alert('✅ '+pairs.length+' emails saved. Go to Verify page and click "From Finder".');
   }catch(e){ alert('Error: '+e.message); }
 }
 
@@ -1431,8 +1479,21 @@ def get_email_finder_job_route(job_id):
 @login_required
 def store_emails():
     user_email = session.get('user_id')
-    emails = request.json.get('emails', [])
-    if user_email: save_user_state(user_email, found_emails='|||'.join(emails))
+    data = request.json
+    pairs = data.get('pairs', [])
+    if pairs:
+        # New format: email:::store
+        items = []
+        for p in pairs:
+            e = p.get('email', '').strip().lower()
+            s = p.get('store', '').strip().lower()
+            if e:
+                items.append(f"{e}:::{s}" if s else e)
+        if user_email: save_user_state(user_email, found_emails='|||'.join(items))
+    else:
+        # Legacy: plain emails list
+        emails = data.get('emails', [])
+        if user_email: save_user_state(user_email, found_emails='|||'.join(emails))
     return jsonify({'success': True})
 
 # ==========================================
@@ -1970,7 +2031,6 @@ async function resetCounter(){
 }
 
 async function continueAuto(){
-  // Resume auto mode from where it paused
   await loadCounter();
   autoMode = true;
   pendingAction = false;
@@ -2119,8 +2179,9 @@ function renderReport(r){
 async function generateEmail(tone){
   if(!currentAuditReport){ return; }
   const senderName = document.getElementById('senderName').value.trim();
+  const emailAddr = currentItem ? currentItem.email : '';
   try{
-    const res = await fetch('/generate-email', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({report: currentAuditReport, tone: tone, sender_name: senderName})});
+    const res = await fetch('/generate-email', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({report: currentAuditReport, tone: tone, sender_name: senderName, email: emailAddr})});
     const data = await res.json();
     if(data.success){
       document.getElementById('genSubject').value = data.subject;
@@ -2167,7 +2228,6 @@ async function startManualMode(){
 }
 
 async function startAutoMode(){
-  // Reset counter to 0 on start
   await fetch('/reset-session-counter', {method:'POST'});
   await loadCounter();
   const tone = prompt('Choose tone:\\n1 = Friendly\\n2 = Professional\\n3 = Casual\\n\\nEnter 1, 2, or 3 (default 1)', '1');
@@ -2210,13 +2270,11 @@ function playAlarm(){
 
 async function nextAuto(){
   if(!autoMode) return;
-  // Check counter status BEFORE each send
   try{
     const cntRes = await fetch('/get-session-counter');
     const cntData = await cntRes.json();
     updateCounterUI(cntData.count, cntData.next_milestone, cntData.at_milestone);
     if(cntData.at_milestone){
-      // Pause at milestone — wait for user to press Continue
       autoMode = false;
       pendingAction = false;
       playAlarm();
@@ -2254,7 +2312,6 @@ async function autoSend(){
   await fetch('/save-scout-state', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [currentItem.email], subject:subj, message:body, count:0})});
   await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentItem.id, status:'done'})});
   await fetch('/mark-sent', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({email: currentItem.email})});
-  // Increment counter
   try{
     const incRes = await fetch('/increment-session-counter', {method:'POST'});
     const incData = await incRes.json();
@@ -2305,11 +2362,10 @@ def get_audit_queue_route():
 def import_to_queue():
     user_email = session.get('user_id')
     source = request.json.get('source', '')
-    emails = []
+    pairs = []
     try:
         if source == 'finder':
-            state = load_user_state(user_email)
-            emails = state.get('found_emails', [])
+            pairs = load_found_pairs(user_email)
         elif source == 'verified':
             state = load_user_state(user_email)
             emails = state.get('verified_emails', [])
@@ -2323,10 +2379,17 @@ def import_to_queue():
                         if row and row[0]: emails = row[0].split('|||')
                     except: pass
                     finally: release_db(conn)
+            # For verified emails, try to find the matching store from found_pairs
+            found_pairs = load_found_pairs(user_email)
+            email_to_store = {}
+            for e, s in found_pairs:
+                if e not in email_to_store: email_to_store[e] = s
+            for e in emails:
+                pairs.append((e, email_to_store.get(e, '')))
         else:
             return jsonify({'success': False, 'error': 'Unknown source'})
-        if not emails: return jsonify({'success': False, 'error': 'No emails available'})
-        added, skipped = add_to_queue(user_email, emails)
+        if not pairs: return jsonify({'success': False, 'error': 'No emails available'})
+        added, skipped = add_to_queue(user_email, pairs)
         return jsonify({'success': True, 'added': added, 'skipped': skipped})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
@@ -2336,7 +2399,9 @@ def import_to_queue():
 def add_to_queue_route():
     user_email = session.get('user_id')
     emails = request.json.get('emails', [])
-    added, skipped = add_to_queue(user_email, emails)
+    # Manual paste: no store, so fall back to email domain
+    pairs = [(e, '') for e in emails]
+    added, skipped = add_to_queue(user_email, pairs)
     return jsonify({'success': True, 'added': added, 'skipped': skipped})
 
 @app.route('/update-queue-item', methods=['POST'])
@@ -2436,11 +2501,12 @@ def generate_email_route():
     report = data.get('report', {})
     tone = data.get('tone', 'friendly')
     sender_name = data.get('sender_name', '').strip()
+    email = data.get('email', '').strip()
     if not sender_name:
         sender_name = get_user_sender_name(session.get('user_id')) or ''
     if not report: return jsonify({'success': False, 'error': 'No report'})
     try:
-        result = generate_outreach_email(report, tone, sender_name)
+        result = generate_outreach_email(report, tone, sender_name, email)
         return jsonify({'success': True, 'subject': result['subject'], 'body': result['body']})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
@@ -2484,7 +2550,15 @@ def verify_jobs_list():
 def get_stored_emails():
     user_email = session.get('user_id')
     state = load_user_state(user_email) if user_email else {}
-    return jsonify({'emails': state.get('found_emails', [])})
+    # Return just the emails (strip :::store for Verify page)
+    emails = []
+    for item in state.get('found_emails', []):
+        if not item: continue
+        if ':::' in item:
+            emails.append(item.split(':::', 1)[0].strip())
+        else:
+            emails.append(item.strip())
+    return jsonify({'emails': [e for e in emails if e]})
 
 @app.route('/save-scout-recipients', methods=['POST'])
 @login_required
