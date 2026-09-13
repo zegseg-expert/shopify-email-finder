@@ -34,7 +34,7 @@ MAX_WORKERS = 10
 SEND_LIMIT = 70
 
 # ==========================================
-# PUBLIC EMAIL PROVIDERS (for brand fallback)
+# PUBLIC EMAIL PROVIDERS
 # ==========================================
 PUBLIC_EMAIL_DOMAINS = {
     'gmail.com','yahoo.com','hotmail.com','outlook.com','aol.com','icloud.com',
@@ -316,23 +316,24 @@ def load_user_state(user_email):
     finally: release_db(conn)
 
 def load_found_pairs(user_email):
-    """Return a list of (email, store) tuples from found_emails.
-    Handles both new format 'email:::store' and old format 'email' (store inferred from email)."""
+    """Return list of (email, store) tuples from found_emails.
+    - New format: 'email:::store'
+    - Old format: 'email' (store unknown → use email as store so we never fall back to gmail.com)"""
     state = load_user_state(user_email)
     pairs = []
     for item in state.get('found_emails', []):
         if not item: continue
         if ':::' in item:
             parts = item.split(':::', 1)
-            email = parts[0].strip()
-            store = parts[1].strip() if len(parts) > 1 else ''
+            email = parts[0].strip().lower()
+            store = parts[1].strip().lower() if len(parts) > 1 else ''
             if email:
-                if not store: store = domain_from_email(email)
+                if not store: store = email
                 pairs.append((email, store))
         else:
-            email = item.strip()
+            email = item.strip().lower()
             if email:
-                pairs.append((email, domain_from_email(email)))
+                pairs.append((email, email))
     return pairs
 
 # ==========================================
@@ -483,7 +484,6 @@ def trigger_next_subjob(master_id, next_index, user_email):
                     conn.commit(); cur.close()
                 finally: release_db(conn)
             if user_email:
-                # Store as email:::store pairs
                 pairs = []
                 for r in all_results:
                     store = r.get('store', '')
@@ -646,7 +646,8 @@ def get_hf_import_detail(import_id, user_email):
 # QUEUE
 # ==========================================
 def add_to_queue(user_email, pairs):
-    """pairs: list of (email, store) tuples"""
+    """pairs: list of (email, store) tuples.
+    If store is a public email provider (gmail.com, etc.), replace store with the email itself."""
     conn = get_db()
     if not conn: return 0, 0
     added = 0; skipped = 0
@@ -659,12 +660,10 @@ def add_to_queue(user_email, pairs):
                 email = item; store = ''
             email = email.strip().lower()
             if not email or '@' not in email: continue
-            # Use store domain if provided, otherwise fall back to email domain
-            if not store:
-                store = domain_from_email(email)
-            if not store:
-                skipped += 1
-                continue
+            store = (store or '').strip().lower()
+            # If store missing OR store is a public email provider → use the email itself
+            if not store or store in PUBLIC_EMAIL_DOMAINS:
+                store = email
             cur.execute("SELECT id FROM sent_log WHERE user_email = %s AND email = %s", (user_email, email))
             if cur.fetchone(): skipped += 1; continue
             try:
@@ -749,6 +748,37 @@ def clear_queue(user_email, mode='done'):
         return n
     except: return 0
     finally: release_db(conn)
+
+def fix_queue_domains(user_email):
+    """Scan the queue, and for any item whose domain is a public email provider
+    (gmail.com, etc.), replace it with the real store from found_emails pairs
+    (or fall back to the email itself if the store is unknown)."""
+    pairs = load_found_pairs(user_email)
+    lookup = {}
+    for e, s in pairs:
+        if e and e not in lookup:
+            lookup[e] = s
+    conn = get_db()
+    if not conn: return 0
+    fixed = 0
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, email, domain FROM audit_queue WHERE user_email = %s AND status IN ('pending','current','done','skipped')", (user_email,))
+        rows = cur.fetchall()
+        for item_id, email, domain in rows:
+            if not domain: continue
+            if domain.lower() in PUBLIC_EMAIL_DOMAINS:
+                # Look up the real store from pairs
+                real_store = lookup.get(email.lower(), '')
+                if not real_store or real_store.lower() in PUBLIC_EMAIL_DOMAINS:
+                    real_store = email
+                cur.execute("UPDATE audit_queue SET domain=%s, updated_at=NOW() WHERE id=%s", (real_store, item_id))
+                fixed += 1
+        conn.commit(); cur.close()
+    except Exception as e:
+        print(f"fix_queue_domains: {e}")
+    finally: release_db(conn)
+    return fixed
 
 def mark_sent(user_email, email):
     conn = get_db()
@@ -1120,12 +1150,20 @@ def audit_store(domain, case_id):
 # ==========================================
 def generate_outreach_email(report, tone='friendly', sender_name='', email=''):
     domain = report.get('domain', '')
-    # If domain is a public email provider (gmail.com, yahoo.com, etc.),
-    # and we know the actual email, use the email address as the brand instead
-    if domain and domain.lower() in PUBLIC_EMAIL_DOMAINS and email:
-        brand = email
+    is_email_as_domain = '@' in domain if domain else False
+
+    if is_email_as_domain:
+        # No real store URL — use the email as brand, and don't mention a URL
+        brand = domain
+        display_url = ''
+    elif domain and domain.lower() in PUBLIC_EMAIL_DOMAINS:
+        # Rare: domain is a public provider but not the full email
+        brand = email if email else domain
+        display_url = ''
     else:
         brand = domain.split('.')[0].title() if domain else 'there'
+        display_url = domain
+
     issues = report.get('issues', [])
     scores = report.get('scores', {})
     checks = report.get('checks', {})
@@ -1141,24 +1179,37 @@ def generate_outreach_email(report, tone='friendly', sender_name='', email=''):
         elif 'Load Time' in title and checks.get('load_time_seconds'):
             title = f"Slow load time ({checks['load_time_seconds']}s)"
         issue_bullets.append(title)
-    if overall < 50: subject = f"Found {len(issues)} issues on {domain}"
-    elif overall < 75: subject = f"Quick idea for {domain}"
-    else: subject = f"Nice store! One thing I noticed on {domain}"
+
+    subj_target = display_url if display_url else 'your store'
+    if overall < 50: subject = f"Found {len(issues)} issues on {subj_target}"
+    elif overall < 75: subject = f"Quick idea for {subj_target}"
+    else: subject = f"Nice store! One thing I noticed on {subj_target}"
+
     if tone == 'friendly':
         greeting = f"Hi {brand} team,"
-        opener = f"I was looking at {domain} today and noticed a few things that could be costing you sales."
+        if display_url:
+            opener = f"I was looking at {display_url} today and noticed a few things that could be costing you sales."
+        else:
+            opener = "I came across your store today and noticed a few things that could be costing you sales."
         closer = "Want me to send over a quick 2-min video showing how to fix these?"
         signoff = "No pitch — just thought it was worth sharing."
     elif tone == 'professional':
         greeting = f"Hello {brand} team,"
-        opener = f"I recently analyzed {domain} and identified {len(issues)} optimization opportunities."
+        if display_url:
+            opener = f"I recently analyzed {display_url} and identified {len(issues)} optimization opportunities."
+        else:
+            opener = f"I recently analyzed your store and identified {len(issues)} optimization opportunities."
         closer = "Would it be worth a 15-minute call this week to discuss?"
         signoff = "I help Shopify stores improve conversion. Happy to walk you through it."
     else:
         greeting = f"Hey {brand},"
-        opener = f"Took a look at {domain} — cool store! Noticed a few things though."
+        if display_url:
+            opener = f"Took a look at {display_url} — cool store! Noticed a few things though."
+        else:
+            opener = "Took a look at your store — cool store! Noticed a few things though."
         closer = "Want me to send a quick checklist of fixes?"
         signoff = "No pressure either way!"
+
     body = f"""{greeting}
 
 {opener}
@@ -1299,7 +1350,7 @@ def settings():
     return render_page("Settings", body)
 
 # ==========================================
-# HOME (Email Finder - Background Jobs)
+# HOME (Email Finder)
 # ==========================================
 @app.route('/')
 @login_required
@@ -1429,7 +1480,7 @@ window.onload = function(){ loadJobs(); setInterval(loadJobs, 5000); };
     return render_page("Finder", body)
 
 # ==========================================
-# EMAIL FINDER JOB API (MASTER + SUBJOBS)
+# EMAIL FINDER JOB API
 # ==========================================
 @app.route('/start-email-finder-job', methods=['POST'])
 @login_required
@@ -1482,16 +1533,14 @@ def store_emails():
     data = request.json
     pairs = data.get('pairs', [])
     if pairs:
-        # New format: email:::store
         items = []
         for p in pairs:
             e = p.get('email', '').strip().lower()
-            s = p.get('store', '').strip().lower()
+            s = (p.get('store', '') or '').strip().lower()
             if e:
                 items.append(f"{e}:::{s}" if s else e)
         if user_email: save_user_state(user_email, found_emails='|||'.join(items))
     else:
-        # Legacy: plain emails list
         emails = data.get('emails', [])
         if user_email: save_user_state(user_email, found_emails='|||'.join(emails))
     return jsonify({'success': True})
@@ -1921,8 +1970,11 @@ def audit_page():
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
 <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
 <h3 style="margin:0">📋 Queue (<span id="queueCount">0</span>)</h3>
-<button onclick="clearQueue('done')" style="background:#ef4444;color:white;padding:6px 14px;border:none;border-radius:5px;cursor:pointer;font-size:12px;margin-right:6px">🗑️ Clear Done</button>
+<div style="display:flex;gap:6px;flex-wrap:wrap">
+<button onclick="fixDomains()" style="background:#0891b2;color:white;padding:6px 14px;border:none;border-radius:5px;cursor:pointer;font-size:12px">🔧 Fix Old Domains</button>
+<button onclick="clearQueue('done')" style="background:#ef4444;color:white;padding:6px 14px;border:none;border-radius:5px;cursor:pointer;font-size:12px">🗑️ Clear Done</button>
 <button onclick="clearQueue('pending')" style="background:#6b7280;color:white;padding:6px 14px;border:none;border-radius:5px;cursor:pointer;font-size:12px">🗑️ Clear Pending</button>
+</div>
 </div>
 <div id="progressBar" style="margin-top:12px;display:none;background:#e0e0e0;border-radius:8px;overflow:hidden">
 <div id="progressFill" style="height:20px;background:linear-gradient(90deg,#4ade80,#22c55e);text-align:center;color:white;font-size:12px;line-height:20px;transition:width 0.3s">0%</div>
@@ -1983,6 +2035,18 @@ def audit_page():
 </div>
 
 </div>
+
+<!-- TONE MODAL -->
+<div id="toneModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);z-index:10000;align-items:center;justify-content:center">
+  <div style="background:white;padding:24px;border-radius:12px;max-width:340px;width:90%;text-align:center">
+    <h3 style="margin:0 0 16px 0">Choose Email Tone</h3>
+    <button onclick="pickTone('friendly')" style="display:block;width:100%;background:#0d9488;color:white;padding:12px;border:none;border-radius:8px;cursor:pointer;font-size:15px;margin-bottom:8px">😊 Friendly</button>
+    <button onclick="pickTone('professional')" style="display:block;width:100%;background:#3b82f6;color:white;padding:12px;border:none;border-radius:8px;cursor:pointer;font-size:15px;margin-bottom:8px">💼 Professional</button>
+    <button onclick="pickTone('casual')" style="display:block;width:100%;background:#f59e0b;color:white;padding:12px;border:none;border-radius:8px;cursor:pointer;font-size:15px">😎 Casual</button>
+    <button onclick="closeToneModal()" style="display:block;width:100%;background:#e5e7eb;color:#374151;padding:10px;border:none;border-radius:8px;cursor:pointer;font-size:14px;margin-top:12px">Cancel</button>
+  </div>
+</div>
+
 <script>
 let currentItem = null;
 let currentAuditReport = null;
@@ -1990,6 +2054,18 @@ let autoMode = false;
 let autoTone = 'friendly';
 let pendingAction = false;
 const SEND_LIMIT = ''' + str(SEND_LIMIT) + ''';
+
+function showToneModal(){ document.getElementById('toneModal').style.display = 'flex'; }
+function closeToneModal(){ document.getElementById('toneModal').style.display = 'none'; }
+function pickTone(tone){
+  closeToneModal();
+  autoTone = tone;
+  autoMode = true;
+  pendingAction = false;
+  document.getElementById('modeStatus').innerHTML = '<p style="color:green">⚡ Auto mode ON (' + tone + ')</p>';
+  document.getElementById('stopBtn').style.display = 'inline-block';
+  nextAuto();
+}
 
 async function loadCounter(){
   try{
@@ -2087,6 +2163,16 @@ async function importFrom(source){
       loadQueue();
     } else { status.innerHTML = '<p style="color:red">Error: '+(data.error||'Unknown')+'</p>'; }
   }catch(e){ status.innerHTML = '<p style="color:red">Error: '+e.message+'</p>'; }
+}
+
+async function fixDomains(){
+  if(!confirm('Fix queue items whose domain is a public provider (gmail.com, etc.)?')) return;
+  const res = await fetch('/fix-queue-domains', {method:'POST'});
+  const data = await res.json();
+  if(data.success){
+    alert('✅ Fixed ' + data.fixed + ' queue items');
+    loadQueue();
+  }
 }
 
 function toggleManual(){ const el = document.getElementById('manualPaste'); el.style.display = el.style.display === 'none' ? 'block' : 'none'; }
@@ -2230,15 +2316,7 @@ async function startManualMode(){
 async function startAutoMode(){
   await fetch('/reset-session-counter', {method:'POST'});
   await loadCounter();
-  const tone = prompt('Choose tone:\\n1 = Friendly\\n2 = Professional\\n3 = Casual\\n\\nEnter 1, 2, or 3 (default 1)', '1');
-  if(tone === '2') autoTone = 'professional';
-  else if(tone === '3') autoTone = 'casual';
-  else autoTone = 'friendly';
-  autoMode = true;
-  pendingAction = false;
-  document.getElementById('modeStatus').innerHTML = '<p style="color:green">⚡ Auto mode ON ('+autoTone+') — counter reset to 0/'+SEND_LIMIT+'</p>';
-  document.getElementById('stopBtn').style.display = 'inline-block';
-  nextAuto();
+  showToneModal();
 }
 
 function stopAutoMode(){
@@ -2379,7 +2457,7 @@ def import_to_queue():
                         if row and row[0]: emails = row[0].split('|||')
                     except: pass
                     finally: release_db(conn)
-            # For verified emails, try to find the matching store from found_pairs
+            # Map verified emails to their stores using found_pairs
             found_pairs = load_found_pairs(user_email)
             email_to_store = {}
             for e, s in found_pairs:
@@ -2399,7 +2477,6 @@ def import_to_queue():
 def add_to_queue_route():
     user_email = session.get('user_id')
     emails = request.json.get('emails', [])
-    # Manual paste: no store, so fall back to email domain
     pairs = [(e, '') for e in emails]
     added, skipped = add_to_queue(user_email, pairs)
     return jsonify({'success': True, 'added': added, 'skipped': skipped})
@@ -2439,6 +2516,13 @@ def clear_queue_route():
     n = clear_queue(user_email, mode=mode)
     return jsonify({'success': True, 'cleared': n})
 
+@app.route('/fix-queue-domains', methods=['POST'])
+@login_required
+def fix_queue_domains_route():
+    user_email = session.get('user_id')
+    fixed = fix_queue_domains(user_email)
+    return jsonify({'success': True, 'fixed': fixed})
+
 @app.route('/get-next-pending')
 @login_required
 def get_next_pending_route():
@@ -2447,7 +2531,7 @@ def get_next_pending_route():
     return jsonify({'item': item})
 
 # ==========================================
-# SESSION COUNTER API (MILESTONE SYSTEM)
+# SESSION COUNTER API
 # ==========================================
 @app.route('/get-session-counter')
 @login_required
@@ -2550,7 +2634,6 @@ def verify_jobs_list():
 def get_stored_emails():
     user_email = session.get('user_id')
     state = load_user_state(user_email) if user_email else {}
-    # Return just the emails (strip :::store for Verify page)
     emails = []
     for item in state.get('found_emails', []):
         if not item: continue
