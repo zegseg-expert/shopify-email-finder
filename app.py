@@ -127,7 +127,6 @@ def init_db():
             email VARCHAR(255) NOT NULL,
             sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_email, email))""")
-        # ----- EDIT 1: Master/subjob tables -----
         cur.execute("""CREATE TABLE IF NOT EXISTS email_finder_master (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             total INTEGER DEFAULT 0, processed INTEGER DEFAULT 0,
@@ -145,7 +144,6 @@ def init_db():
             status VARCHAR(50) DEFAULT 'pending',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        # ----- /EDIT 1 -----
         cur.execute("""CREATE TABLE IF NOT EXISTS hf_imports (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             requested INTEGER DEFAULT 0,
@@ -599,6 +597,19 @@ def update_queue_item(item_id, user_email, **kwargs):
     except Exception as e: print(f"update_queue: {e}")
     finally: release_db(conn)
 
+def delete_queue_item(item_id, user_email):
+    """Delete a single queue item by ID"""
+    conn = get_db()
+    if not conn: return False
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM audit_queue WHERE id=%s AND user_email=%s", (item_id, user_email))
+        deleted = cur.rowcount > 0
+        conn.commit(); cur.close()
+        return deleted
+    except: return False
+    finally: release_db(conn)
+
 def get_queue_item(item_id, user_email):
     conn = get_db()
     if not conn: return None
@@ -615,15 +626,18 @@ def get_queue_item(item_id, user_email):
     except: return None
     finally: release_db(conn)
 
-def clear_queue(user_email, only_pending=False):
+def clear_queue(user_email, mode='done'):
+    """mode: 'pending' (delete pending+current), 'done' (delete done+skipped), 'all' (delete everything)"""
     conn = get_db()
     if not conn: return 0
     try:
         cur = conn.cursor()
-        if only_pending:
-            cur.execute("DELETE FROM audit_queue WHERE user_email = %s AND status IN ('pending','current')", (user_email,))
-        else:
+        if mode == 'done':
+            cur.execute("DELETE FROM audit_queue WHERE user_email = %s AND status IN ('done','skipped')", (user_email,))
+        elif mode == 'all':
             cur.execute("DELETE FROM audit_queue WHERE user_email = %s", (user_email,))
+        else:
+            cur.execute("DELETE FROM audit_queue WHERE user_email = %s AND status IN ('pending','current')", (user_email,))
         n = cur.rowcount
         conn.commit(); cur.close()
         return n
@@ -1781,7 +1795,8 @@ def audit_page():
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
 <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
 <h3 style="margin:0">📋 Queue (<span id="queueCount">0</span>)</h3>
-<button onclick="clearQueue()" style="background:#ef4444;color:white;padding:6px 14px;border:none;border-radius:5px;cursor:pointer;font-size:12px">🗑️ Clear Pending</button>
+<button onclick="clearQueue('done')" style="background:#ef4444;color:white;padding:6px 14px;border:none;border-radius:5px;cursor:pointer;font-size:12px;margin-right:6px">🗑️ Clear Done</button>
+<button onclick="clearQueue('pending')" style="background:#6b7280;color:white;padding:6px 14px;border:none;border-radius:5px;cursor:pointer;font-size:12px">🗑️ Clear Pending</button>
 </div>
 <div id="progressBar" style="margin-top:12px;display:none;background:#e0e0e0;border-radius:8px;overflow:hidden">
 <div id="progressFill" style="height:20px;background:linear-gradient(90deg,#4ade80,#22c55e);text-align:center;color:white;font-size:12px;line-height:20px;transition:width 0.3s">0%</div>
@@ -1861,6 +1876,7 @@ async function loadQueue(){
         html += '<button onclick="skipItem('+i.id+')" style="background:#6b7280;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">Skip</button>';
       } else {
         html += '<button onclick="resetItem('+i.id+')" style="background:#f59e0b;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">Undo</button>';
+        html += '<button onclick="deleteItem('+i.id+')" style="background:#ef4444;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">🗑️</button>';
       }
       html += '</div></div>';
     });
@@ -1894,9 +1910,33 @@ async function addManual(){
     loadQueue();
   }
 }
-async function clearQueue(){ if(!confirm('Clear all pending items?')) return; await fetch('/clear-queue', {method:'POST'}); loadQueue(); }
+
+async function clearQueue(mode){
+  const msg = mode === 'done'
+    ? 'Delete all DONE and SKIPPED emails from the queue?'
+    : mode === 'all'
+      ? 'Delete ALL emails from the queue (pending + done)?'
+      : 'Delete all PENDING emails from the queue?';
+  if(!confirm(msg)) return;
+  const res = await fetch('/clear-queue', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({mode: mode})
+  });
+  const data = await res.json();
+  if(data.success){
+    alert('✅ Cleared ' + data.cleared + ' items');
+    loadQueue();
+  }
+}
+
 async function skipItem(id){ await fetch('/update-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id, status:'skipped'})}); loadQueue(); if(autoMode) nextAuto(); }
 async function resetItem(id){ await fetch('/update-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id, status:'pending'})}); loadQueue(); }
+async function deleteItem(id){
+  if(!confirm('Delete this email from the queue permanently?')) return;
+  await fetch('/delete-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id: id})});
+  loadQueue();
+}
 
 async function analyzeItem(id){
   document.getElementById('auditSection').style.display = 'block';
@@ -2069,6 +2109,17 @@ window.onload = function(){ loadQueue(); };
 @login_required
 def get_audit_queue_route():
     user_email = session.get('user_id')
+    # Auto-clean: remove done/skipped items older than 24 hours
+    conn = get_db()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("""DELETE FROM audit_queue WHERE user_email = %s
+                AND status IN ('done','skipped')
+                AND updated_at < NOW() - INTERVAL '24 hours'""", (user_email,))
+            conn.commit(); cur.close()
+        except: pass
+        finally: release_db(conn)
     return jsonify({'items': get_queue(user_email)})
 
 @app.route('/import-to-queue', methods=['POST'])
@@ -2120,6 +2171,15 @@ def update_queue_item_route():
     update_queue_item(item_id, user_email, **data)
     return jsonify({'success': True})
 
+@app.route('/delete-queue-item', methods=['POST'])
+@login_required
+def delete_queue_item_route():
+    user_email = session.get('user_id')
+    item_id = request.json.get('id')
+    if not item_id: return jsonify({'success': False, 'error': 'No id'})
+    deleted = delete_queue_item(item_id, user_email)
+    return jsonify({'success': deleted})
+
 @app.route('/mark-sent', methods=['POST'])
 @login_required
 def mark_sent_route():
@@ -2132,7 +2192,8 @@ def mark_sent_route():
 @login_required
 def clear_queue_route():
     user_email = session.get('user_id')
-    n = clear_queue(user_email, only_pending=True)
+    mode = request.json.get('mode', 'done') if request.is_json else 'done'
+    n = clear_queue(user_email, mode=mode)
     return jsonify({'success': True, 'cleared': n})
 
 @app.route('/get-next-pending')
@@ -2249,7 +2310,7 @@ def save_scout_state_route():
     return jsonify({'success': True})
 
 # ==========================================
-# STARTUP RESUME (must be at the bottom)
+# STARTUP RESUME
 # ==========================================
 try:
     resume_unfinished_masters()
