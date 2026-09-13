@@ -29,7 +29,7 @@ SHOPIFY_IPS = ["23.227.38.32","23.227.38.36","23.227.38.65","23.227.38.66","23.2
 MAX_WORKERS = 10
 
 # ==========================================
-# SESSION SEND COUNTER LIMIT
+# SESSION SEND COUNTER LIMIT (milestone size)
 # ==========================================
 SEND_LIMIT = 70
 
@@ -307,7 +307,7 @@ def load_user_state(user_email):
     finally: release_db(conn)
 
 # ==========================================
-# SESSION SEND COUNTER
+# SESSION SEND COUNTER (MILESTONE SYSTEM)
 # ==========================================
 def get_session_sent_count(user_email):
     conn = get_db()
@@ -349,6 +349,18 @@ def reset_session_sent_count(user_email):
         conn.commit(); cur.close()
     except: pass
     finally: release_db(conn)
+
+def counter_status(user_email):
+    """Return counter status with milestone info."""
+    count = get_session_sent_count(user_email)
+    at_milestone = (count > 0 and count % SEND_LIMIT == 0)
+    next_milestone = ((count // SEND_LIMIT) + 1) * SEND_LIMIT
+    return {
+        'count': count,
+        'limit': SEND_LIMIT,
+        'next_milestone': next_milestone,
+        'at_milestone': at_milestone
+    }
 
 # ==========================================
 # EMAIL FINDER BACKGROUND JOBS (MASTER + SUBJOBS)
@@ -653,7 +665,6 @@ def update_queue_item(item_id, user_email, **kwargs):
     finally: release_db(conn)
 
 def delete_queue_item(item_id, user_email):
-    """Delete a single queue item by ID"""
     conn = get_db()
     if not conn: return False
     try:
@@ -682,7 +693,6 @@ def get_queue_item(item_id, user_email):
     finally: release_db(conn)
 
 def clear_queue(user_email, mode='done'):
-    """mode: 'pending' (delete pending+current), 'done' (delete done+skipped), 'all' (delete everything)"""
     conn = get_db()
     if not conn: return 0
     try:
@@ -1875,7 +1885,11 @@ def audit_page():
 <div style="background:#111827;border-radius:8px;overflow:hidden;height:14px">
 <div id="counterBar" style="width:0%;height:100%;background:linear-gradient(90deg,#22c55e,#16a34a);transition:width 0.3s"></div>
 </div>
-<div id="counterHint" style="font-size:12px;margin-top:8px;opacity:0.85">Auto mode stops at ''' + str(SEND_LIMIT) + '''. Press Start Auto to reset.</div>
+<div id="counterHint" style="font-size:12px;margin-top:8px;opacity:0.85">Auto mode pauses at every ''' + str(SEND_LIMIT) + ''' emails. Press Continue to resume.</div>
+<div style="display:flex;gap:8px;margin-top:12px">
+<button id="continueBtn" onclick="continueAuto()" style="display:none;flex:1;background:#0d9488;color:white;padding:10px;border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:bold">▶️ Continue</button>
+<button onclick="resetCounter()" style="background:#dc2626;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;font-size:14px">🔄 Reset</button>
+</div>
 </div>
 
 <button onclick="startManualMode()" style="background:#3b82f6;color:white;padding:14px 24px;border:none;border-radius:8px;cursor:pointer;font-size:16px;margin-right:10px;margin-bottom:10px">▶️ Start Manual</button>
@@ -1920,24 +1934,49 @@ async function loadCounter(){
   try{
     const res = await fetch('/get-session-counter');
     const data = await res.json();
-    updateCounterUI(data.count);
+    updateCounterUI(data.count, data.next_milestone, data.at_milestone);
   }catch(e){ console.error(e); }
 }
 
-function updateCounterUI(count){
-  const pct = Math.min(100, Math.round((count / SEND_LIMIT) * 100));
-  document.getElementById('counterText').textContent = count + ' / ' + SEND_LIMIT;
+function updateCounterUI(count, nextMilestone, atMilestone){
+  document.getElementById('counterText').textContent = count + ' / ' + nextMilestone;
+  const withinMilestone = count % SEND_LIMIT;
+  const pct = count > 0 && withinMilestone === 0 ? 100 : Math.round((withinMilestone / SEND_LIMIT) * 100);
   const bar = document.getElementById('counterBar');
   bar.style.width = pct + '%';
-  if(count >= SEND_LIMIT){
+  const hint = document.getElementById('counterHint');
+  const contBtn = document.getElementById('continueBtn');
+  if(atMilestone){
     bar.style.background = 'linear-gradient(90deg,#ef4444,#dc2626)';
-    document.getElementById('counterHint').innerHTML = '🛑 Limit reached! Press Start Auto to reset & continue.';
-    document.getElementById('counterHint').style.color = '#fca5a5';
+    hint.innerHTML = '🛑 Milestone reached (' + count + ' sent). Auto mode paused.';
+    hint.style.color = '#fca5a5';
+    contBtn.style.display = 'block';
   } else {
     bar.style.background = 'linear-gradient(90deg,#22c55e,#16a34a)';
-    document.getElementById('counterHint').innerHTML = 'Auto mode stops at ' + SEND_LIMIT + '. Press Start Auto to reset.';
-    document.getElementById('counterHint').style.color = '';
+    hint.innerHTML = 'Next pause at ' + nextMilestone + ' emails. Press Continue to resume when paused.';
+    hint.style.color = '';
+    contBtn.style.display = 'none';
   }
+}
+
+async function resetCounter(){
+  if(!confirm('Reset the session counter to 0? Auto mode will stop.')) return;
+  autoMode = false;
+  pendingAction = false;
+  await fetch('/reset-session-counter', {method:'POST'});
+  await loadCounter();
+  document.getElementById('modeStatus').innerHTML = '<p style="color:red">🔄 Counter reset to 0. Auto mode stopped.</p>';
+  document.getElementById('stopBtn').style.display = 'none';
+}
+
+async function continueAuto(){
+  // Resume auto mode from where it paused
+  await loadCounter();
+  autoMode = true;
+  pendingAction = false;
+  document.getElementById('modeStatus').innerHTML = '<p style="color:green">▶️ Continuing auto mode...</p>';
+  document.getElementById('stopBtn').style.display = 'inline-block';
+  nextAuto();
 }
 
 async function loadQueue(){
@@ -2106,6 +2145,7 @@ async function sendToScoutAndOpen(){
   await fetch('/save-scout-state', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [currentItem.email], subject:subj, message:body, count:0})});
   await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentItem.id, status:'done'})});
   await fetch('/mark-sent', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({email: currentItem.email})});
+  await fetch('/increment-session-counter', {method:'POST'});
   await loadCounter();
   const mailto = 'mailto:' + currentItem.email + '?subject=' + encodeURIComponent(subj) + '&body=' + encodeURIComponent(body);
   window.location.href = mailto;
@@ -2127,16 +2167,15 @@ async function startManualMode(){
 }
 
 async function startAutoMode(){
-  // OPTION A: Reset counter on every Start Auto
-  try{
-    await fetch('/reset-session-counter', {method:'POST'});
-    await loadCounter();
-  }catch(e){ console.error(e); }
+  // Reset counter to 0 on start
+  await fetch('/reset-session-counter', {method:'POST'});
+  await loadCounter();
   const tone = prompt('Choose tone:\\n1 = Friendly\\n2 = Professional\\n3 = Casual\\n\\nEnter 1, 2, or 3 (default 1)', '1');
   if(tone === '2') autoTone = 'professional';
   else if(tone === '3') autoTone = 'casual';
   else autoTone = 'friendly';
   autoMode = true;
+  pendingAction = false;
   document.getElementById('modeStatus').innerHTML = '<p style="color:green">⚡ Auto mode ON ('+autoTone+') — counter reset to 0/'+SEND_LIMIT+'</p>';
   document.getElementById('stopBtn').style.display = 'inline-block';
   nextAuto();
@@ -2160,7 +2199,6 @@ function playAlarm(){
     osc.frequency.value = 880;
     gain.gain.value = 0.15;
     osc.start();
-    // Beep pattern: on-off-on-off-on for ~1.5 seconds
     let t = ctx.currentTime;
     for(let i=0;i<3;i++){
       gain.gain.setValueAtTime(0.15, t + i*0.4);
@@ -2172,18 +2210,18 @@ function playAlarm(){
 
 async function nextAuto(){
   if(!autoMode) return;
-  // Check counter FIRST
+  // Check counter status BEFORE each send
   try{
     const cntRes = await fetch('/get-session-counter');
     const cntData = await cntRes.json();
-    if(cntData.count >= SEND_LIMIT){
+    updateCounterUI(cntData.count, cntData.next_milestone, cntData.at_milestone);
+    if(cntData.at_milestone){
+      // Pause at milestone — wait for user to press Continue
       autoMode = false;
       pendingAction = false;
       playAlarm();
-      document.getElementById('modeStatus').innerHTML = '<p style="color:red;font-weight:bold">🛑 Limit reached ('+cntData.count+'/'+SEND_LIMIT+'). Auto mode STOPPED. Press Start Auto to reset.</p>';
+      document.getElementById('modeStatus').innerHTML = '<p style="color:red;font-weight:bold">🛑 Milestone reached ('+cntData.count+' sent). Auto mode PAUSED. Press Continue to resume.</p>';
       document.getElementById('stopBtn').style.display = 'none';
-      updateCounterUI(cntData.count);
-      alert('🛑 SEND LIMIT REACHED (' + SEND_LIMIT + ' emails sent).\\n\\nAuto mode stopped.\\nPress "Start Auto" to reset the counter and continue.');
       return;
     }
   }catch(e){ console.error(e); }
@@ -2216,11 +2254,11 @@ async function autoSend(){
   await fetch('/save-scout-state', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [currentItem.email], subject:subj, message:body, count:0})});
   await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentItem.id, status:'done'})});
   await fetch('/mark-sent', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({email: currentItem.email})});
-  // Increment + refresh counter
+  // Increment counter
   try{
     const incRes = await fetch('/increment-session-counter', {method:'POST'});
     const incData = await incRes.json();
-    updateCounterUI(incData.count);
+    updateCounterUI(incData.count, incData.next_milestone, incData.at_milestone);
   }catch(e){ console.error(e); }
   loadQueue();
   const mailto = 'mailto:' + currentItem.email + '?subject=' + encodeURIComponent(subj) + '&body=' + encodeURIComponent(body);
@@ -2250,7 +2288,6 @@ window.onload = function(){ loadQueue(); loadCounter(); };
 @login_required
 def get_audit_queue_route():
     user_email = session.get('user_id')
-    # Auto-clean: remove done/skipped items older than 24 hours
     conn = get_db()
     if conn:
         try:
@@ -2345,28 +2382,27 @@ def get_next_pending_route():
     return jsonify({'item': item})
 
 # ==========================================
-# SESSION COUNTER API
+# SESSION COUNTER API (MILESTONE SYSTEM)
 # ==========================================
 @app.route('/get-session-counter')
 @login_required
 def get_session_counter_route():
     user_email = session.get('user_id')
-    count = get_session_sent_count(user_email)
-    return jsonify({'count': count, 'limit': SEND_LIMIT})
+    return jsonify(counter_status(user_email))
 
 @app.route('/increment-session-counter', methods=['POST'])
 @login_required
 def increment_session_counter_route():
     user_email = session.get('user_id')
-    new_count = increment_session_sent_count(user_email)
-    return jsonify({'success': True, 'count': new_count, 'limit': SEND_LIMIT})
+    increment_session_sent_count(user_email)
+    return jsonify(counter_status(user_email))
 
 @app.route('/reset-session-counter', methods=['POST'])
 @login_required
 def reset_session_counter_route():
     user_email = session.get('user_id')
     reset_session_sent_count(user_email)
-    return jsonify({'success': True, 'count': 0, 'limit': SEND_LIMIT})
+    return jsonify(counter_status(user_email))
 
 @app.route('/analyze-queue-item', methods=['POST'])
 @login_required
