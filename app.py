@@ -29,6 +29,11 @@ SHOPIFY_IPS = ["23.227.38.32","23.227.38.36","23.227.38.65","23.227.38.66","23.2
 MAX_WORKERS = 10
 
 # ==========================================
+# SESSION SEND COUNTER LIMIT
+# ==========================================
+SEND_LIMIT = 70
+
+# ==========================================
 # DB POOL
 # ==========================================
 _db_pool = None
@@ -92,7 +97,13 @@ def init_db():
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) UNIQUE NOT NULL,
             found_emails TEXT, verified_emails TEXT, scout_recipients TEXT,
             scout_subject TEXT, scout_message TEXT, scout_count INTEGER DEFAULT 0,
+            session_sent_count INTEGER DEFAULT 0,
+            session_started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        try: cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS session_sent_count INTEGER DEFAULT 0")
+        except: pass
+        try: cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS session_started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        except: pass
         cur.execute("""CREATE TABLE IF NOT EXISTS verify_jobs (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             job_name VARCHAR(255), total INTEGER DEFAULT 0, processed INTEGER DEFAULT 0,
@@ -293,6 +304,50 @@ def load_user_state(user_email):
             }
         return {}
     except: return {}
+    finally: release_db(conn)
+
+# ==========================================
+# SESSION SEND COUNTER
+# ==========================================
+def get_session_sent_count(user_email):
+    conn = get_db()
+    if not conn: return 0
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT session_sent_count FROM user_state WHERE user_email = %s", (user_email,))
+        row = cur.fetchone(); cur.close()
+        return row[0] if row and row[0] is not None else 0
+    except: return 0
+    finally: release_db(conn)
+
+def increment_session_sent_count(user_email):
+    conn = get_db()
+    if not conn: return 0
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM user_state WHERE user_email = %s", (user_email,))
+        if not cur.fetchone():
+            cur.execute("INSERT INTO user_state (user_email, session_sent_count) VALUES (%s, 0)", (user_email,))
+        cur.execute("UPDATE user_state SET session_sent_count = COALESCE(session_sent_count,0) + 1, updated_at=NOW() WHERE user_email=%s RETURNING session_sent_count", (user_email,))
+        new_count = cur.fetchone()[0]
+        conn.commit(); cur.close()
+        return new_count
+    except Exception as e:
+        print(f"increment_session_sent_count: {e}")
+        return 0
+    finally: release_db(conn)
+
+def reset_session_sent_count(user_email):
+    conn = get_db()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM user_state WHERE user_email = %s", (user_email,))
+        if not cur.fetchone():
+            cur.execute("INSERT INTO user_state (user_email, session_sent_count) VALUES (%s, 0)", (user_email,))
+        cur.execute("UPDATE user_state SET session_sent_count = 0, session_started_at = NOW(), updated_at=NOW() WHERE user_email=%s", (user_email,))
+        conn.commit(); cur.close()
+    except: pass
     finally: release_db(conn)
 
 # ==========================================
@@ -1810,6 +1865,19 @@ def audit_page():
 <label style="font-weight:bold;font-size:13px">Your name:</label>
 <input type="text" id="senderName" value="''' + sender_name.replace('"','') + '''" placeholder="e.g. Daniel Phillips" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:5px;margin:5px 0;box-sizing:border-box;font-size:14px">
 </div>
+
+<!-- SESSION COUNTER -->
+<div id="sessionCounterBox" style="background:linear-gradient(135deg,#1f2937,#374151);color:white;padding:16px;border-radius:10px;margin-bottom:15px">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+<span style="font-size:15px;font-weight:bold">📧 Sent this session</span>
+<span id="counterText" style="font-size:20px;font-weight:bold">0 / ''' + str(SEND_LIMIT) + '''</span>
+</div>
+<div style="background:#111827;border-radius:8px;overflow:hidden;height:14px">
+<div id="counterBar" style="width:0%;height:100%;background:linear-gradient(90deg,#22c55e,#16a34a);transition:width 0.3s"></div>
+</div>
+<div id="counterHint" style="font-size:12px;margin-top:8px;opacity:0.85">Auto mode stops at ''' + str(SEND_LIMIT) + '''. Press Start Auto to reset.</div>
+</div>
+
 <button onclick="startManualMode()" style="background:#3b82f6;color:white;padding:14px 24px;border:none;border-radius:8px;cursor:pointer;font-size:16px;margin-right:10px;margin-bottom:10px">▶️ Start Manual</button>
 <button onclick="startAutoMode()" style="background:#0d9488;color:white;padding:14px 24px;border:none;border-radius:8px;cursor:pointer;font-size:16px;margin-bottom:10px">⚡ Start Auto</button>
 <button onclick="stopAutoMode()" id="stopBtn" style="background:#ef4444;color:white;padding:14px 24px;border:none;border-radius:8px;cursor:pointer;font-size:16px;display:none;margin-left:10px">⏹️ Stop Auto</button>
@@ -1846,6 +1914,31 @@ let currentAuditReport = null;
 let autoMode = false;
 let autoTone = 'friendly';
 let pendingAction = false;
+const SEND_LIMIT = ''' + str(SEND_LIMIT) + ''';
+
+async function loadCounter(){
+  try{
+    const res = await fetch('/get-session-counter');
+    const data = await res.json();
+    updateCounterUI(data.count);
+  }catch(e){ console.error(e); }
+}
+
+function updateCounterUI(count){
+  const pct = Math.min(100, Math.round((count / SEND_LIMIT) * 100));
+  document.getElementById('counterText').textContent = count + ' / ' + SEND_LIMIT;
+  const bar = document.getElementById('counterBar');
+  bar.style.width = pct + '%';
+  if(count >= SEND_LIMIT){
+    bar.style.background = 'linear-gradient(90deg,#ef4444,#dc2626)';
+    document.getElementById('counterHint').innerHTML = '🛑 Limit reached! Press Start Auto to reset & continue.';
+    document.getElementById('counterHint').style.color = '#fca5a5';
+  } else {
+    bar.style.background = 'linear-gradient(90deg,#22c55e,#16a34a)';
+    document.getElementById('counterHint').innerHTML = 'Auto mode stops at ' + SEND_LIMIT + '. Press Start Auto to reset.';
+    document.getElementById('counterHint').style.color = '';
+  }
+}
 
 async function loadQueue(){
   try{
@@ -2013,6 +2106,7 @@ async function sendToScoutAndOpen(){
   await fetch('/save-scout-state', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [currentItem.email], subject:subj, message:body, count:0})});
   await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentItem.id, status:'done'})});
   await fetch('/mark-sent', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({email: currentItem.email})});
+  await loadCounter();
   const mailto = 'mailto:' + currentItem.email + '?subject=' + encodeURIComponent(subj) + '&body=' + encodeURIComponent(body);
   window.location.href = mailto;
 }
@@ -2033,12 +2127,17 @@ async function startManualMode(){
 }
 
 async function startAutoMode(){
+  // OPTION A: Reset counter on every Start Auto
+  try{
+    await fetch('/reset-session-counter', {method:'POST'});
+    await loadCounter();
+  }catch(e){ console.error(e); }
   const tone = prompt('Choose tone:\\n1 = Friendly\\n2 = Professional\\n3 = Casual\\n\\nEnter 1, 2, or 3 (default 1)', '1');
   if(tone === '2') autoTone = 'professional';
   else if(tone === '3') autoTone = 'casual';
   else autoTone = 'friendly';
   autoMode = true;
-  document.getElementById('modeStatus').innerHTML = '<p style="color:green">⚡ Auto mode ON ('+autoTone+')</p>';
+  document.getElementById('modeStatus').innerHTML = '<p style="color:green">⚡ Auto mode ON ('+autoTone+') — counter reset to 0/'+SEND_LIMIT+'</p>';
   document.getElementById('stopBtn').style.display = 'inline-block';
   nextAuto();
 }
@@ -2050,8 +2149,44 @@ function stopAutoMode(){
   document.getElementById('stopBtn').style.display = 'none';
 }
 
+function playAlarm(){
+  try{
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.type = 'square';
+    osc.frequency.value = 880;
+    gain.gain.value = 0.15;
+    osc.start();
+    // Beep pattern: on-off-on-off-on for ~1.5 seconds
+    let t = ctx.currentTime;
+    for(let i=0;i<3;i++){
+      gain.gain.setValueAtTime(0.15, t + i*0.4);
+      gain.gain.setValueAtTime(0, t + i*0.4 + 0.2);
+    }
+    osc.stop(t + 1.4);
+  }catch(e){ console.error('Audio error:', e); }
+}
+
 async function nextAuto(){
   if(!autoMode) return;
+  // Check counter FIRST
+  try{
+    const cntRes = await fetch('/get-session-counter');
+    const cntData = await cntRes.json();
+    if(cntData.count >= SEND_LIMIT){
+      autoMode = false;
+      pendingAction = false;
+      playAlarm();
+      document.getElementById('modeStatus').innerHTML = '<p style="color:red;font-weight:bold">🛑 Limit reached ('+cntData.count+'/'+SEND_LIMIT+'). Auto mode STOPPED. Press Start Auto to reset.</p>';
+      document.getElementById('stopBtn').style.display = 'none';
+      updateCounterUI(cntData.count);
+      alert('🛑 SEND LIMIT REACHED (' + SEND_LIMIT + ' emails sent).\\n\\nAuto mode stopped.\\nPress "Start Auto" to reset the counter and continue.');
+      return;
+    }
+  }catch(e){ console.error(e); }
   try{
     const res = await fetch('/get-next-pending');
     const data = await res.json();
@@ -2081,6 +2216,12 @@ async function autoSend(){
   await fetch('/save-scout-state', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [currentItem.email], subject:subj, message:body, count:0})});
   await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentItem.id, status:'done'})});
   await fetch('/mark-sent', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({email: currentItem.email})});
+  // Increment + refresh counter
+  try{
+    const incRes = await fetch('/increment-session-counter', {method:'POST'});
+    const incData = await incRes.json();
+    updateCounterUI(incData.count);
+  }catch(e){ console.error(e); }
   loadQueue();
   const mailto = 'mailto:' + currentItem.email + '?subject=' + encodeURIComponent(subj) + '&body=' + encodeURIComponent(body);
   localStorage.setItem('lastAutoSentId', currentItem.id.toString());
@@ -2098,7 +2239,7 @@ document.addEventListener('visibilitychange', function(){
   }
 });
 
-window.onload = function(){ loadQueue(); };
+window.onload = function(){ loadQueue(); loadCounter(); };
 </script>'''
     return render_page("Analyze & Send", body)
 
@@ -2202,6 +2343,30 @@ def get_next_pending_route():
     user_email = session.get('user_id')
     item = get_next_pending_item(user_email)
     return jsonify({'item': item})
+
+# ==========================================
+# SESSION COUNTER API
+# ==========================================
+@app.route('/get-session-counter')
+@login_required
+def get_session_counter_route():
+    user_email = session.get('user_id')
+    count = get_session_sent_count(user_email)
+    return jsonify({'count': count, 'limit': SEND_LIMIT})
+
+@app.route('/increment-session-counter', methods=['POST'])
+@login_required
+def increment_session_counter_route():
+    user_email = session.get('user_id')
+    new_count = increment_session_sent_count(user_email)
+    return jsonify({'success': True, 'count': new_count, 'limit': SEND_LIMIT})
+
+@app.route('/reset-session-counter', methods=['POST'])
+@login_required
+def reset_session_counter_route():
+    user_email = session.get('user_id')
+    reset_session_sent_count(user_email)
+    return jsonify({'success': True, 'count': 0, 'limit': SEND_LIMIT})
 
 @app.route('/analyze-queue-item', methods=['POST'])
 @login_required
