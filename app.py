@@ -29,9 +29,9 @@ SHOPIFY_IPS = ["23.227.38.32","23.227.38.36","23.227.38.65","23.227.38.66","23.2
 MAX_WORKERS = 10
 
 # ==========================================
-# SESSION SEND COUNTER LIMIT (milestone size)
+# DEFAULT SESSION SEND LIMIT (users can override)
 # ==========================================
-SEND_LIMIT = 70
+DEFAULT_SEND_LIMIT = 70
 
 # ==========================================
 # PUBLIC EMAIL PROVIDERS
@@ -108,10 +108,13 @@ def init_db():
             scout_subject TEXT, scout_message TEXT, scout_count INTEGER DEFAULT 0,
             session_sent_count INTEGER DEFAULT 0,
             session_started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            send_limit INTEGER DEFAULT 70,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
         try: cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS session_sent_count INTEGER DEFAULT 0")
         except: pass
         try: cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS session_started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        except: pass
+        try: cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS send_limit INTEGER DEFAULT 70")
         except: pass
         cur.execute("""CREATE TABLE IF NOT EXISTS verify_jobs (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
@@ -316,7 +319,6 @@ def load_user_state(user_email):
     finally: release_db(conn)
 
 def load_found_pairs(user_email):
-    """Return list of (email, store) tuples from found_emails."""
     state = load_user_state(user_email)
     pairs = []
     for item in state.get('found_emails', []):
@@ -335,7 +337,7 @@ def load_found_pairs(user_email):
     return pairs
 
 # ==========================================
-# SESSION SEND COUNTER (MILESTONE SYSTEM)
+# SESSION SEND COUNTER (MILESTONE SYSTEM) + LIMIT
 # ==========================================
 def get_session_sent_count(user_email):
     conn = get_db()
@@ -378,13 +380,45 @@ def reset_session_sent_count(user_email):
     except: pass
     finally: release_db(conn)
 
+def get_send_limit(user_email):
+    conn = get_db()
+    if not conn: return DEFAULT_SEND_LIMIT
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT send_limit FROM user_state WHERE user_email = %s", (user_email,))
+        row = cur.fetchone(); cur.close()
+        val = row[0] if row and row[0] else DEFAULT_SEND_LIMIT
+        if val < 1: val = DEFAULT_SEND_LIMIT
+        return val
+    except: return DEFAULT_SEND_LIMIT
+    finally: release_db(conn)
+
+def set_send_limit(user_email, limit):
+    if limit < 1: limit = 1
+    if limit > 10000: limit = 10000
+    conn = get_db()
+    if not conn: return False
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM user_state WHERE user_email = %s", (user_email,))
+        if not cur.fetchone():
+            cur.execute("INSERT INTO user_state (user_email, send_limit) VALUES (%s, %s)", (user_email, limit))
+        cur.execute("UPDATE user_state SET send_limit = %s, updated_at=NOW() WHERE user_email = %s", (limit, user_email))
+        conn.commit(); cur.close()
+        return True
+    except Exception as e:
+        print(f"set_send_limit: {e}")
+        return False
+    finally: release_db(conn)
+
 def counter_status(user_email):
     count = get_session_sent_count(user_email)
-    at_milestone = (count > 0 and count % SEND_LIMIT == 0)
-    next_milestone = ((count // SEND_LIMIT) + 1) * SEND_LIMIT
+    limit = get_send_limit(user_email)
+    at_milestone = (count > 0 and count % limit == 0)
+    next_milestone = ((count // limit) + 1) * limit
     return {
         'count': count,
-        'limit': SEND_LIMIT,
+        'limit': limit,
         'next_milestone': next_milestone,
         'at_milestone': at_milestone
     }
@@ -1937,6 +1971,7 @@ document.addEventListener('visibilitychange',function(){if(document.visibilitySt
 def audit_page():
     user_email = session.get('user_id')
     sender_name = get_user_sender_name(user_email) or ''
+    current_limit = get_send_limit(user_email)
     body = '''<div style="max-width:900px;margin:20px auto;padding:20px">
 
 <div style="background:#65a30d;color:white;padding:20px;border-radius:10px;margin-bottom:20px;display:flex;align-items:center;gap:16px">
@@ -1981,12 +2016,22 @@ def audit_page():
 <div id="sessionCounterBox" style="background:linear-gradient(135deg,#1f2937,#374151);color:white;padding:16px;border-radius:10px;margin-bottom:15px">
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
 <span style="font-size:15px;font-weight:bold">📧 Sent this session</span>
-<span id="counterText" style="font-size:20px;font-weight:bold">0 / ''' + str(SEND_LIMIT) + '''</span>
+<span id="counterText" style="font-size:20px;font-weight:bold">0 / ''' + str(current_limit) + '''</span>
 </div>
 <div style="background:#111827;border-radius:8px;overflow:hidden;height:14px">
 <div id="counterBar" style="width:0%;height:100%;background:linear-gradient(90deg,#22c55e,#16a34a);transition:width 0.3s"></div>
 </div>
-<div id="counterHint" style="font-size:12px;margin-top:8px;opacity:0.85">Auto mode pauses at every ''' + str(SEND_LIMIT) + ''' emails. Press Continue to resume.</div>
+<div id="counterHint" style="font-size:12px;margin-top:8px;opacity:0.85">Auto mode pauses at every milestone. Press Continue to resume.</div>
+
+<div style="margin-top:12px;padding-top:12px;border-top:1px solid #4b5563">
+  <label style="font-size:13px;font-weight:bold;display:block;margin-bottom:6px">⚙️ Pause every N emails:</label>
+  <div style="display:flex;gap:8px;align-items:center">
+    <input type="number" id="limitInput" value="''' + str(current_limit) + '''" min="1" max="10000" style="flex:1;padding:8px;border:1px solid #4b5563;border-radius:6px;background:#111827;color:white;font-size:14px;box-sizing:border-box">
+    <button onclick="saveLimit()" style="background:#0d9488;color:white;padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:bold">Save</button>
+  </div>
+  <div id="limitMsg" style="font-size:12px;color:#86efac;margin-top:4px"></div>
+</div>
+
 <div style="display:flex;gap:8px;margin-top:12px">
 <button id="continueBtn" onclick="continueAuto()" style="display:none;flex:1;background:#0d9488;color:white;padding:10px;border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:bold">▶️ Continue</button>
 <button onclick="resetCounter()" style="background:#dc2626;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;font-size:14px">🔄 Reset</button>
@@ -2044,9 +2089,8 @@ let currentAuditReport = null;
 let autoMode = false;
 let autoTone = 'friendly';
 let pendingAction = false;
-const SEND_LIMIT = ''' + str(SEND_LIMIT) + ''';
+let SEND_LIMIT = ''' + str(current_limit) + ''';
 
-// ========= PIPELINE STATE =========
 const MAX_PARALLEL = 3;
 let readyBuffer = [];
 let preparingSet = new Set();
@@ -2060,6 +2104,21 @@ function updatePipelineUI(){
     txt.textContent = '⚡ Pipeline: ' + readyBuffer.length + ' ready · ' + preparingSet.size + ' preparing (running ' + MAX_PARALLEL + ' at a time)';
   } else {
     box.style.display = 'none';
+  }
+}
+
+async function saveLimit(){
+  const val = parseInt(document.getElementById('limitInput').value);
+  if(!val || val < 1){ alert('Enter a number >= 1'); return; }
+  const res = await fetch('/set-send-limit', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({limit: val})});
+  const data = await res.json();
+  if(data.success){
+    SEND_LIMIT = data.limit;
+    document.getElementById('limitMsg').textContent = '✅ Pause every ' + data.limit + ' emails';
+    setTimeout(()=>{ document.getElementById('limitMsg').textContent = ''; }, 2500);
+    await loadCounter();
+  } else {
+    alert('Error: ' + (data.error || 'Unknown'));
   }
 }
 
@@ -2181,6 +2240,7 @@ async function loadCounter(){
   try{
     const res = await fetch('/get-session-counter');
     const data = await res.json();
+    SEND_LIMIT = data.limit;
     updateCounterUI(data.count, data.next_milestone, data.at_milestone);
   }catch(e){ console.error(e); }
 }
@@ -2467,6 +2527,7 @@ async function nextAuto(){
   try{
     const cntRes = await fetch('/get-session-counter');
     const cntData = await cntRes.json();
+    SEND_LIMIT = cntData.limit;
     updateCounterUI(cntData.count, cntData.next_milestone, cntData.at_milestone);
     if(cntData.at_milestone){
       autoMode = false;
@@ -2498,6 +2559,7 @@ async function autoSend(){
   try{
     const incRes = await fetch('/increment-session-counter', {method:'POST'});
     const incData = await incRes.json();
+    SEND_LIMIT = incData.limit;
     updateCounterUI(incData.count, incData.next_milestone, incData.at_milestone);
   }catch(e){ console.error(e); }
   loadQueue();
@@ -2656,6 +2718,21 @@ def reset_session_counter_route():
     user_email = session.get('user_id')
     reset_session_sent_count(user_email)
     return jsonify(counter_status(user_email))
+
+@app.route('/set-send-limit', methods=['POST'])
+@login_required
+def set_send_limit_route():
+    user_email = session.get('user_id')
+    try:
+        limit = int(request.json.get('limit', DEFAULT_SEND_LIMIT))
+    except:
+        return jsonify({'success': False, 'error': 'Invalid limit'})
+    if limit < 1: limit = 1
+    if limit > 10000: limit = 10000
+    ok = set_send_limit(user_email, limit)
+    if ok:
+        return jsonify({'success': True, 'limit': limit})
+    return jsonify({'success': False, 'error': 'Could not save'})
 
 @app.route('/analyze-queue-item', methods=['POST'])
 @login_required
