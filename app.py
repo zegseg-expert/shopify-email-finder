@@ -646,8 +646,6 @@ def get_hf_import_detail(import_id, user_email):
 # QUEUE
 # ==========================================
 def add_to_queue(user_email, pairs):
-    """pairs: list of (email, store) tuples.
-    If store is a public email provider (gmail.com, etc.), replace store with the email itself."""
     conn = get_db()
     if not conn: return 0, 0
     added = 0; skipped = 0
@@ -661,7 +659,6 @@ def add_to_queue(user_email, pairs):
             email = email.strip().lower()
             if not email or '@' not in email: continue
             store = (store or '').strip().lower()
-            # If store missing OR store is a public email provider → use the email itself
             if not store or store in PUBLIC_EMAIL_DOMAINS:
                 store = email
             cur.execute("SELECT id FROM sent_log WHERE user_email = %s AND email = %s", (user_email, email))
@@ -750,9 +747,6 @@ def clear_queue(user_email, mode='done'):
     finally: release_db(conn)
 
 def fix_queue_domains(user_email):
-    """Scan the queue, and for any item whose domain is a public email provider
-    (gmail.com, etc.), replace it with the real store from found_emails pairs
-    (or fall back to the email itself if the store is unknown)."""
     pairs = load_found_pairs(user_email)
     lookup = {}
     for e, s in pairs:
@@ -768,7 +762,6 @@ def fix_queue_domains(user_email):
         for item_id, email, domain in rows:
             if not domain: continue
             if domain.lower() in PUBLIC_EMAIL_DOMAINS:
-                # Look up the real store from pairs
                 real_store = lookup.get(email.lower(), '')
                 if not real_store or real_store.lower() in PUBLIC_EMAIL_DOMAINS:
                     real_store = email
@@ -1153,11 +1146,9 @@ def generate_outreach_email(report, tone='friendly', sender_name='', email=''):
     is_email_as_domain = '@' in domain if domain else False
 
     if is_email_as_domain:
-        # No real store URL — use the email as brand, and don't mention a URL
         brand = domain
         display_url = ''
     elif domain and domain.lower() in PUBLIC_EMAIL_DOMAINS:
-        # Rare: domain is a public provider but not the full email
         brand = email if email else domain
         display_url = ''
     else:
@@ -1895,7 +1886,7 @@ def verify_page():
 </div></div>
 <script>
 async function loadFromFinder(){const res=await fetch('/get-stored-emails');const data=await res.json();if(data.emails&&data.emails.length>0){document.getElementById('emailsInput').value=data.emails.join('\\n');alert('Loaded '+data.emails.length)}}
-async function startBackgroundVerify(){const emails=document.getElementById('emailsInput').value.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);if(emails.length===0){alert('Enter emails');return}const name=prompt('Job name:','Job '+new Date().toLocaleString());document.getElementById('startMsg').innerHTML='<p style="color:#666">Starting...</p>';try{const res=await fetch('/verify-async',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({emails:emails,name:name||'Untitled'})});const data=await res.json();if(data.success){document.getElementById('startMsg').innerHTML='<p style="color:green">✅ Job #'+data.job_id+' started!</p>';document.getElementById('emailsInput').value='';refreshJobs()}}catch(e){document.getElementById('startMsg').innerHTML='<p style="color:red">Error: '+e+'</p>'}}
+async function startBackgroundVerify(){const emails=document.getElementById('emailsInput').value.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);if(emails.length===0){alert('Enter emails');return}const name='Job '+new Date().toLocaleString();document.getElementById('startMsg').innerHTML='<p style="color:#666">Starting...</p>';try{const res=await fetch('/verify-async',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({emails:emails,name:name||'Untitled'})});const data=await res.json();if(data.success){document.getElementById('startMsg').innerHTML='<p style="color:green">✅ Job #'+data.job_id+' started!</p>';document.getElementById('emailsInput').value='';refreshJobs()}}catch(e){document.getElementById('startMsg').innerHTML='<p style="color:red">Error: '+e+'</p>'}}
 async function refreshJobs(){const res=await fetch('/verify-jobs');const data=await res.json();const container=document.getElementById('jobsList');if(!data.jobs||data.jobs.length===0){container.innerHTML='<p style="color:#666">No jobs yet.</p>';return}let html='';data.jobs.forEach(job=>{const percent=job.total>0?Math.round((job.processed/job.total)*100):0;const sc=job.status==='completed'?'#0d9488':(job.status==='running'?'#f59e0b':'#ef4444');const si=job.status==='completed'?'✅':(job.status==='running'?'🔄':'⏹️');html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+sc+'"><div style="font-weight:bold">'+si+' '+job.name+'</div><div style="margin-top:8px;background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+percent+'%;height:16px;background:'+sc+';text-align:center;color:white;font-size:11px;line-height:16px">'+percent+'%</div></div><div style="font-size:13px;margin-top:6px">'+job.processed+' / '+job.total+' | ✅ '+job.valid+' | ❌ '+job.invalid+'</div></div>'});container.innerHTML=html}
 window.onload=function(){refreshJobs();setInterval(refreshJobs,10000)};
 </script>'''
@@ -2005,6 +1996,11 @@ def audit_page():
 </div>
 </div>
 
+<!-- PIPELINE STATUS -->
+<div id="pipelineBox" style="background:#eff6ff;border-left:4px solid #3b82f6;padding:10px 14px;border-radius:8px;margin-bottom:15px;font-size:13px;color:#1e40af;display:none">
+<span id="pipelineText"></span>
+</div>
+
 <button onclick="startManualMode()" style="background:#3b82f6;color:white;padding:14px 24px;border:none;border-radius:8px;cursor:pointer;font-size:16px;margin-right:10px;margin-bottom:10px">▶️ Start Manual</button>
 <button onclick="startAutoMode()" style="background:#0d9488;color:white;padding:14px 24px;border:none;border-radius:8px;cursor:pointer;font-size:16px;margin-bottom:10px">⚡ Start Auto</button>
 <button onclick="stopAutoMode()" id="stopBtn" style="background:#ef4444;color:white;padding:14px 24px;border:none;border-radius:8px;cursor:pointer;font-size:16px;display:none;margin-left:10px">⏹️ Stop Auto</button>
@@ -2055,6 +2051,122 @@ let autoTone = 'friendly';
 let pendingAction = false;
 const SEND_LIMIT = ''' + str(SEND_LIMIT) + ''';
 
+// ========= PIPELINE STATE =========
+const MAX_PARALLEL = 2;
+let readyBuffer = [];
+let preparingSet = new Set();
+let refilling = false;
+
+function updatePipelineUI(){
+  const box = document.getElementById('pipelineBox');
+  const txt = document.getElementById('pipelineText');
+  if(autoMode){
+    box.style.display = 'block';
+    txt.textContent = '⚡ Pipeline: ' + readyBuffer.length + ' ready · ' + preparingSet.size + ' preparing (running ' + MAX_PARALLEL + ' at a time)';
+  } else {
+    box.style.display = 'none';
+  }
+}
+
+async function prepareItem(id){
+  try{
+    const res = await fetch('/analyze-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id: id})});
+    const data = await res.json();
+    if(!data.success || !data.item) return null;
+    const item = data.item;
+    const senderName = document.getElementById('senderName').value.trim();
+    const emailRes = await fetch('/generate-email', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({
+      report: item.report, tone: autoTone, sender_name: senderName, email: item.email
+    })});
+    const emailData = await emailRes.json();
+    return {
+      id: item.id,
+      email: item.email,
+      domain: item.domain,
+      report: item.report,
+      subject: emailData.success ? emailData.subject : '',
+      message: emailData.success ? emailData.body : ''
+    };
+  }catch(e){ console.error('prepareItem:', e); return null; }
+}
+
+async function refillPipeline(){
+  if(refilling) return;
+  refilling = true;
+  try{
+    while(autoMode && (readyBuffer.length + preparingSet.size) < MAX_PARALLEL){
+      let nextRes;
+      try { nextRes = await fetch('/get-next-pending'); } catch(e){ break; }
+      const nextData = await nextRes.json();
+      if(!nextData.item) break;
+      const id = nextData.item.id;
+      try{
+        await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id: id, status: 'current'})});
+      }catch(e){ break; }
+      preparingSet.add(id);
+      loadQueue();
+      updatePipelineUI();
+      (async () => {
+        const item = await prepareItem(id);
+        preparingSet.delete(id);
+        if(item) readyBuffer.push(item);
+        updatePipelineUI();
+        loadQueue();
+        refillPipeline();
+      })();
+      await new Promise(r => setTimeout(r, 150));
+    }
+  } finally {
+    refilling = false;
+    updatePipelineUI();
+  }
+}
+
+async function showNextReady(){
+  if(!autoMode) return;
+  while(autoMode && readyBuffer.length === 0){
+    document.getElementById('auditSection').style.display = 'block';
+    document.getElementById('currentEmailLabel').textContent = '⏳ Preparing next email...';
+    document.getElementById('auditResult').innerHTML = '<p style="color:#666;padding:20px;text-align:center">⚡ Audit running in background (' + preparingSet.size + ' in progress, ' + readyBuffer.length + ' ready)...</p>';
+    document.getElementById('outreachSection').style.display = 'none';
+    updatePipelineUI();
+    await new Promise(r => setTimeout(r, 800));
+    refillPipeline();
+    if(preparingSet.size === 0 && readyBuffer.length === 0){
+      try{
+        const checkRes = await fetch('/get-next-pending');
+        const checkData = await checkRes.json();
+        if(!checkData.item) break;
+      }catch(e){ break; }
+    }
+  }
+  if(!autoMode) return;
+  if(readyBuffer.length === 0){
+    autoMode = false;
+    updatePipelineUI();
+    document.getElementById('modeStatus').innerHTML = '<p style="color:blue">🎉 Auto complete! All emails processed.</p>';
+    document.getElementById('stopBtn').style.display = 'none';
+    return;
+  }
+  const item = readyBuffer.shift();
+  currentItem = {id: item.id, email: item.email, domain: item.domain, report: item.report};
+  currentAuditReport = item.report;
+  document.getElementById('auditSection').style.display = 'block';
+  document.getElementById('currentEmailLabel').textContent = '📧 ' + item.email + '  →  ' + item.domain + '  (buffer: ' + readyBuffer.length + ' ready, ' + preparingSet.size + ' preparing)';
+  renderReport(item.report);
+  document.getElementById('outreachSection').style.display = 'block';
+  document.getElementById('genSubject').value = item.subject;
+  document.getElementById('genBody').value = item.message;
+  document.getElementById('emailPreview').style.display = 'block';
+  updatePipelineUI();
+  loadQueue();
+  refillPipeline();
+  if(autoMode && !pendingAction){
+    pendingAction = true;
+    setTimeout(async()=>{ pendingAction = false; await autoSend(); }, 1200);
+  }
+}
+
 function showToneModal(){ document.getElementById('toneModal').style.display = 'flex'; }
 function closeToneModal(){ document.getElementById('toneModal').style.display = 'none'; }
 function pickTone(tone){
@@ -2062,8 +2174,11 @@ function pickTone(tone){
   autoTone = tone;
   autoMode = true;
   pendingAction = false;
-  document.getElementById('modeStatus').innerHTML = '<p style="color:green">⚡ Auto mode ON (' + tone + ')</p>';
+  readyBuffer = [];
+  preparingSet.clear();
+  document.getElementById('modeStatus').innerHTML = '<p style="color:green">⚡ Auto mode ON (' + tone + ') — preparing 2 emails in parallel...</p>';
   document.getElementById('stopBtn').style.display = 'inline-block';
+  refillPipeline();
   nextAuto();
 }
 
@@ -2100,6 +2215,8 @@ async function resetCounter(){
   if(!confirm('Reset the session counter to 0? Auto mode will stop.')) return;
   autoMode = false;
   pendingAction = false;
+  readyBuffer = [];
+  updatePipelineUI();
   await fetch('/reset-session-counter', {method:'POST'});
   await loadCounter();
   document.getElementById('modeStatus').innerHTML = '<p style="color:red">🔄 Counter reset to 0. Auto mode stopped.</p>';
@@ -2112,6 +2229,7 @@ async function continueAuto(){
   pendingAction = false;
   document.getElementById('modeStatus').innerHTML = '<p style="color:green">▶️ Continuing auto mode...</p>';
   document.getElementById('stopBtn').style.display = 'inline-block';
+  refillPipeline();
   nextAuto();
 }
 
@@ -2134,7 +2252,7 @@ async function loadQueue(){
     data.items.forEach(i=>{
       let icon = '⏳'; let color = '#f59e0b';
       if(i.status==='done'){ icon='✅'; color='#16a34a'; }
-      else if(i.status==='current'){ icon='▶️'; color='#3b82f6'; }
+      else if(i.status==='current'){ icon='⚙️'; color='#3b82f6'; }
       else if(i.status==='skipped'){ icon='⏭️'; color='#6b7280'; }
       html += '<div style="background:#f9f9f9;padding:10px;border-radius:6px;margin:6px 0;border-left:4px solid '+color+';display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">';
       html += '<div style="font-size:14px"><span style="margin-right:8px">'+icon+'</span><b>'+i.email+'</b><br><span style="color:#666;font-size:12px">'+i.domain+'</span></div>';
@@ -2217,6 +2335,8 @@ async function deleteItem(id){
 }
 
 async function analyzeItem(id){
+  autoMode = false;
+  pendingAction = false;
   document.getElementById('auditSection').style.display = 'block';
   document.getElementById('auditResult').innerHTML = '<p style="color:#666;padding:20px;text-align:center">⏳ Running audit... 30-45 seconds</p>';
   document.getElementById('outreachSection').style.display = 'none';
@@ -2233,17 +2353,11 @@ async function analyzeItem(id){
       document.getElementById('outreachSection').style.display = 'block';
       await generateEmail(autoTone);
       loadQueue();
-      if(autoMode && !pendingAction){
-        pendingAction = true;
-        setTimeout(async()=>{ pendingAction = false; await autoSend(); }, 1500);
-      }
     } else {
       document.getElementById('auditResult').innerHTML = '<p style="color:red">Error: '+(data.error||'Unknown')+'</p>';
-      if(autoMode) setTimeout(nextAuto, 3000);
     }
   }catch(e){
     document.getElementById('auditResult').innerHTML = '<p style="color:red">Error: '+e.message+'</p>';
-    if(autoMode) setTimeout(nextAuto, 3000);
   }
 }
 
@@ -2309,8 +2423,10 @@ async function skipCurrent(){
 
 async function startManualMode(){
   autoMode = false;
+  pendingAction = false;
   document.getElementById('modeStatus').innerHTML = '<p style="color:blue">▶️ Manual mode: click each email to analyze</p>';
   document.getElementById('stopBtn').style.display = 'none';
+  updatePipelineUI();
 }
 
 async function startAutoMode(){
@@ -2322,6 +2438,11 @@ async function startAutoMode(){
 function stopAutoMode(){
   autoMode = false;
   pendingAction = false;
+  for(const item of readyBuffer){
+    fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id: item.id, status: 'pending'})});
+  }
+  readyBuffer = [];
+  updatePipelineUI();
   document.getElementById('modeStatus').innerHTML = '<p style="color:red">⏹️ Auto mode stopped</p>';
   document.getElementById('stopBtn').style.display = 'none';
 }
@@ -2361,18 +2482,7 @@ async function nextAuto(){
       return;
     }
   }catch(e){ console.error(e); }
-  try{
-    const res = await fetch('/get-next-pending');
-    const data = await res.json();
-    if(data.item){
-      document.getElementById('modeStatus').innerHTML = '<p style="color:green">⚡ Auto: analyzing '+data.item.email+'...</p>';
-      await analyzeItem(data.item.id);
-    } else {
-      autoMode = false;
-      document.getElementById('modeStatus').innerHTML = '<p style="color:blue">🎉 Auto complete! All emails processed.</p>';
-      document.getElementById('stopBtn').style.display = 'none';
-    }
-  }catch(e){ console.error(e); if(autoMode) setTimeout(nextAuto, 3000); }
+  await showNextReady();
 }
 
 async function autoSend(){
@@ -2407,7 +2517,7 @@ document.addEventListener('visibilitychange', function(){
     if(lastSent){
       localStorage.removeItem('lastAutoSentId');
       currentItem = null;
-      setTimeout(nextAuto, 1500);
+      setTimeout(nextAuto, 1200);
     }
   }
 });
@@ -2457,7 +2567,6 @@ def import_to_queue():
                         if row and row[0]: emails = row[0].split('|||')
                     except: pass
                     finally: release_db(conn)
-            # Map verified emails to their stores using found_pairs
             found_pairs = load_found_pairs(user_email)
             email_to_store = {}
             for e, s in found_pairs:
@@ -2677,4 +2786,4 @@ except Exception as e:
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
