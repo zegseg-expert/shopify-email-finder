@@ -316,9 +316,7 @@ def load_user_state(user_email):
     finally: release_db(conn)
 
 def load_found_pairs(user_email):
-    """Return list of (email, store) tuples from found_emails.
-    - New format: 'email:::store'
-    - Old format: 'email' (store unknown → use email as store so we never fall back to gmail.com)"""
+    """Return list of (email, store) tuples from found_emails."""
     state = load_user_state(user_email)
     pairs = []
     for item in state.get('found_emails', []):
@@ -1980,7 +1978,6 @@ def audit_page():
 <input type="text" id="senderName" value="''' + sender_name.replace('"','') + '''" placeholder="e.g. Daniel Phillips" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:5px;margin:5px 0;box-sizing:border-box;font-size:14px">
 </div>
 
-<!-- SESSION COUNTER -->
 <div id="sessionCounterBox" style="background:linear-gradient(135deg,#1f2937,#374151);color:white;padding:16px;border-radius:10px;margin-bottom:15px">
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
 <span style="font-size:15px;font-weight:bold">📧 Sent this session</span>
@@ -1996,7 +1993,6 @@ def audit_page():
 </div>
 </div>
 
-<!-- PIPELINE STATUS -->
 <div id="pipelineBox" style="background:#eff6ff;border-left:4px solid #3b82f6;padding:10px 14px;border-radius:8px;margin-bottom:15px;font-size:13px;color:#1e40af;display:none">
 <span id="pipelineText"></span>
 </div>
@@ -2032,7 +2028,6 @@ def audit_page():
 
 </div>
 
-<!-- TONE MODAL -->
 <div id="toneModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);z-index:10000;align-items:center;justify-content:center">
   <div style="background:white;padding:24px;border-radius:12px;max-width:340px;width:90%;text-align:center">
     <h3 style="margin:0 0 16px 0">Choose Email Tone</h3>
@@ -2052,7 +2047,7 @@ let pendingAction = false;
 const SEND_LIMIT = ''' + str(SEND_LIMIT) + ''';
 
 // ========= PIPELINE STATE =========
-const MAX_PARALLEL = 2;
+const MAX_PARALLEL = 3;
 let readyBuffer = [];
 let preparingSet = new Set();
 let refilling = false;
@@ -2176,7 +2171,7 @@ function pickTone(tone){
   pendingAction = false;
   readyBuffer = [];
   preparingSet.clear();
-  document.getElementById('modeStatus').innerHTML = '<p style="color:green">⚡ Auto mode ON (' + tone + ') — preparing 2 emails in parallel...</p>';
+  document.getElementById('modeStatus').innerHTML = '<p style="color:green">⚡ Auto mode ON (' + tone + ') — preparing 3 emails in parallel...</p>';
   document.getElementById('stopBtn').style.display = 'inline-block';
   refillPipeline();
   nextAuto();
