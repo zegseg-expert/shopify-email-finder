@@ -1996,7 +1996,6 @@ def audit_page():
 <h3 style="margin:0">📋 Queue (<span id="queueCount">0</span>)</h3>
 <div style="display:flex;gap:6px;flex-wrap:wrap">
 <button onclick="fixDomains()" style="background:#0891b2;color:white;padding:6px 14px;border:none;border-radius:5px;cursor:pointer;font-size:12px">🔧 Fix Old Domains</button>
-<button onclick="clearQueue('done')" style="background:#ef4444;color:white;padding:6px 14px;border:none;border-radius:5px;cursor:pointer;font-size:12px">🗑️ Clear Done</button>
 <button onclick="clearQueue('pending')" style="background:#6b7280;color:white;padding:6px 14px;border:none;border-radius:5px;cursor:pointer;font-size:12px">🗑️ Clear Pending</button>
 </div>
 </div>
@@ -2168,7 +2167,7 @@ async function refillPipeline(){
         loadQueue();
         refillPipeline();
       })();
-      await new Promise(r => setTimeout(r, 150));
+      await new Promise(r => setTimeout(r, 100));
     }
   } finally {
     refilling = false;
@@ -2184,7 +2183,7 @@ async function showNextReady(){
     document.getElementById('auditResult').innerHTML = '<p style="color:#666;padding:20px;text-align:center">⚡ Audit running in background (' + preparingSet.size + ' in progress, ' + readyBuffer.length + ' ready)...</p>';
     document.getElementById('outreachSection').style.display = 'none';
     updatePipelineUI();
-    await new Promise(r => setTimeout(r, 800));
+    await new Promise(r => setTimeout(r, 250));
     refillPipeline();
     if(preparingSet.size === 0 && readyBuffer.length === 0){
       try{
@@ -2217,7 +2216,7 @@ async function showNextReady(){
   refillPipeline();
   if(autoMode && !pendingAction){
     pendingAction = true;
-    setTimeout(async()=>{ pendingAction = false; await autoSend(); }, 1200);
+    setTimeout(async()=>{ pendingAction = false; await autoSend(); }, 150);
   }
 }
 
@@ -2363,11 +2362,9 @@ async function addManual(){
 }
 
 async function clearQueue(mode){
-  const msg = mode === 'done'
-    ? 'Delete all DONE and SKIPPED emails from the queue?'
-    : mode === 'all'
-      ? 'Delete ALL emails from the queue (pending + done)?'
-      : 'Delete all PENDING emails from the queue?';
+  const msg = mode === 'all'
+    ? 'Delete ALL emails from the queue?'
+    : 'Delete all PENDING emails from the queue?';
   if(!confirm(msg)) return;
   const res = await fetch('/clear-queue', {
     method:'POST',
@@ -2456,14 +2453,18 @@ async function sendToScoutAndOpen(){
   const subj = document.getElementById('genSubject').value;
   const body = document.getElementById('genBody').value;
   if(!subj || !body){ alert('Generate email first'); return; }
-  await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentItem.id, subject:subj, message:body})});
-  await fetch('/save-scout-recipients', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [currentItem.email]})});
-  await fetch('/save-scout-state', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [currentItem.email], subject:subj, message:body, count:0})});
-  await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentItem.id, status:'done'})});
-  await fetch('/mark-sent', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({email: currentItem.email})});
+  const itemId = currentItem.id;
+  const itemEmail = currentItem.email;
+  await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id:itemId, subject:subj, message:body})});
+  await fetch('/save-scout-recipients', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [itemEmail]})});
+  await fetch('/save-scout-state', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [itemEmail], subject:subj, message:body, count:0})});
+  await fetch('/mark-sent', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({email: itemEmail})});
+  // DELETE sent email immediately
+  await fetch('/delete-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id: itemId})});
   await fetch('/increment-session-counter', {method:'POST'});
   await loadCounter();
-  const mailto = 'mailto:' + currentItem.email + '?subject=' + encodeURIComponent(subj) + '&body=' + encodeURIComponent(body);
+  loadQueue();
+  const mailto = 'mailto:' + itemEmail + '?subject=' + encodeURIComponent(subj) + '&body=' + encodeURIComponent(body);
   window.location.href = mailto;
 }
 
@@ -2551,11 +2552,14 @@ async function autoSend(){
     nextAuto();
     return;
   }
-  await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentItem.id, subject:subj, message:body})});
-  await fetch('/save-scout-recipients', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [currentItem.email]})});
-  await fetch('/save-scout-state', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [currentItem.email], subject:subj, message:body, count:0})});
-  await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentItem.id, status:'done'})});
-  await fetch('/mark-sent', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({email: currentItem.email})});
+  const itemId = currentItem.id;
+  const itemEmail = currentItem.email;
+  await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id:itemId, subject:subj, message:body})});
+  await fetch('/save-scout-recipients', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [itemEmail]})});
+  await fetch('/save-scout-state', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [itemEmail], subject:subj, message:body, count:0})});
+  await fetch('/mark-sent', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({email: itemEmail})});
+  // DELETE sent email immediately
+  await fetch('/delete-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id: itemId})});
   try{
     const incRes = await fetch('/increment-session-counter', {method:'POST'});
     const incData = await incRes.json();
@@ -2563,8 +2567,8 @@ async function autoSend(){
     updateCounterUI(incData.count, incData.next_milestone, incData.at_milestone);
   }catch(e){ console.error(e); }
   loadQueue();
-  const mailto = 'mailto:' + currentItem.email + '?subject=' + encodeURIComponent(subj) + '&body=' + encodeURIComponent(body);
-  localStorage.setItem('lastAutoSentId', currentItem.id.toString());
+  const mailto = 'mailto:' + itemEmail + '?subject=' + encodeURIComponent(subj) + '&body=' + encodeURIComponent(body);
+  localStorage.setItem('lastAutoSentId', itemId.toString());
   window.location.href = mailto;
 }
 
@@ -2574,7 +2578,7 @@ document.addEventListener('visibilitychange', function(){
     if(lastSent){
       localStorage.removeItem('lastAutoSentId');
       currentItem = null;
-      setTimeout(nextAuto, 1200);
+      setTimeout(nextAuto, 200);
     }
   }
 });
@@ -2590,16 +2594,6 @@ window.onload = function(){ loadQueue(); loadCounter(); };
 @login_required
 def get_audit_queue_route():
     user_email = session.get('user_id')
-    conn = get_db()
-    if conn:
-        try:
-            cur = conn.cursor()
-            cur.execute("""DELETE FROM audit_queue WHERE user_email = %s
-                AND status IN ('done','skipped')
-                AND updated_at < NOW() - INTERVAL '24 hours'""", (user_email,))
-            conn.commit(); cur.close()
-        except: pass
-        finally: release_db(conn)
     return jsonify({'items': get_queue(user_email)})
 
 @app.route('/import-to-queue', methods=['POST'])
