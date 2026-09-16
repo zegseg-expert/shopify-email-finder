@@ -43,6 +43,15 @@ PUBLIC_EMAIL_DOMAINS = {
 }
 
 # ==========================================
+# PLACEHOLDER DOMAINS (blocked on import)
+# ==========================================
+PLACEHOLDER_DOMAINS = {
+    'yourstore.com','example.com','example.org','example.net','domain.com',
+    'yoursite.com','mysite.com','sitename.com','site.com','test.com',
+    'mystore.com','store.com','shop.com','company.com','website.com'
+}
+
+# ==========================================
 # DB POOL
 # ==========================================
 _db_pool = None
@@ -192,6 +201,29 @@ def init_db():
 try:
     init_pool(); init_db()
 except: pass
+
+# ----- FIX 3: Reset stuck 'current' items on startup -----
+def reset_stuck_current_items():
+    """On startup, reset any items stuck in 'current' status back to 'pending'.
+    This fixes orphans left behind by server crashes/restarts."""
+    conn = get_db()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE audit_queue SET status='pending', updated_at=NOW() WHERE status='current'")
+        n = cur.rowcount
+        conn.commit(); cur.close()
+        if n > 0:
+            print(f"🔄 Reset {n} stuck 'current' queue items to 'pending'")
+    except Exception as e:
+        print(f"⚠️ reset_stuck_current_items: {e}")
+    finally: release_db(conn)
+
+try:
+    reset_stuck_current_items()
+except Exception as e:
+    print(f"⚠️ reset_stuck_current_items startup: {e}")
+# ----- /FIX 3 -----
 
 def hash_password(p): return hashlib.sha256(p.encode()).hexdigest()
 
@@ -621,6 +653,7 @@ def do_hf_import(user_email, requested):
             if not store_url: continue
             clean = store_url.replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0].strip().lower()
             if not clean or '.' not in clean: continue
+            if clean in PLACEHOLDER_DOMAINS: skipped += 1; continue
             if clean in seen: skipped += 1; continue
             seen.add(clean)
             cur.execute("SELECT id FROM discovered_stores WHERE user_email = %s AND domain = %s", (user_email, clean))
@@ -690,8 +723,14 @@ def add_to_queue(user_email, pairs):
                 email = item; store = ''
             email = email.strip().lower()
             if not email or '@' not in email: continue
+            # FIX 4: Skip placeholder domains
+            domain_from_email_val = domain_from_email(email)
+            if domain_from_email_val in PLACEHOLDER_DOMAINS:
+                skipped += 1; continue
             store = (store or '').strip().lower()
             if not store or store in PUBLIC_EMAIL_DOMAINS:
+                store = email
+            if store in PLACEHOLDER_DOMAINS:
                 store = email
             cur.execute("SELECT id FROM sent_log WHERE user_email = %s AND email = %s", (user_email, email))
             if cur.fetchone(): skipped += 1; continue
@@ -793,7 +832,7 @@ def fix_queue_domains(user_email):
         rows = cur.fetchall()
         for item_id, email, domain in rows:
             if not domain: continue
-            if domain.lower() in PUBLIC_EMAIL_DOMAINS:
+            if domain.lower() in PUBLIC_EMAIL_DOMAINS or domain.lower() in PLACEHOLDER_DOMAINS:
                 real_store = lookup.get(email.lower(), '')
                 if not real_store or real_store.lower() in PUBLIC_EMAIL_DOMAINS:
                     real_store = email
@@ -965,6 +1004,7 @@ def background_verify_worker(job_id):
 def find_emails(domain):
     domain = domain.strip().lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
     if not domain or '.' not in domain: return []
+    if domain in PLACEHOLDER_DOMAINS: return []
     cached = get_cached_emails(domain)
     if cached is not None: return cached
     emails = []
@@ -2175,6 +2215,21 @@ async function refillPipeline(){
   }
 }
 
+// FIX 1 + 2: retry on server hiccups instead of silently giving up
+async function safeGetNextPending(retries = 5){
+  for(let i = 0; i < retries; i++){
+    try{
+      const res = await fetch('/get-next-pending');
+      if(res.ok){
+        const data = await res.json();
+        return { ok: true, item: data.item || null };
+      }
+    }catch(e){ /* network/server error, retry */ }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  return { ok: false, item: null };
+}
+
 async function showNextReady(){
   if(!autoMode) return;
   while(autoMode && readyBuffer.length === 0){
@@ -2183,14 +2238,15 @@ async function showNextReady(){
     document.getElementById('auditResult').innerHTML = '<p style="color:#666;padding:20px;text-align:center">⚡ Audit running in background (' + preparingSet.size + ' in progress, ' + readyBuffer.length + ' ready)...</p>';
     document.getElementById('outreachSection').style.display = 'none';
     updatePipelineUI();
-    await new Promise(r => setTimeout(r, 250));
+    await new Promise(r => setTimeout(r, 500));
     refillPipeline();
     if(preparingSet.size === 0 && readyBuffer.length === 0){
-      try{
-        const checkRes = await fetch('/get-next-pending');
-        const checkData = await checkRes.json();
-        if(!checkData.item) break;
-      }catch(e){ break; }
+      // FIX 1: only declare "complete" when the server SUCCESSFULLY says no more items
+      const check = await safeGetNextPending(5);
+      if(check.ok && !check.item){
+        break; // truly no more pending
+      }
+      // Otherwise: server error or temporary — keep waiting
     }
   }
   if(!autoMode) return;
@@ -2459,7 +2515,6 @@ async function sendToScoutAndOpen(){
   await fetch('/save-scout-recipients', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [itemEmail]})});
   await fetch('/save-scout-state', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [itemEmail], subject:subj, message:body, count:0})});
   await fetch('/mark-sent', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({email: itemEmail})});
-  // DELETE sent email immediately
   await fetch('/delete-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id: itemId})});
   await fetch('/increment-session-counter', {method:'POST'});
   await loadCounter();
@@ -2558,7 +2613,6 @@ async function autoSend(){
   await fetch('/save-scout-recipients', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [itemEmail]})});
   await fetch('/save-scout-state', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [itemEmail], subject:subj, message:body, count:0})});
   await fetch('/mark-sent', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({email: itemEmail})});
-  // DELETE sent email immediately
   await fetch('/delete-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id: itemId})});
   try{
     const incRes = await fetch('/increment-session-counter', {method:'POST'});
