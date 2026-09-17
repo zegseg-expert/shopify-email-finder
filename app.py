@@ -193,6 +193,15 @@ def init_db():
             status VARCHAR(50) DEFAULT 'pending',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        # ----- NEW: catalogue cache table -----
+        cur.execute("""CREATE TABLE IF NOT EXISTS store_catalogues (
+            id SERIAL PRIMARY KEY, domain VARCHAR(255) UNIQUE NOT NULL,
+            product_count INTEGER DEFAULT 0,
+            categories TEXT, vendors TEXT, tags TEXT,
+            sold_out_count INTEGER DEFAULT 0,
+            bestsellers TEXT,
+            crawled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        # ----- /NEW -----
         conn.commit(); cur.close()
         print("✅ DB ready")
     except Exception as e: print(f"❌ DB: {e}")
@@ -204,8 +213,6 @@ except: pass
 
 # ----- FIX 3: Reset stuck 'current' items on startup -----
 def reset_stuck_current_items():
-    """On startup, reset any items stuck in 'current' status back to 'pending'.
-    This fixes orphans left behind by server crashes/restarts."""
     conn = get_db()
     if not conn: return
     try:
@@ -223,7 +230,6 @@ try:
     reset_stuck_current_items()
 except Exception as e:
     print(f"⚠️ reset_stuck_current_items startup: {e}")
-# ----- /FIX 3 -----
 
 def hash_password(p): return hashlib.sha256(p.encode()).hexdigest()
 
@@ -369,7 +375,7 @@ def load_found_pairs(user_email):
     return pairs
 
 # ==========================================
-# SESSION SEND COUNTER (MILESTONE SYSTEM) + LIMIT
+# SESSION SEND COUNTER + LIMIT
 # ==========================================
 def get_session_sent_count(user_email):
     conn = get_db()
@@ -456,7 +462,119 @@ def counter_status(user_email):
     }
 
 # ==========================================
-# EMAIL FINDER BACKGROUND JOBS (MASTER + SUBJOBS)
+# CATALOGUE CRAWLER (SpyTool-style)
+# ==========================================
+def get_cached_catalogue(domain, max_age_hours=24):
+    conn = get_db()
+    if not conn: return None
+    try:
+        cur = conn.cursor()
+        cur.execute("""SELECT product_count, categories, vendors, tags, sold_out_count, bestsellers
+            FROM store_catalogues WHERE domain = %s
+            AND crawled_at > NOW() - INTERVAL '%s hours'""", (domain, max_age_hours))
+        row = cur.fetchone(); cur.close()
+        if not row: return None
+        return {
+            'product_count': row[0] or 0,
+            'categories': row[1].split('|||') if row[1] else [],
+            'vendors': row[2].split('|||') if row[2] else [],
+            'tags': row[3].split('|||') if row[3] else [],
+            'sold_out_count': row[4] or 0,
+            'bestsellers': json.loads(row[5]) if row[5] else []
+        }
+    except: return None
+    finally: release_db(conn)
+
+def save_catalogue_cache(domain, cat):
+    conn = get_db()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("""INSERT INTO store_catalogues
+            (domain, product_count, categories, vendors, tags, sold_out_count, bestsellers, crawled_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (domain) DO UPDATE SET
+                product_count=EXCLUDED.product_count,
+                categories=EXCLUDED.categories,
+                vendors=EXCLUDED.vendors,
+                tags=EXCLUDED.tags,
+                sold_out_count=EXCLUDED.sold_out_count,
+                bestsellers=EXCLUDED.bestsellers,
+                crawled_at=NOW()""",
+            (domain,
+             cat.get('product_count', 0),
+             '|||'.join(cat.get('categories', [])),
+             '|||'.join(cat.get('vendors', [])),
+             '|||'.join(cat.get('tags', [])),
+             cat.get('sold_out_count', 0),
+             json.dumps(cat.get('bestsellers', []))))
+        conn.commit(); cur.close()
+    except Exception as e:
+        print(f"save_catalogue_cache: {e}")
+    finally: release_db(conn)
+
+def crawl_catalogue(domain, limit=50):
+    """Fetch top N products from /products.json and extract a lightweight summary."""
+    try:
+        domain = domain.strip().lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
+        if not domain or '.' not in domain: return None
+        cached = get_cached_catalogue(domain)
+        if cached is not None: return cached
+        url = f"https://{domain}/products.json?limit={limit}"
+        r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        if r.status_code != 200: return None
+        data = r.json()
+        products = data.get('products', [])
+        if not products: return None
+
+        categories = {}
+        vendors = {}
+        tags = {}
+        sold_out = 0
+        product_details = []
+
+        for p in products:
+            pt = (p.get('product_type') or 'Uncategorized').strip()
+            if pt: categories[pt] = categories.get(pt, 0) + 1
+
+            v = (p.get('vendor') or 'Unknown').strip()
+            if v: vendors[v] = vendors.get(v, 0) + 1
+
+            for t in p.get('tags', [])[:5]:
+                t = (t or '').strip()
+                if t: tags[t] = tags.get(t, 0) + 1
+
+            variants = p.get('variants', [])
+            if any(not v.get('available', True) for v in variants):
+                sold_out += 1
+
+            product_details.append({
+                'title': (p.get('title') or '')[:80],
+                'variants': len(variants),
+                'price': variants[0].get('price', '') if variants else ''
+            })
+
+        top_categories = [c[0] for c in sorted(categories.items(), key=lambda x: -x[1])[:5]]
+        top_vendors = [v[0] for v in sorted(vendors.items(), key=lambda x: -x[1])[:5]]
+        top_tags = [t[0] for t in sorted(tags.items(), key=lambda x: -x[1])[:10]]
+        bestsellers = sorted(product_details, key=lambda x: -x['variants'])[:5]
+
+        result = {
+            'product_count': len(products),
+            'categories': top_categories,
+            'vendors': top_vendors,
+            'tags': top_tags,
+            'sold_out_count': sold_out,
+            'bestsellers': bestsellers
+        }
+        save_catalogue_cache(domain, result)
+        return result
+    except Exception as e:
+        print(f"crawl_catalogue({domain}): {e}")
+        return None
+
+# ==========================================
+# EMAIL FINDER BACKGROUND JOBS
 # ==========================================
 def process_subjob(subjob_id):
     conn = get_db()
@@ -723,7 +841,6 @@ def add_to_queue(user_email, pairs):
                 email = item; store = ''
             email = email.strip().lower()
             if not email or '@' not in email: continue
-            # FIX 4: Skip placeholder domains
             domain_from_email_val = domain_from_email(email)
             if domain_from_email_val in PLACEHOLDER_DOMAINS:
                 skipped += 1; continue
@@ -1039,9 +1156,9 @@ def find_emails(domain):
     return final
 
 # ==========================================
-# AUDIT
+# AUDIT (with optional catalogue crawl)
 # ==========================================
-def audit_store(domain, case_id):
+def audit_store(domain, case_id, include_catalogue=False):
     raw = domain.strip().lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
     report = {"domain": raw, "case_id": case_id, "audited_at": datetime.now().isoformat(), "checks": {}, "scores": {}, "issues": [], "positives": []}
     if not raw or '.' not in raw:
@@ -1208,20 +1325,115 @@ def audit_store(domain, case_id):
     if len(payments) >= 3: mkt += 10
     report["scores"]["marketing_score"] = min(mkt, 100)
     report["scores"]["overall_score"] = int((report["scores"]["trust_score"] + report["scores"]["technical_score"] + report["scores"]["marketing_score"]) / 3)
+
+    # ----- Catalogue crawl (optional) -----
+    if include_catalogue:
+        try:
+            cat = crawl_catalogue(raw, limit=50)
+            if cat:
+                report["catalogue"] = cat
+        except Exception as e:
+            print(f"catalogue during audit: {e}")
     return report
 
 # ==========================================
-# EMAIL GENERATOR
+# EMAIL GENERATOR (RANDOMIZED)
 # ==========================================
+GREETINGS = {
+    'friendly': ["Hi {brand} team,", "Hey {brand} folks,", "Hello {brand},", "Hey {brand},", "Hi {brand},", "Hey there {brand},"],
+    'professional': ["Hello {brand} team,", "Dear {brand} team,", "Greetings {brand} team,", "Hello {brand},", "Good day {brand} team,"],
+    'casual': ["Hey {brand},", "Yo {brand},", "What's up {brand}?", "Hey {brand} team,"]
+}
+
+OPENERS_WITH_URL = {
+    'friendly': [
+        "Just had a quick look at {url} — spotted a few things.",
+        "Went through {url} today and noticed a few issues.",
+        "Spent a few minutes on {url} — here's what stood out.",
+        "Checked out {url} and found some quick wins.",
+        "Browsed {url} today and jotted down a few notes.",
+        "Took a peek at {url} — found some easy fixes."
+    ],
+    'professional': [
+        "I reviewed {url} and identified several areas for improvement.",
+        "After analyzing {url}, I found a few notable issues.",
+        "I ran a quick audit of {url} today and wanted to share the findings.",
+        "Here are some observations from my review of {url}.",
+        "I spent some time analyzing {url} — here's what I found."
+    ],
+    'casual': [
+        "Just checked {url} — found a few things.",
+        "Took a look at {url} and noticed some stuff.",
+        "Was browsing {url} and saw a few issues.",
+        "Had a look at {url} — here's what popped up.",
+        "Quick peek at {url}, and I found some wins."
+    ]
+}
+
+OPENERS_NO_URL = {
+    'friendly': [
+        "Just had a quick look at your store — spotted a few things.",
+        "Went through your store today and noticed a few issues.",
+        "Spent a few minutes on your store — here's what stood out."
+    ],
+    'professional': [
+        "I reviewed your store and identified several areas for improvement.",
+        "After analyzing your store, I found a few notable issues.",
+        "I ran a quick audit of your store today and wanted to share the findings."
+    ],
+    'casual': [
+        "Just checked your store — found a few things.",
+        "Took a look at your store and noticed some stuff.",
+        "Was browsing your store and saw a few issues."
+    ]
+}
+
+ISSUES_INTROS = {
+    'friendly': ["Top issues I found:", "Here's what I noticed:", "Quick list:", "What stood out:", "A few things off:"],
+    'professional': ["Key findings:", "Issues identified:", "Summary of findings:", "The main issues I found:", "Notable findings:"],
+    'casual': ["Here's what I found:", "Quick rundown:", "Stuff I noticed:", "What's off:", "Quick list:"]
+}
+
+CATALOGUE_INTROS = {
+    'friendly': ["Also noticed in your catalogue:", "On the product side:", "One more thing:", "About your products:", "Also worth noting:"],
+    'professional': ["Additionally, regarding your product catalogue:", "I also noted the following about your catalogue:", "On the product side:", "Regarding your inventory:", "Catalogue observations:"],
+    'casual': ["Also saw this about your products:", "About your catalogue:", "One more thing:", "Also on the product side:"]
+}
+
+SCORE_LINES = [
+    "Overall score: {score}/100 — most are 1-day fixes.",
+    "Overall: {score}/100. Fixable in a day or two.",
+    "Score: {score}/100. Easy wins."
+]
+
+CTAS = {
+    'friendly': ["Want me to send a quick 2-min video?", "Want a short checklist?", "Should I send over the details?", "Want me to send a quick Loom?", "Interested in a quick fix list?", "Can I send a short walkthrough?"],
+    'professional': ["Would a short walkthrough be useful?", "Shall I send over the detailed findings?", "Would you like me to send a brief video?", "Can I share a quick report on this?", "Would a 15-min call be worth scheduling?"],
+    'casual': ["Want a quick video?", "Should I send the details?", "Want a checklist?", "Send over a Loom?", "Want a quick fix list?"]
+}
+
+SIGNOFF_LINES = {
+    'friendly': ["No pitch — just thought it was worth sharing.", "No pressure either way.", "Just sharing in case it's useful.", "Not selling anything — just helping.", "Thought you'd want to know."],
+    'professional': ["Happy to provide a detailed report if helpful.", "Let me know if you'd like the full breakdown.", "No obligation — just wanted to flag it.", "Feel free to reach out if this is useful."],
+    'casual': ["No pitch — just sharing.", "No pressure.", "Just thought I'd share.", "No strings attached."]
+}
+
+SIGNOFFS = ["Best regards,", "Cheers,", "Best,", "Warmly,"]
+
+def pick(pool):
+    try: return random.choice(pool)
+    except: return pool[0] if pool else ''
+
 def generate_outreach_email(report, tone='friendly', sender_name='', email=''):
+    tone = tone if tone in GREETINGS else 'friendly'
     domain = report.get('domain', '')
     is_email_as_domain = '@' in domain if domain else False
 
     if is_email_as_domain:
-        brand = domain
+        brand = domain.split('@')[0]
         display_url = ''
     elif domain and domain.lower() in PUBLIC_EMAIL_DOMAINS:
-        brand = email if email else domain
+        brand = email.split('@')[0] if email and '@' in email else 'there'
         display_url = ''
     else:
         brand = domain.split('.')[0].title() if domain else 'there'
@@ -1248,42 +1460,49 @@ def generate_outreach_email(report, tone='friendly', sender_name='', email=''):
     elif overall < 75: subject = f"Quick idea for {subj_target}"
     else: subject = f"Nice store! One thing I noticed on {subj_target}"
 
-    if tone == 'friendly':
-        greeting = f"Hi {brand} team,"
-        if display_url:
-            opener = f"I was looking at {display_url} today and noticed a few things that could be costing you sales."
-        else:
-            opener = "I came across your store today and noticed a few things that could be costing you sales."
-        closer = "Want me to send over a quick 2-min video showing how to fix these?"
-        signoff = "No pitch — just thought it was worth sharing."
-    elif tone == 'professional':
-        greeting = f"Hello {brand} team,"
-        if display_url:
-            opener = f"I recently analyzed {display_url} and identified {len(issues)} optimization opportunities."
-        else:
-            opener = f"I recently analyzed your store and identified {len(issues)} optimization opportunities."
-        closer = "Would it be worth a 15-minute call this week to discuss?"
-        signoff = "I help Shopify stores improve conversion. Happy to walk you through it."
-    else:
-        greeting = f"Hey {brand},"
-        if display_url:
-            opener = f"Took a look at {display_url} — cool store! Noticed a few things though."
-        else:
-            opener = "Took a look at your store — cool store! Noticed a few things though."
-        closer = "Want me to send a quick checklist of fixes?"
-        signoff = "No pressure either way!"
-
-    body = f"""{greeting}
-
-{opener}
-
-Top 3 issues I found:
-
-"""
-    for b in issue_bullets:
-        body += f"• {b}\n"
+    greeting = pick(GREETINGS[tone]).replace('{brand}', brand)
+    opener = pick(OPENERS_WITH_URL[tone] if display_url else OPENERS_NO_URL[tone]).replace('{url}', display_url)
+    issues_intro = pick(ISSUES_INTROS[tone])
+    score_line = pick(SCORE_LINES).replace('{score}', str(overall))
+    cta = pick(CTAS[tone])
+    signoff_line = pick(SIGNOFF_LINES[tone])
+    signoff = pick(SIGNOFFS)
     signature = sender_name.strip() if sender_name and sender_name.strip() else "[Your name]"
-    body += f"\nOverall score: {overall}/100. Most are fixable in a day or two.\n\n{closer}\n\n{signoff}\n\nBest regards,\n{signature}"
+
+    body_parts = [greeting, "", opener, "", issues_intro, ""]
+    for b in issue_bullets:
+        body_parts.append(f"• {b}")
+    body_parts.append("")
+
+    cat = report.get('catalogue')
+    if cat and (cat.get('product_count') or cat.get('categories')):
+        cat_intro = pick(CATALOGUE_INTROS[tone])
+        cat_lines = []
+        pc = cat.get('product_count', 0)
+        cats = cat.get('categories', [])[:3]
+        if pc and cats:
+            cat_lines.append(f"{pc} products — top categories: {', '.join(cats)}")
+        elif pc:
+            cat_lines.append(f"{pc} products live")
+        sold = cat.get('sold_out_count', 0)
+        if sold > 0:
+            cat_lines.append(f"{sold} bestsellers currently sold out")
+        if cat_lines:
+            body_parts.append(cat_intro)
+            for c in cat_lines:
+                body_parts.append(f"• {c}")
+            body_parts.append("")
+
+    body_parts.append(score_line)
+    body_parts.append("")
+    body_parts.append(cta)
+    body_parts.append("")
+    body_parts.append(signoff_line)
+    body_parts.append("")
+    body_parts.append(signoff)
+    body_parts.append(signature)
+
+    body = "\n".join(body_parts)
     return {'subject': subject, 'body': body, 'tone': tone}
 
 # ==========================================
@@ -1542,9 +1761,6 @@ window.onload = function(){ loadJobs(); setInterval(loadJobs, 5000); };
 </script>'''
     return render_page("Finder", body)
 
-# ==========================================
-# EMAIL FINDER JOB API
-# ==========================================
 @app.route('/start-email-finder-job', methods=['POST'])
 @login_required
 def start_email_finder_job():
@@ -2052,6 +2268,14 @@ def audit_page():
 <input type="text" id="senderName" value="''' + sender_name.replace('"','') + '''" placeholder="e.g. Daniel Phillips" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:5px;margin:5px 0;box-sizing:border-box;font-size:14px">
 </div>
 
+<div style="margin-bottom:15px">
+<label style="font-weight:bold;font-size:13px;display:flex;align-items:center;gap:8px;cursor:pointer">
+<input type="checkbox" id="includeCatalogue" style="width:18px;height:18px;cursor:pointer">
+<span>🛍️ Include product catalogue insights in emails</span>
+</label>
+<div style="font-size:11px;color:#666;margin-left:26px">Fetches top 50 products to add product data to your outreach (slight speed impact)</div>
+</div>
+
 <div id="sessionCounterBox" style="background:linear-gradient(135deg,#1f2937,#374151);color:white;padding:16px;border-radius:10px;margin-bottom:15px">
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
 <span style="font-size:15px;font-weight:bold">📧 Sent this session</span>
@@ -2097,6 +2321,7 @@ def audit_page():
 <button onclick="regenerateEmail('friendly')" style="background:#0d9488;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;margin-right:5px">😊 Friendly</button>
 <button onclick="regenerateEmail('professional')" style="background:#3b82f6;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;margin-right:5px">💼 Professional</button>
 <button onclick="regenerateEmail('casual')" style="background:#f59e0b;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px">😎 Casual</button>
+<button onclick="generateEmail(autoTone)" style="background:#8b5cf6;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;margin-left:5px">🔄 Regenerate</button>
 </div>
 <div id="emailPreview" style="display:none">
 <label style="font-weight:bold;font-size:13px">Subject:</label>
@@ -2163,7 +2388,8 @@ async function saveLimit(){
 
 async function prepareItem(id){
   try{
-    const res = await fetch('/analyze-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id: id})});
+    const includeCat = document.getElementById('includeCatalogue').checked;
+    const res = await fetch('/analyze-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id: id, include_catalogue: includeCat})});
     const data = await res.json();
     if(!data.success || !data.item) return null;
     const item = data.item;
@@ -2215,7 +2441,6 @@ async function refillPipeline(){
   }
 }
 
-// FIX 1 + 2: retry on server hiccups instead of silently giving up
 async function safeGetNextPending(retries = 5){
   for(let i = 0; i < retries; i++){
     try{
@@ -2224,7 +2449,7 @@ async function safeGetNextPending(retries = 5){
         const data = await res.json();
         return { ok: true, item: data.item || null };
       }
-    }catch(e){ /* network/server error, retry */ }
+    }catch(e){ /* retry */ }
     await new Promise(r => setTimeout(r, 1000));
   }
   return { ok: false, item: null };
@@ -2241,12 +2466,8 @@ async function showNextReady(){
     await new Promise(r => setTimeout(r, 500));
     refillPipeline();
     if(preparingSet.size === 0 && readyBuffer.length === 0){
-      // FIX 1: only declare "complete" when the server SUCCESSFULLY says no more items
       const check = await safeGetNextPending(5);
-      if(check.ok && !check.item){
-        break; // truly no more pending
-      }
-      // Otherwise: server error or temporary — keep waiting
+      if(check.ok && !check.item){ break; }
     }
   }
   if(!autoMode) return;
@@ -2451,7 +2672,8 @@ async function analyzeItem(id){
   document.getElementById('currentEmailLabel').textContent = '🔍 Loading...';
   await fetch('/update-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id, status:'current'})});
   try{
-    const res = await fetch('/analyze-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})});
+    const includeCat = document.getElementById('includeCatalogue').checked;
+    const res = await fetch('/analyze-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id, include_catalogue: includeCat})});
     const data = await res.json();
     if(data.success){
       currentItem = data.item;
@@ -2477,6 +2699,25 @@ function renderReport(r){
   let h='';
   h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:15px"><h2 style="margin:0">Store Audit Overview</h2><div style="color:#666;font-size:13px;margin-top:6px">Store: <a href="https://'+r.domain+'" target="_blank" style="color:#3b82f6">https://'+r.domain+'/</a></div>'+(r.case_id?'<div style="background:#f3f4f6;padding:6px 12px;border-radius:6px;font-size:13px;color:#374151;margin-top:8px;display:inline-block">Case ID: <b>'+r.case_id+'</b></div>':'')+'</div>';
   h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:15px"><h3 style="margin-top:0">📈 Scores</h3>'+scoreBar('Overall',sc.overall_score||0)+scoreBar('Trust',sc.trust_score||0)+scoreBar('Technical',sc.technical_score||0)+scoreBar('Marketing',sc.marketing_score||0)+'</div>';
+
+  if(r.catalogue){
+    const cat = r.catalogue;
+    h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:15px">';
+    h+='<h3 style="margin-top:0">🛍️ Product Catalogue</h3>';
+    h+='<div style="font-size:14px;color:#374151">';
+    h+='<div><b>Products:</b> '+cat.product_count+'</div>';
+    if(cat.categories && cat.categories.length) h+='<div style="margin-top:4px"><b>Top categories:</b> '+cat.categories.join(', ')+'</div>';
+    if(cat.vendors && cat.vendors.length) h+='<div style="margin-top:4px"><b>Top vendors:</b> '+cat.vendors.join(', ')+'</div>';
+    if(cat.sold_out_count > 0) h+='<div style="margin-top:4px;color:#dc2626"><b>Sold out:</b> '+cat.sold_out_count+' products</div>';
+    if(cat.bestsellers && cat.bestsellers.length){
+      h+='<div style="margin-top:8px"><b>Top products:</b></div>';
+      cat.bestsellers.slice(0,3).forEach(b=>{
+        h+='<div style="padding-left:12px;font-size:13px;color:#555">• '+b.title+(b.variants?' ('+b.variants+' variants)':'')+'</div>';
+      });
+    }
+    h+='</div></div>';
+  }
+
   const hi=iss.filter(i=>i.severity==='high');
   if(hi.length>0)h+='<div style="background:#fef2f2;border-left:4px solid #ef4444;padding:15px;border-radius:8px;margin-bottom:15px"><div style="color:#991b1b;font-weight:bold">⚠️ '+hi.length+' critical issue(s)</div></div>';
   if(iss.length>0){h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:15px"><h3 style="margin-top:0;color:#991b1b">⚠️ Issues ('+iss.length+')</h3>';iss.forEach(i=>{const c=i.severity==='high'?'#ef4444':(i.severity==='medium'?'#f59e0b':'#6b7280');h+='<div style="background:#fef2f2;border-left:4px solid '+c+';padding:12px;border-radius:6px;margin:8px 0"><div style="font-weight:bold;font-size:14px">⚠️ '+i.title+'</div><div style="color:#374151;font-size:13px;margin:4px 0">'+i.description+'</div><div style="background:#fef3c7;padding:8px;border-radius:5px;font-size:12px;color:#78350f"><b>💡</b> '+i.recommendation+'</div></div>'});h+='</div>'}
@@ -2786,13 +3027,15 @@ def set_send_limit_route():
 @login_required
 def analyze_queue_item():
     user_email = session.get('user_id')
-    item_id = request.json.get('id')
+    data = request.json
+    item_id = data.get('id')
+    include_catalogue = bool(data.get('include_catalogue', False))
     item = get_queue_item(item_id, user_email)
     if not item: return jsonify({'success': False, 'error': 'Item not found'})
     if item.get('report'):
         return jsonify({'success': True, 'item': item})
     case_id = generate_case_id()
-    report = audit_store(item['domain'], case_id)
+    report = audit_store(item['domain'], case_id, include_catalogue=include_catalogue)
     update_queue_item(item_id, user_email, report=report, status='current')
     save_audit_history(user_email, item['domain'], report)
     item = get_queue_item(item_id, user_email)
