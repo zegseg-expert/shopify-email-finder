@@ -193,7 +193,6 @@ def init_db():
             status VARCHAR(50) DEFAULT 'pending',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        # ----- NEW: catalogue cache table -----
         cur.execute("""CREATE TABLE IF NOT EXISTS store_catalogues (
             id SERIAL PRIMARY KEY, domain VARCHAR(255) UNIQUE NOT NULL,
             product_count INTEGER DEFAULT 0,
@@ -201,7 +200,6 @@ def init_db():
             sold_out_count INTEGER DEFAULT 0,
             bestsellers TEXT,
             crawled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        # ----- /NEW -----
         conn.commit(); cur.close()
         print("✅ DB ready")
     except Exception as e: print(f"❌ DB: {e}")
@@ -211,7 +209,6 @@ try:
     init_pool(); init_db()
 except: pass
 
-# ----- FIX 3: Reset stuck 'current' items on startup -----
 def reset_stuck_current_items():
     conn = get_db()
     if not conn: return
@@ -462,7 +459,7 @@ def counter_status(user_email):
     }
 
 # ==========================================
-# CATALOGUE CRAWLER (SpyTool-style)
+# CATALOGUE CRAWLER
 # ==========================================
 def get_cached_catalogue(domain, max_age_hours=24):
     conn = get_db()
@@ -514,7 +511,6 @@ def save_catalogue_cache(domain, cat):
     finally: release_db(conn)
 
 def crawl_catalogue(domain, limit=50):
-    """Fetch top N products from /products.json and extract a lightweight summary."""
     try:
         domain = domain.strip().lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
         if not domain or '.' not in domain: return None
@@ -1156,7 +1152,7 @@ def find_emails(domain):
     return final
 
 # ==========================================
-# AUDIT (with optional catalogue crawl)
+# AUDIT
 # ==========================================
 def audit_store(domain, case_id, include_catalogue=False):
     raw = domain.strip().lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
@@ -1326,13 +1322,11 @@ def audit_store(domain, case_id, include_catalogue=False):
     report["scores"]["marketing_score"] = min(mkt, 100)
     report["scores"]["overall_score"] = int((report["scores"]["trust_score"] + report["scores"]["technical_score"] + report["scores"]["marketing_score"]) / 3)
 
-    # ----- Catalogue crawl (optional) -----
     if include_catalogue:
         try:
             cat = crawl_catalogue(raw, limit=50)
             if cat:
-                report["catalogue"] = cat
-        except Exception as e:
+                report["catalogue"] = cat        except Exception as e:
             print(f"catalogue during audit: {e}")
     return report
 
@@ -2181,7 +2175,7 @@ window.onload=function(){refreshJobs();setInterval(refreshJobs,10000)};
     return render_page("Verify", body)
 
 # ==========================================
-# SCOUT
+# SCOUT (with From Finder + From Verified buttons)
 # ==========================================
 @app.route('/scout')
 @login_required
@@ -2190,8 +2184,14 @@ def scout():
 <div style="background:#0d9488;color:white;padding:20px;border-radius:10px;margin-bottom:20px"><h1 style="margin:0">📨 Email Scout</h1></div>
 <div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
 <h3 style="margin-top:0">📥 Recipients</h3>
+<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+<button onclick="loadFromFinder()" style="background:#667eea;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;font-size:13px">📥 From Finder</button>
+<button onclick="loadFromVerified()" style="background:#f59e0b;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;font-size:13px">✅ From Verified</button>
+<button onclick="clearRecipients()" style="background:#ef4444;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;font-size:13px">🗑️ Clear</button>
+</div>
 <textarea id="emailsInput" oninput="syncRecipients()" style="width:100%;height:160px;border:1px solid #ddd;border-radius:5px;padding:10px;font-family:monospace;box-sizing:border-box"></textarea>
 <div id="emailCount" style="margin-top:10px;font-weight:bold">0 recipients</div>
+<div id="loadStatus" style="margin-top:6px;font-size:13px"></div>
 </div>
 <div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
 <h3 style="margin-top:0">✍️ Template</h3>
@@ -2211,6 +2211,46 @@ window.onload=async function(){try{const res=await fetch('/load-scout-state');co
   if(data.subject) document.getElementById('subjectLine').value = data.subject;
   if(data.message) document.getElementById('messageBody').value = data.message;
 }catch(e){};document.getElementById('emailCount').textContent=recipients.length+' recipients';};
+
+async function loadFromFinder(){
+  const status = document.getElementById('loadStatus');
+  status.textContent = '⏳ Loading from Finder...';
+  try{
+    const res = await fetch('/get-stored-emails');
+    const data = await res.json();
+    if(!data.emails || data.emails.length === 0){
+      status.innerHTML = '<span style="color:#dc2626">No emails found in Finder results.</span>';
+      return;
+    }
+    document.getElementById('emailsInput').value = data.emails.join('\\n');
+    syncRecipients();
+    status.innerHTML = '<span style="color:#16a34a">✅ Loaded ' + data.emails.length + ' emails from Finder</span>';
+  }catch(e){ status.innerHTML = '<span style="color:#dc2626">Error: ' + e.message + '</span>'; }
+}
+
+async function loadFromVerified(){
+  const status = document.getElementById('loadStatus');
+  status.textContent = '⏳ Loading from last Verify job...';
+  try{
+    const res = await fetch('/get-verified-emails');
+    const data = await res.json();
+    if(!data.emails || data.emails.length === 0){
+      status.innerHTML = '<span style="color:#dc2626">No valid emails from last verify job.</span>';
+      return;
+    }
+    document.getElementById('emailsInput').value = data.emails.join('\\n');
+    syncRecipients();
+    status.innerHTML = '<span style="color:#16a34a">✅ Loaded ' + data.emails.length + ' verified emails</span>';
+  }catch(e){ status.innerHTML = '<span style="color:#dc2626">Error: ' + e.message + '</span>'; }
+}
+
+function clearRecipients(){
+  if(!confirm('Clear all recipients?')) return;
+  document.getElementById('emailsInput').value = '';
+  syncRecipients();
+  document.getElementById('loadStatus').textContent = '';
+}
+
 async function saveState(){try{await fetch('/save-scout-state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients:recipients,subject:document.getElementById('subjectLine').value,message:document.getElementById('messageBody').value,count:scoutedEmails})})}catch(e){}}
 function startCampaign(){if(recipients.length===0){alert('Add recipients');return}isRunning=true;openNextEmail()}
 function stopCampaign(){isRunning=false}
@@ -3114,6 +3154,26 @@ def get_stored_emails():
         else:
             emails.append(item.strip())
     return jsonify({'emails': [e for e in emails if e]})
+
+# ----- NEW: verified emails from last completed job -----
+@app.route('/get-verified-emails')
+@login_required
+def get_verified_emails():
+    user_email = session.get('user_id')
+    conn = get_db()
+    if not conn: return jsonify({'emails': []})
+    try:
+        cur = conn.cursor()
+        cur.execute("""SELECT valid_emails FROM verify_jobs
+            WHERE user_email = %s AND status = 'completed'
+            ORDER BY created_at DESC LIMIT 1""", (user_email,))
+        row = cur.fetchone(); cur.close()
+        if row and row[0]:
+            emails = [e.strip() for e in row[0].split('|||') if e.strip()]
+            return jsonify({'emails': emails})
+        return jsonify({'emails': []})
+    except: return jsonify({'emails': []})
+    finally: release_db(conn)
 
 @app.route('/save-scout-recipients', methods=['POST'])
 @login_required
