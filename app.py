@@ -1326,7 +1326,8 @@ def audit_store(domain, case_id, include_catalogue=False):
         try:
             cat = crawl_catalogue(raw, limit=50)
             if cat:
-                report["catalogue"] = cat        except Exception as e:
+                report["catalogue"] = cat
+        except Exception as e:
             print(f"catalogue during audit: {e}")
     return report
 
@@ -2175,7 +2176,7 @@ window.onload=function(){refreshJobs();setInterval(refreshJobs,10000)};
     return render_page("Verify", body)
 
 # ==========================================
-# SCOUT (with From Finder + From Verified buttons)
+# SCOUT
 # ==========================================
 @app.route('/scout')
 @login_required
@@ -3155,7 +3156,6 @@ def get_stored_emails():
             emails.append(item.strip())
     return jsonify({'emails': [e for e in emails if e]})
 
-# ----- NEW: verified emails from last completed job -----
 @app.route('/get-verified-emails')
 @login_required
 def get_verified_emails():
