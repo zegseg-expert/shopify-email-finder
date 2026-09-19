@@ -20,6 +20,8 @@ app.secret_key = 'super_secret_key_12345_change_this'
 DATABASE_URL = os.environ.get('DATABASE_URL')
 SHODAN_API_KEY = 'W5LL903l5aFfMROHmpBQGNm7mMkCimWq'
 HF_DATASET = "snncn/shopify-websites"
+APEX_TOKEN = os.environ.get('APEX_TOKEN', '')
+APEX_API_BASE = "https://api.eccompass.ai/public/api/v1"
 
 SHOPIFY_IPS = ["23.227.38.32","23.227.38.36","23.227.38.65","23.227.38.66","23.227.38.67","23.227.38.68","23.227.38.69","23.227.38.70","23.227.38.71","23.227.38.72","23.227.38.73","23.227.38.74","23.227.39.20"]
 
@@ -146,14 +148,21 @@ def init_db():
             has_email BOOLEAN DEFAULT FALSE,
             discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_email, domain))""")
-        # ----- NEW: Wix stores table -----
         cur.execute("""CREATE TABLE IF NOT EXISTS wix_stores (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             domain VARCHAR(255) NOT NULL, source VARCHAR(50),
             has_email BOOLEAN DEFAULT FALSE,
+            emails TEXT,
+            gmv NUMERIC,
+            country VARCHAR(10),
             discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_email, domain))""")
-        # ----- NEW: Wix discovery jobs -----
+        try: cur.execute("ALTER TABLE wix_stores ADD COLUMN IF NOT EXISTS emails TEXT")
+        except: pass
+        try: cur.execute("ALTER TABLE wix_stores ADD COLUMN IF NOT EXISTS gmv NUMERIC")
+        except: pass
+        try: cur.execute("ALTER TABLE wix_stores ADD COLUMN IF NOT EXISTS country VARCHAR(10)")
+        except: pass
         cur.execute("""CREATE TABLE IF NOT EXISTS wix_discovery_jobs (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             category VARCHAR(100),
@@ -162,7 +171,12 @@ def init_db():
             status VARCHAR(50) DEFAULT 'pending',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        # ----- /NEW -----
+        cur.execute("""CREATE TABLE IF NOT EXISTS apex_usage (
+            id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
+            month VARCHAR(7) NOT NULL,
+            calls_used INTEGER DEFAULT 0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_email, month))""")
         cur.execute("""CREATE TABLE IF NOT EXISTS email_scans (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             results JSONB, emails TEXT, email_count INTEGER DEFAULT 0, store_count INTEGER DEFAULT 0,
@@ -484,7 +498,45 @@ def counter_status(user_email):
     }
 
 # ==========================================
-# CATALOGUE CRAWLER
+# APEX / ECCOMPASS USAGE TRACKING
+# ==========================================
+def current_month():
+    return datetime.now().strftime('%Y-%m')
+
+def get_apex_usage(user_email):
+    conn = get_db()
+    if not conn: return 0
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT calls_used FROM apex_usage WHERE user_email = %s AND month = %s", (user_email, current_month()))
+        row = cur.fetchone(); cur.close()
+        return row[0] if row and row[0] else 0
+    except: return 0
+    finally: release_db(conn)
+
+def increment_apex_usage(user_email):
+    conn = get_db()
+    if not conn: return 0
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM apex_usage WHERE user_email = %s AND month = %s", (user_email, current_month()))
+        if cur.fetchone():
+            cur.execute("UPDATE apex_usage SET calls_used = calls_used + 1, updated_at=NOW() WHERE user_email = %s AND month = %s RETURNING calls_used", (user_email, current_month()))
+            new_count = cur.fetchone()[0]
+        else:
+            cur.execute("INSERT INTO apex_usage (user_email, month, calls_used) VALUES (%s, %s, 1) RETURNING calls_used", (user_email, current_month()))
+            new_count = cur.fetchone()[0]
+        conn.commit(); cur.close()
+        return new_count
+    except Exception as e:
+        print(f"increment_apex_usage: {e}")
+        return 0
+    finally: release_db(conn)
+
+APEX_MONTHLY_QUOTA = 5
+
+# ==========================================
+# CATALOGUE CRAWLER (Shopify)
 # ==========================================
 def get_cached_catalogue(domain, max_age_hours=24):
     conn = get_db()
@@ -847,7 +899,7 @@ def get_hf_import_detail(import_id, user_email):
     finally: release_db(conn)
 
 # ==========================================
-# WIX DISCOVERY (automated, no keyword input)
+# WIX DISCOVERY (Common Crawl primary, DDG fallback, Related, EcCompass bonus)
 # ==========================================
 def is_wix_site(html):
     if not html: return False
@@ -875,7 +927,35 @@ def save_wix_stores(user_email, stores):
     finally: release_db(conn)
     return saved
 
-def discover_wix_via_ddg(query, source_tag, max_results=30):
+# ----- Method 1: Common Crawl (primary) -----
+def discover_wix_via_commoncrawl(category, limit=50):
+    """Query Common Crawl's CDX API for .wixsite.com domains matching the category."""
+    discovered = []; seen_roots = set()
+    try:
+        query_domain = f"*.wixsite.com/*{category}*"
+        url = f"https://index.commoncrawl.org/CC-MAIN-2024-10-index?url={requests.utils.quote(query_domain)}&output=json&limit={limit}"
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; WixDiscovery/1.0)"}
+        r = requests.get(url, headers=headers, timeout=25)
+        if r.status_code == 200:
+            for line in r.text.strip().split("\n"):
+                if not line.strip(): continue
+                try:
+                    data = json.loads(line)
+                    raw = data.get('url', '')
+                    clean = raw.replace("https://", "").replace("http://", "").split("/")[0].strip().lower()
+                    if not clean or '.' not in clean: continue
+                    if not clean.endswith('.wixsite.com'): continue
+                    if clean in seen_roots: continue
+                    seen_roots.add(clean)
+                    discovered.append({'domain': clean, 'source': f'wix_cc_{category}'})
+                except: continue
+        print(f"  📡 Common Crawl [{category}]: {len(discovered)} results")
+    except Exception as e:
+        print(f"  ⚠️ Common Crawl [{category}]: {e}")
+    return discovered
+
+# ----- Method 2: DuckDuckGo (fallback) -----
+def discover_wix_via_ddg(query, source_tag, max_results=20):
     discovered = []; seen_roots = set()
     try:
         url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
@@ -898,9 +978,10 @@ def discover_wix_via_ddg(query, source_tag, max_results=30):
                 seen_roots.add(root)
                 discovered.append({'domain': root, 'source': source_tag})
     except Exception as e:
-        print(f"discover_wix_via_ddg: {e}")
+        print(f"  ⚠️ DDG [{source_tag}]: {e}")
     return discovered
 
+# ----- Method 3: Related (from found Wix stores) -----
 def discover_wix_via_related(user_email, seeds_limit=5):
     discovered = []; seen_roots = set()
     conn = get_db()
@@ -919,15 +1000,15 @@ def discover_wix_via_related(user_email, seeds_limit=5):
             for ext in re.findall(r'href="https?://([a-zA-Z0-9\.\-]+)"', r.text)[:30]:
                 root = root_domain(ext)
                 if root == seed or root in seen_roots: continue
-                if any(s in root for s in ['wix','facebook','instagram','twitter','youtube','tiktok','pinterest','google','apple','duckduckgo']): continue
+                if any(s in root for s in ['wix','facebook','instagram','twitter','youtube','tiktok','pinterest','google','apple','duckduckgo','bing']): continue
                 if '.' not in root or len(root) < 5: continue
                 seen_roots.add(root)
                 discovered.append({'domain': root, 'source': 'wix_related'})
         except: continue
     return discovered
 
+# ----- Background Worker -----
 def background_wix_discovery(job_id):
-    """Runs all 8 Wix categories in the background, using 3 discovery methods each."""
     print(f"🛍️ Wix discovery job #{job_id} started")
     conn = get_db()
     if not conn: return
@@ -939,11 +1020,10 @@ def background_wix_discovery(job_id):
         user_email = row[0]
     finally: release_db(conn)
 
-    all_discovered = []
     total_processed = 0
+    total_saved = 0
 
     for category in WIX_CATEGORIES:
-        # Check if cancelled
         conn = get_db()
         if not conn: break
         try:
@@ -955,25 +1035,36 @@ def background_wix_discovery(job_id):
                 return
         finally: release_db(conn)
 
-        # Run 3 discovery methods for this category
-        queries = [
-            (f'site:wixsite.com {category}', 'wix_ddg_wixsite'),
-            (f'"Powered by Wix" {category}', 'wix_ddg_powered'),
-            (f'"wixstatic.com" {category}', 'wix_ddg_wixstatic'),
-        ]
-        for q, tag in queries:
-            try:
-                results = discover_wix_via_ddg(q, tag, max_results=15)
-                all_discovered.extend(results)
-            except Exception as e:
-                print(f"wix discovery error ({category}/{tag}): {e}")
-            time.sleep(1)  # polite delay
+        batch = []
 
+        # 1. Common Crawl (primary)
+        try:
+            cc = discover_wix_via_commoncrawl(category, limit=50)
+            batch.extend(cc)
+        except Exception as e:
+            print(f"CC error [{category}]: {e}")
+
+        # 2. DDG (fallback — often blocked from cloud, but try)
+        try:
+            ddg_queries = [
+                (f'site:wixsite.com {category}', f'wix_ddg_site_{category}'),
+                (f'"Powered by Wix" {category}', f'wix_ddg_powered_{category}'),
+            ]
+            for q, tag in ddg_queries:
+                try:
+                    ddg = discover_wix_via_ddg(q, tag, max_results=15)
+                    batch.extend(ddg)
+                except Exception as e:
+                    print(f"DDG error [{category}/{tag}]: {e}")
+                time.sleep(1)
+        except Exception as e:
+            print(f"DDG block error: {e}")
+
+        # Save batch
+        saved = save_wix_stores(user_email, batch)
+        total_saved += saved
         total_processed += 1
-
-        # Save progress after each category
-        saved_count = save_wix_stores(user_email, all_discovered)
-        all_discovered = []  # prevent re-saving
+        print(f"  ✅ [{category}] saved {saved} new stores")
 
         conn = get_db()
         if not conn: break
@@ -982,19 +1073,21 @@ def background_wix_discovery(job_id):
             new_status = 'running' if total_processed < len(WIX_CATEGORIES) else 'completed'
             cur.execute("""UPDATE wix_discovery_jobs SET processed=%s, found=%s, saved=%s,
                 status=%s, updated_at=NOW() WHERE id=%s""",
-                (total_processed, total_processed * 45, saved_count, new_status, job_id))
+                (total_processed, total_processed * 50, total_saved, new_status, job_id))
             conn.commit(); cur.close()
         finally: release_db(conn)
 
-    # Add related discovery at the end
+        time.sleep(1)
+
+    # 3. Related discovery (bonus)
     try:
         related = discover_wix_via_related(user_email, seeds_limit=5)
         if related:
             save_wix_stores(user_email, related)
+            total_saved += len(related)
     except Exception as e:
-        print(f"wix related discovery: {e}")
+        print(f"related error: {e}")
 
-    # Mark complete
     conn = get_db()
     if conn:
         try:
@@ -1004,7 +1097,7 @@ def background_wix_discovery(job_id):
         except: pass
         finally: release_db(conn)
 
-    print(f"✅ Wix discovery job #{job_id} complete")
+    print(f"✅ Wix discovery job #{job_id} complete ({total_saved} saved)")
 
 def get_wix_discovery_jobs(user_email):
     conn = get_db()
@@ -1018,6 +1111,93 @@ def get_wix_discovery_jobs(user_email):
                  'found': r[4], 'saved': r[5], 'status': r[6], 'created_at': str(r[7])[:16]} for r in rows]
     except: return []
     finally: release_db(conn)
+
+# ==========================================
+# ECCOMPASS ENRICHMENT (Manual, Mode A)
+# ==========================================
+def background_wix_enrichment(user_email, job_id):
+    """Call EcCompass ONCE to enrich discovered Wix stores with contacts + GMV."""
+    print(f"✨ EcCompass enrichment job #{job_id} started")
+    if not APEX_TOKEN:
+        conn = get_db()
+        if conn:
+            try:
+                cur = conn.cursor()
+                cur.execute("UPDATE wix_discovery_jobs SET status='failed' WHERE id=%s", (job_id,))
+                conn.commit(); cur.close()
+            finally: release_db(conn)
+        print("❌ No APEX_TOKEN set")
+        return
+
+    # Fetch user's discovered Wix domains
+    conn = get_db()
+    if not conn: return
+    domains = []
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT domain FROM wix_stores WHERE user_email = %s ORDER BY discovered_at DESC LIMIT 100", (user_email,))
+        rows = cur.fetchall(); cur.close()
+        domains = [r[0] for r in rows]
+    finally: release_db(conn)
+
+    if not domains:
+        print("⚠️ No Wix domains to enrich")
+        conn = get_db()
+        if conn:
+            try:
+                cur = conn.cursor()
+                cur.execute("UPDATE wix_discovery_jobs SET status='completed', saved=0 WHERE id=%s", (job_id,))
+                conn.commit(); cur.close()
+            finally: release_db(conn)
+        return
+
+    # Call EcCompass search once — try to fetch many Wix stores at once
+    enriched_count = 0
+    try:
+        url = f"{APEX_API_BASE}/search"
+        headers = {"Authorization": f"Bearer {APEX_TOKEN}", "Content-Type": "application/json"}
+        body = {
+            "platform": "wix",
+            "limit": 100
+        }
+        r = requests.post(url, headers=headers, json=body, timeout=30)
+        if r.status_code == 200:
+            data = r.json()
+            results = data.get('results', []) or data.get('data', []) or []
+            # Match results to our existing domains and enrich
+            conn2 = get_db()
+            if conn2:
+                try:
+                    cur2 = conn2.cursor()
+                    for item in results:
+                        dom = (item.get('domain') or '').strip().lower()
+                        if not dom: continue
+                        emails_raw = item.get('emails') or item.get('contact_emails') or []
+                        if isinstance(emails_raw, str): emails_raw = [e.strip() for e in emails_raw.split(',') if e.strip()]
+                        emails_str = ','.join(emails_raw) if emails_raw else None
+                        gmv_val = item.get('gmv') or item.get('estimated_gmv') or None
+                        country = item.get('country') or None
+                        cur2.execute("""UPDATE wix_stores SET emails=%s, gmv=%s, country=%s, has_email=%s
+                            WHERE user_email=%s AND domain=%s""",
+                            (emails_str, gmv_val, country, bool(emails_str), user_email, dom))
+                        if cur2.rowcount > 0: enriched_count += 1
+                    conn2.commit(); cur2.close()
+                finally: release_db(conn2)
+            increment_apex_usage(user_email)
+        else:
+            print(f"❌ EcCompass search failed: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        print(f"❌ EcCompass error: {e}")
+
+    conn = get_db()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("UPDATE wix_discovery_jobs SET status='completed', saved=%s WHERE id=%s", (enriched_count, job_id))
+            conn.commit(); cur.close()
+        finally: release_db(conn)
+
+    print(f"✅ EcCompass enrichment complete ({enriched_count} stores enriched)")
 
 # ==========================================
 # QUEUE
@@ -1703,7 +1883,7 @@ def generate_outreach_email(report, tone='friendly', sender_name='', email=''):
     return {'subject': subject, 'body': body, 'tone': tone}
 
 # ==========================================
-# NAVBAR (with SHOPIFY + WIX sections)
+# NAVBAR (SHOPIFY + WIX sections)
 # ==========================================
 NAVBAR = '''
 <style>
@@ -1750,7 +1930,7 @@ function closeDrawer(){document.getElementById('drawer').classList.remove('open'
 '''
 
 def render_page(title, body):
-    return f'<!DOCTYPE html><html><head><title>{title}</title><meta name="viewport" content="width=device-width,initial-scale=1">{NAVBAR}</head><body style="margin:0;font-family:Arial"><div class="page-content">{body}</div></body></html>'
+    return f'<!DOCTYPE html><html><head><title>{title}</title><meta name="viewport" content="width=device-width,initial-scale=1">{NAVBAR}</head><body style="margin:0;font-family:Arial"><div class="page-content">{body}</div></div></body></html>'
 
 # ==========================================
 # AUTH
@@ -2186,26 +2366,41 @@ window.onload = function(){ loadStores(); loadHFHistory(); };
     return render_page("Store Discovery", body)
 
 # ==========================================
-# WIX STORE FINDER PAGE (NEW)
+# WIX STORE FINDER PAGE
 # ==========================================
 @app.route('/wix')
 @login_required
 def wix_page():
+    user_email = session.get('user_id')
+    apex_used = get_apex_usage(user_email)
+    apex_remaining = max(0, APEX_MONTHLY_QUOTA - apex_used)
+    apex_token_set = 'yes' if APEX_TOKEN else 'no'
     body = '''<div style="max-width:900px;margin:20px auto;padding:20px">
 <div style="background:linear-gradient(135deg,#0d9488,#0891b2);color:white;padding:20px;border-radius:10px;margin-bottom:20px">
 <h1 style="margin:0">🔍 Wix Store Finder</h1>
-<p style="margin:4px 0 0 0;font-size:14px;opacity:0.9">Automated discovery of Wix stores across 8 categories</p>
+<p style="margin:4px 0 0 0;font-size:14px;opacity:0.9">Automated discovery of Wix stores · Common Crawl primary · DDG fallback</p>
 </div>
 
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
 <h3 style="margin-top:0">🚀 Automated Discovery</h3>
-<p style="font-size:14px;color:#555;margin:5px 0">Click below to run Wix store discovery. The system will automatically search for stores across these categories:</p>
+<p style="font-size:14px;color:#555;margin:5px 0">Runs all 8 categories automatically. Uses Common Crawl (free, unlimited) as primary source.</p>
 <div style="margin:10px 0;font-size:13px;color:#666;line-height:1.8">
 👗 Fashion · 💍 Jewelry · 🧸 Toys · 🏠 Home Decor<br>
 💄 Beauty · 🍕 Food · 👜 Accessories · 🎁 Gifts
 </div>
 <button onclick="startWixDiscovery()" style="background:#0d9488;color:white;padding:14px 28px;border:none;border-radius:8px;cursor:pointer;font-size:16px;font-weight:bold;width:100%">🚀 Discover Wix Stores</button>
 <div id="wixStatus" style="margin-top:12px"></div>
+</div>
+
+<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px;border-left:4px solid #8b5cf6">
+<h3 style="margin-top:0">✨ EcCompass Enrichment (Optional)</h3>
+<p style="font-size:13px;color:#555;margin:5px 0">Enrich discovered Wix stores with emails, GMV, and country data. Uses 1 API call from your monthly quota.</p>
+<div style="background:#f3f4f6;padding:10px;border-radius:6px;margin:10px 0;font-size:13px">
+  <b>Quota this month:</b> ''' + str(apex_used) + ''' / ''' + str(APEX_MONTHLY_QUOTA) + ''' used (''' + str(apex_remaining) + ''' remaining)<br>
+  <span style="font-size:11px;color:#666">Token configured: ''' + apex_token_set + '''</span>
+</div>
+<button id="enrichBtn" onclick="startWixEnrichment()" style="background:#8b5cf6;color:white;padding:12px 24px;border:none;border-radius:8px;cursor:pointer;font-size:15px;font-weight:bold;width:100%">✨ Enrich Discovered Stores</button>
+<div id="enrichStatus" style="margin-top:12px"></div>
 </div>
 
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
@@ -2225,12 +2420,28 @@ def wix_page():
 <script>
 async function startWixDiscovery(){
   const status = document.getElementById('wixStatus');
-  status.innerHTML = '<p style="color:#666">⏳ Starting Wix discovery across 8 categories...<br>This runs in the background — you can close the browser.</p>';
+  status.innerHTML = '<p style="color:#666">⏳ Starting Wix discovery across 8 categories...<br>Uses Common Crawl (free). Runs in background — you can close the browser.</p>';
   try{
     const res = await fetch('/start-wix-discovery', {method:'POST'});
     const data = await res.json();
     if(data.success){
-      status.innerHTML = '<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:12px;border-radius:5px;color:#166534"><b>✅ Job #'+data.job_id+' started!</b><br>Searching 8 categories in the background.<br><br><b>You can close the browser now.</b></div>';
+      status.innerHTML = '<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:12px;border-radius:5px;color:#166534"><b>✅ Job #'+data.job_id+' started!</b><br>Searching 8 categories via Common Crawl.<br><br><b>You can close the browser now.</b></div>';
+      loadWixJobs();
+    } else {
+      status.innerHTML = '<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">Error: '+(data.error||'Unknown')+'</div>';
+    }
+  }catch(e){ status.innerHTML = '<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">Error: '+e.message+'</div>'; }
+}
+
+async function startWixEnrichment(){
+  const status = document.getElementById('enrichStatus');
+  if(!confirm('This will use 1 EcCompass API call from your monthly quota. Continue?')) return;
+  status.innerHTML = '<p style="color:#666">⏳ Enriching discovered stores...</p>';
+  try{
+    const res = await fetch('/start-wix-enrichment', {method:'POST'});
+    const data = await res.json();
+    if(data.success){
+      status.innerHTML = '<div style="background:#f5f3ff;border-left:4px solid #8b5cf6;padding:12px;border-radius:5px;color:#5b21b6"><b>✨ Enrichment #'+data.job_id+' started!</b><br>Contact + GMV data being added.</div>';
       loadWixJobs();
     } else {
       status.innerHTML = '<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">Error: '+(data.error||'Unknown')+'</div>';
@@ -2250,6 +2461,7 @@ async function loadWixJobs(){
       let icon = '🔄';
       if(j.status === 'completed'){ color = '#16a34a'; icon = '✅'; }
       else if(j.status === 'cancelled'){ color = '#ef4444'; icon = '⏹️'; }
+      else if(j.status === 'failed'){ color = '#ef4444'; icon = '❌'; }
       const pct = j.total > 0 ? Math.round((j.processed / j.total) * 100) : 0;
       html += '<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+color+'">';
       html += '<div><b>'+icon+' Job #'+j.id+'</b> — '+j.saved+' stores saved ('+j.processed+'/'+j.total+' categories)<br>';
@@ -2271,7 +2483,10 @@ async function loadWixStores(){
     let html = '';
     data.stores.slice(0, 50).forEach(s => {
       html += '<div style="background:#f9f9f9;padding:10px;border-radius:6px;margin:6px 0;border-left:4px solid #0d9488">';
-      html += '<b><a href="https://'+s.domain+'" target="_blank" style="color:#3b82f6">'+s.domain+'</a></b> <span style="font-size:11px;color:#666">('+s.source+')</span></div>';
+      html += '<b><a href="https://'+s.domain+'" target="_blank" style="color:#3b82f6">'+s.domain+'</a></b> <span style="font-size:11px;color:#666">('+s.source+')</span>';
+      if(s.emails) html += '<div style="font-size:12px;color:#555;margin-top:4px">📧 '+s.emails+'</div>';
+      if(s.gmv) html += '<div style="font-size:12px;color:#555">💰 GMV: $'+s.gmv+'</div>';
+      html += '</div>';
     });
     if(data.stores.length > 50){ html += '<p style="color:#666;font-size:13px">... and '+(data.stores.length - 50)+' more</p>'; }
     c.innerHTML = html;
@@ -2310,6 +2525,28 @@ def start_wix_discovery():
     threading.Thread(target=background_wix_discovery, args=(job_id,), daemon=True).start()
     return jsonify({'success': True, 'job_id': job_id, 'total': len(WIX_CATEGORIES)})
 
+@app.route('/start-wix-enrichment', methods=['POST'])
+@login_required
+def start_wix_enrichment():
+    user_email = session.get('user_id')
+    if not APEX_TOKEN:
+        return jsonify({'success': False, 'error': 'APEX_TOKEN not set on server'})
+    used = get_apex_usage(user_email)
+    if used >= APEX_MONTHLY_QUOTA:
+        return jsonify({'success': False, 'error': f'Monthly quota reached ({used}/{APEX_MONTHLY_QUOTA})'})
+    conn = get_db()
+    if not conn: return jsonify({'success': False, 'error': 'No DB'})
+    try:
+        cur = conn.cursor()
+        cur.execute("""INSERT INTO wix_discovery_jobs (user_email, category, total, status)
+            VALUES (%s, %s, %s, 'running') RETURNING id""",
+            (user_email, 'enrichment', 1))
+        job_id = cur.fetchone()[0]
+        conn.commit(); cur.close()
+    finally: release_db(conn)
+    threading.Thread(target=background_wix_enrichment, args=(user_email, job_id), daemon=True).start()
+    return jsonify({'success': True, 'job_id': job_id})
+
 @app.route('/get-wix-jobs')
 @login_required
 def get_wix_jobs_route():
@@ -2324,9 +2561,9 @@ def get_wix_stores_route():
     if not conn: return jsonify({'stores': []})
     try:
         cur = conn.cursor()
-        cur.execute("SELECT domain, source, discovered_at FROM wix_stores WHERE user_email = %s ORDER BY discovered_at DESC LIMIT 10000", (user_email,))
+        cur.execute("SELECT domain, source, emails, gmv, country, discovered_at FROM wix_stores WHERE user_email = %s ORDER BY discovered_at DESC LIMIT 10000", (user_email,))
         rows = cur.fetchall(); cur.close()
-        return jsonify({'stores': [{'domain': r[0], 'source': r[1], 'discovered_at': str(r[2])[:16]} for r in rows]})
+        return jsonify({'stores': [{'domain': r[0], 'source': r[1], 'emails': r[2] or '', 'gmv': str(r[3]) if r[3] else '', 'country': r[4] or '', 'discovered_at': str(r[5])[:16]} for r in rows]})
     except: return jsonify({'stores': []})
     finally: release_db(conn)
 
