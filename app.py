@@ -52,6 +52,14 @@ PLACEHOLDER_DOMAINS = {
 }
 
 # ==========================================
+# WIX SEARCH CATEGORIES (auto-cycled)
+# ==========================================
+WIX_CATEGORIES = [
+    "fashion", "jewelry", "toys", "home decor",
+    "beauty", "food", "accessories", "gifts"
+]
+
+# ==========================================
 # DB POOL
 # ==========================================
 _db_pool = None
@@ -138,6 +146,23 @@ def init_db():
             has_email BOOLEAN DEFAULT FALSE,
             discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_email, domain))""")
+        # ----- NEW: Wix stores table -----
+        cur.execute("""CREATE TABLE IF NOT EXISTS wix_stores (
+            id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
+            domain VARCHAR(255) NOT NULL, source VARCHAR(50),
+            has_email BOOLEAN DEFAULT FALSE,
+            discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_email, domain))""")
+        # ----- NEW: Wix discovery jobs -----
+        cur.execute("""CREATE TABLE IF NOT EXISTS wix_discovery_jobs (
+            id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
+            category VARCHAR(100),
+            total INTEGER DEFAULT 0, processed INTEGER DEFAULT 0,
+            found INTEGER DEFAULT 0, saved INTEGER DEFAULT 0,
+            status VARCHAR(50) DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        # ----- /NEW -----
         cur.execute("""CREATE TABLE IF NOT EXISTS email_scans (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             results JSONB, emails TEXT, email_count INTEGER DEFAULT 0, store_count INTEGER DEFAULT 0,
@@ -570,7 +595,7 @@ def crawl_catalogue(domain, limit=50):
         return None
 
 # ==========================================
-# EMAIL FINDER BACKGROUND JOBS
+# EMAIL FINDER BACKGROUND JOBS (Shopify)
 # ==========================================
 def process_subjob(subjob_id):
     conn = get_db()
@@ -818,6 +843,179 @@ def get_hf_import_detail(import_id, user_email):
         cur.execute("SELECT domains FROM hf_imports WHERE id = %s AND user_email = %s", (import_id, user_email))
         row = cur.fetchone(); cur.close()
         return row[0].split('|||') if row and row[0] else []
+    except: return []
+    finally: release_db(conn)
+
+# ==========================================
+# WIX DISCOVERY (automated, no keyword input)
+# ==========================================
+def is_wix_site(html):
+    if not html: return False
+    low = html.lower()
+    return any(x in low for x in [
+        'wix.com', 'wixstatic.com', 'wix-code', 'wixstores',
+        '_wixcss', 'parastorage.com', 'wixsite.com'
+    ])
+
+def save_wix_stores(user_email, stores):
+    conn = get_db()
+    if not conn: return 0
+    saved = 0
+    try:
+        cur = conn.cursor()
+        for store in stores:
+            try:
+                cur.execute("""INSERT INTO wix_stores (user_email, domain, source)
+                    VALUES (%s, %s, %s) ON CONFLICT (user_email, domain) DO NOTHING""",
+                    (user_email, store['domain'], store.get('source', 'unknown')))
+                if cur.rowcount > 0: saved += 1
+            except: pass
+        conn.commit(); cur.close()
+    except: pass
+    finally: release_db(conn)
+    return saved
+
+def discover_wix_via_ddg(query, source_tag, max_results=30):
+    discovered = []; seen_roots = set()
+    try:
+        url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+        r = requests.post(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            links = re.findall(r'class="result__a" href="(.*?)"', r.text)[:max_results]
+            for link in links:
+                if "uddg=" in link:
+                    try:
+                        import urllib.parse
+                        parsed = urllib.parse.parse_qs(urllib.parse.urlparse(link).query)
+                        if 'uddg' in parsed: link = parsed['uddg'][0]
+                    except: pass
+                clean = link.replace("https://", "").replace("http://", "").split("/")[0]
+                root = root_domain(clean)
+                if "wix.com" in root or "duckduckgo" in root: continue
+                if not root or '.' not in root or len(root) < 5: continue
+                if root in seen_roots: continue
+                seen_roots.add(root)
+                discovered.append({'domain': root, 'source': source_tag})
+    except Exception as e:
+        print(f"discover_wix_via_ddg: {e}")
+    return discovered
+
+def discover_wix_via_related(user_email, seeds_limit=5):
+    discovered = []; seen_roots = set()
+    conn = get_db()
+    if not conn: return discovered
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT domain FROM wix_stores WHERE user_email = %s ORDER BY discovered_at DESC LIMIT %s", (user_email, seeds_limit))
+        seeds = [r[0] for r in cur.fetchall()]; cur.close()
+    finally: release_db(conn)
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    for seed in seeds:
+        try:
+            r = requests.get(f"https://{seed}", headers=headers, timeout=8)
+            if r.status_code != 200: continue
+            if not is_wix_site(r.text): continue
+            for ext in re.findall(r'href="https?://([a-zA-Z0-9\.\-]+)"', r.text)[:30]:
+                root = root_domain(ext)
+                if root == seed or root in seen_roots: continue
+                if any(s in root for s in ['wix','facebook','instagram','twitter','youtube','tiktok','pinterest','google','apple','duckduckgo']): continue
+                if '.' not in root or len(root) < 5: continue
+                seen_roots.add(root)
+                discovered.append({'domain': root, 'source': 'wix_related'})
+        except: continue
+    return discovered
+
+def background_wix_discovery(job_id):
+    """Runs all 8 Wix categories in the background, using 3 discovery methods each."""
+    print(f"🛍️ Wix discovery job #{job_id} started")
+    conn = get_db()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT user_email FROM wix_discovery_jobs WHERE id = %s", (job_id,))
+        row = cur.fetchone(); cur.close()
+        if not row: return
+        user_email = row[0]
+    finally: release_db(conn)
+
+    all_discovered = []
+    total_processed = 0
+
+    for category in WIX_CATEGORIES:
+        # Check if cancelled
+        conn = get_db()
+        if not conn: break
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT status FROM wix_discovery_jobs WHERE id = %s", (job_id,))
+            sr = cur.fetchone(); cur.close()
+            if not sr or sr[0] == 'cancelled':
+                print(f"⏹️ Wix job #{job_id} cancelled")
+                return
+        finally: release_db(conn)
+
+        # Run 3 discovery methods for this category
+        queries = [
+            (f'site:wixsite.com {category}', 'wix_ddg_wixsite'),
+            (f'"Powered by Wix" {category}', 'wix_ddg_powered'),
+            (f'"wixstatic.com" {category}', 'wix_ddg_wixstatic'),
+        ]
+        for q, tag in queries:
+            try:
+                results = discover_wix_via_ddg(q, tag, max_results=15)
+                all_discovered.extend(results)
+            except Exception as e:
+                print(f"wix discovery error ({category}/{tag}): {e}")
+            time.sleep(1)  # polite delay
+
+        total_processed += 1
+
+        # Save progress after each category
+        saved_count = save_wix_stores(user_email, all_discovered)
+        all_discovered = []  # prevent re-saving
+
+        conn = get_db()
+        if not conn: break
+        try:
+            cur = conn.cursor()
+            new_status = 'running' if total_processed < len(WIX_CATEGORIES) else 'completed'
+            cur.execute("""UPDATE wix_discovery_jobs SET processed=%s, found=%s, saved=%s,
+                status=%s, updated_at=NOW() WHERE id=%s""",
+                (total_processed, total_processed * 45, saved_count, new_status, job_id))
+            conn.commit(); cur.close()
+        finally: release_db(conn)
+
+    # Add related discovery at the end
+    try:
+        related = discover_wix_via_related(user_email, seeds_limit=5)
+        if related:
+            save_wix_stores(user_email, related)
+    except Exception as e:
+        print(f"wix related discovery: {e}")
+
+    # Mark complete
+    conn = get_db()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("UPDATE wix_discovery_jobs SET status='completed', updated_at=NOW() WHERE id=%s", (job_id,))
+            conn.commit(); cur.close()
+        except: pass
+        finally: release_db(conn)
+
+    print(f"✅ Wix discovery job #{job_id} complete")
+
+def get_wix_discovery_jobs(user_email):
+    conn = get_db()
+    if not conn: return []
+    try:
+        cur = conn.cursor()
+        cur.execute("""SELECT id, category, total, processed, found, saved, status, created_at
+            FROM wix_discovery_jobs WHERE user_email = %s ORDER BY created_at DESC LIMIT 3""", (user_email,))
+        rows = cur.fetchall(); cur.close()
+        return [{'id': r[0], 'category': r[1] or 'all', 'total': r[2], 'processed': r[3],
+                 'found': r[4], 'saved': r[5], 'status': r[6], 'created_at': str(r[7])[:16]} for r in rows]
     except: return []
     finally: release_db(conn)
 
@@ -1174,8 +1372,12 @@ def audit_store(domain, case_id, include_catalogue=False):
         report["checks"]["https"] = False
         report["error"] = f"Could not reach store: {str(e)[:100]}"; return report
     is_shop = any(x in html.lower() for x in ['cdn.shopify.com', 'shopify.theme', 'shopify-section', 'myshopify.com'])
+    is_wix = is_wix_site(html)
     report["checks"]["is_shopify"] = is_shop
+    report["checks"]["is_wix"] = is_wix
+    report["checks"]["platform"] = "Shopify" if is_shop else ("Wix" if is_wix else "Unknown")
     if is_shop: report["positives"].append("Confirmed Shopify store")
+    if is_wix: report["positives"].append("Confirmed Wix store")
     try:
         r2 = requests.get(f"{base_url}/products.json?limit=250", headers=headers, timeout=10)
         if r2.status_code == 200:
@@ -1501,19 +1703,20 @@ def generate_outreach_email(report, tone='friendly', sender_name='', email=''):
     return {'subject': subject, 'body': body, 'tone': tone}
 
 # ==========================================
-# NAVBAR
+# NAVBAR (with SHOPIFY + WIX sections)
 # ==========================================
 NAVBAR = '''
 <style>
 .navbar{position:fixed;top:0;left:0;right:0;height:56px;background:#1f2937;color:white;display:flex;align-items:center;padding:0 16px;z-index:9999;box-shadow:0 2px 8px rgba(0,0,0,0.2)}
 .navbar-title{font-size:18px;font-weight:bold;margin-left:12px}
 .hamburger{background:none;border:none;color:white;font-size:24px;cursor:pointer;padding:4px 10px}
-.drawer{position:fixed;top:0;left:-280px;width:280px;height:100vh;background:#111827;color:white;transition:left 0.3s ease;z-index:10000;padding-top:20px;overflow-y:auto}
+.drawer{position:fixed;top:0;left:-300px;width:300px;height:100vh;background:#111827;color:white;transition:left 0.3s ease;z-index:10000;padding-top:20px;overflow-y:auto}
 .drawer.open{left:0}
 .drawer-header{padding:16px 20px;font-size:18px;font-weight:bold;border-bottom:1px solid #374151;display:flex;justify-content:space-between;align-items:center}
 .drawer-close{background:none;border:none;color:white;font-size:24px;cursor:pointer}
-.drawer a{display:block;padding:16px 20px;color:white;text-decoration:none;border-bottom:1px solid #1f2937;font-size:16px}
+.drawer a{display:block;padding:14px 20px;color:white;text-decoration:none;border-bottom:1px solid #1f2937;font-size:15px}
 .drawer a:hover{background:#1f2937}
+.drawer-section{padding:12px 20px 6px;font-size:12px;font-weight:bold;color:#9ca3af;letter-spacing:1px;text-transform:uppercase;background:#0f172a}
 .drawer-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:9998;display:none}
 .drawer-overlay.show{display:block}
 .page-content{padding-top:70px}
@@ -1525,13 +1728,19 @@ NAVBAR = '''
 <div class="drawer-overlay" id="drawerOverlay" onclick="toggleDrawer()"></div>
 <div class="drawer" id="drawer">
 <div class="drawer-header"><span>📧 Menu</span><button class="drawer-close" onclick="toggleDrawer()">×</button></div>
+
+<div class="drawer-section">🛍️ Shopify</div>
 <a href="/" onclick="closeDrawer()">🔍 Email Finder</a>
 <a href="/discover" onclick="closeDrawer()">🎯 Store Discovery</a>
 <a href="/verify" onclick="closeDrawer()">✅ Verify Emails</a>
 <a href="/scout" onclick="closeDrawer()">📨 Email Scout</a>
 <a href="/audit" onclick="closeDrawer()">🚀 Analyze & Send</a>
+
+<div class="drawer-section">🛍️ Wix</div>
+<a href="/wix" onclick="closeDrawer()">🔍 Wix Store Finder</a>
+
+<div class="drawer-section">⚙️ Account</div>
 <a href="/settings" onclick="closeDrawer()">⚙️ Settings</a>
-<hr style="border-color:#374151;margin:20px 0">
 <a href="/logout" onclick="closeDrawer()" style="color:#ef4444">🚪 Logout</a>
 </div>
 <script>
@@ -1627,7 +1836,7 @@ def settings():
     return render_page("Settings", body)
 
 # ==========================================
-# HOME (Email Finder)
+# HOME (Email Finder - Shopify)
 # ==========================================
 @app.route('/')
 @login_required
@@ -1820,7 +2029,7 @@ def store_emails():
     return jsonify({'success': True})
 
 # ==========================================
-# STORE DISCOVERY
+# STORE DISCOVERY (Shopify)
 # ==========================================
 @app.route('/discover')
 @login_required
@@ -1977,7 +2186,166 @@ window.onload = function(){ loadStores(); loadHFHistory(); };
     return render_page("Store Discovery", body)
 
 # ==========================================
-# DISCOVERY API
+# WIX STORE FINDER PAGE (NEW)
+# ==========================================
+@app.route('/wix')
+@login_required
+def wix_page():
+    body = '''<div style="max-width:900px;margin:20px auto;padding:20px">
+<div style="background:linear-gradient(135deg,#0d9488,#0891b2);color:white;padding:20px;border-radius:10px;margin-bottom:20px">
+<h1 style="margin:0">🔍 Wix Store Finder</h1>
+<p style="margin:4px 0 0 0;font-size:14px;opacity:0.9">Automated discovery of Wix stores across 8 categories</p>
+</div>
+
+<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
+<h3 style="margin-top:0">🚀 Automated Discovery</h3>
+<p style="font-size:14px;color:#555;margin:5px 0">Click below to run Wix store discovery. The system will automatically search for stores across these categories:</p>
+<div style="margin:10px 0;font-size:13px;color:#666;line-height:1.8">
+👗 Fashion · 💍 Jewelry · 🧸 Toys · 🏠 Home Decor<br>
+💄 Beauty · 🍕 Food · 👜 Accessories · 🎁 Gifts
+</div>
+<button onclick="startWixDiscovery()" style="background:#0d9488;color:white;padding:14px 28px;border:none;border-radius:8px;cursor:pointer;font-size:16px;font-weight:bold;width:100%">🚀 Discover Wix Stores</button>
+<div id="wixStatus" style="margin-top:12px"></div>
+</div>
+
+<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
+<h3 style="margin-top:0">📋 Last 3 Discovery Jobs</h3>
+<div id="wixJobs">Loading...</div>
+</div>
+
+<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1)">
+<h3 style="margin-top:0">📋 Discovered Wix Stores (<span id="wixCount">0</span>)</h3>
+<div id="wixList">Loading...</div>
+<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+<button onclick="sendAllToWixFinder()" style="background:#667eea;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;font-size:14px;opacity:0.6" disabled title="Coming in Step 2">📧 Send All to Wix Email Finder</button>
+<button onclick="clearWixStores()" style="background:#ef4444;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px">🗑️ Clear</button>
+</div>
+</div>
+</div>
+<script>
+async function startWixDiscovery(){
+  const status = document.getElementById('wixStatus');
+  status.innerHTML = '<p style="color:#666">⏳ Starting Wix discovery across 8 categories...<br>This runs in the background — you can close the browser.</p>';
+  try{
+    const res = await fetch('/start-wix-discovery', {method:'POST'});
+    const data = await res.json();
+    if(data.success){
+      status.innerHTML = '<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:12px;border-radius:5px;color:#166534"><b>✅ Job #'+data.job_id+' started!</b><br>Searching 8 categories in the background.<br><br><b>You can close the browser now.</b></div>';
+      loadWixJobs();
+    } else {
+      status.innerHTML = '<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">Error: '+(data.error||'Unknown')+'</div>';
+    }
+  }catch(e){ status.innerHTML = '<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">Error: '+e.message+'</div>'; }
+}
+
+async function loadWixJobs(){
+  try{
+    const res = await fetch('/get-wix-jobs');
+    const data = await res.json();
+    const c = document.getElementById('wixJobs');
+    if(!data.jobs || data.jobs.length === 0){ c.innerHTML = '<p style="color:#666">No Wix discovery jobs yet.</p>'; return; }
+    let html = '';
+    data.jobs.forEach(j => {
+      let color = '#f59e0b';
+      let icon = '🔄';
+      if(j.status === 'completed'){ color = '#16a34a'; icon = '✅'; }
+      else if(j.status === 'cancelled'){ color = '#ef4444'; icon = '⏹️'; }
+      const pct = j.total > 0 ? Math.round((j.processed / j.total) * 100) : 0;
+      html += '<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+color+'">';
+      html += '<div><b>'+icon+' Job #'+j.id+'</b> — '+j.saved+' stores saved ('+j.processed+'/'+j.total+' categories)<br>';
+      html += '<span style="font-size:12px;color:#666">'+j.created_at+'</span></div>';
+      html += '<div style="margin-top:8px;background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+pct+'%;height:14px;background:'+color+';text-align:center;color:white;font-size:11px;line-height:14px">'+pct+'%</div></div>';
+      html += '</div>';
+    });
+    c.innerHTML = html;
+  }catch(e){ console.error(e); }
+}
+
+async function loadWixStores(){
+  try{
+    const res = await fetch('/get-wix-stores');
+    const data = await res.json();
+    document.getElementById('wixCount').textContent = data.stores ? data.stores.length : 0;
+    const c = document.getElementById('wixList');
+    if(!data.stores || data.stores.length === 0){ c.innerHTML = '<p style="color:#666">No Wix stores discovered yet.</p>'; return; }
+    let html = '';
+    data.stores.slice(0, 50).forEach(s => {
+      html += '<div style="background:#f9f9f9;padding:10px;border-radius:6px;margin:6px 0;border-left:4px solid #0d9488">';
+      html += '<b><a href="https://'+s.domain+'" target="_blank" style="color:#3b82f6">'+s.domain+'</a></b> <span style="font-size:11px;color:#666">('+s.source+')</span></div>';
+    });
+    if(data.stores.length > 50){ html += '<p style="color:#666;font-size:13px">... and '+(data.stores.length - 50)+' more</p>'; }
+    c.innerHTML = html;
+  }catch(e){ console.error(e); }
+}
+
+async function clearWixStores(){
+  if(!confirm('Delete all discovered Wix stores?')) return;
+  await fetch('/clear-wix-stores', {method:'POST'});
+  loadWixStores();
+}
+
+function sendAllToWixFinder(){ alert('Wix Email Finder is coming in Step 2!'); }
+
+window.onload = function(){ loadWixJobs(); loadWixStores(); setInterval(loadWixJobs, 5000); };
+</script>'''
+    return render_page("Wix Store Finder", body)
+
+# ==========================================
+# WIX API ROUTES
+# ==========================================
+@app.route('/start-wix-discovery', methods=['POST'])
+@login_required
+def start_wix_discovery():
+    user_email = session.get('user_id')
+    conn = get_db()
+    if not conn: return jsonify({'success': False, 'error': 'No DB'})
+    try:
+        cur = conn.cursor()
+        cur.execute("""INSERT INTO wix_discovery_jobs (user_email, category, total, status)
+            VALUES (%s, %s, %s, 'running') RETURNING id""",
+            (user_email, 'all', len(WIX_CATEGORIES)))
+        job_id = cur.fetchone()[0]
+        conn.commit(); cur.close()
+    finally: release_db(conn)
+    threading.Thread(target=background_wix_discovery, args=(job_id,), daemon=True).start()
+    return jsonify({'success': True, 'job_id': job_id, 'total': len(WIX_CATEGORIES)})
+
+@app.route('/get-wix-jobs')
+@login_required
+def get_wix_jobs_route():
+    user_email = session.get('user_id')
+    return jsonify({'jobs': get_wix_discovery_jobs(user_email)})
+
+@app.route('/get-wix-stores')
+@login_required
+def get_wix_stores_route():
+    user_email = session.get('user_id')
+    conn = get_db()
+    if not conn: return jsonify({'stores': []})
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT domain, source, discovered_at FROM wix_stores WHERE user_email = %s ORDER BY discovered_at DESC LIMIT 10000", (user_email,))
+        rows = cur.fetchall(); cur.close()
+        return jsonify({'stores': [{'domain': r[0], 'source': r[1], 'discovered_at': str(r[2])[:16]} for r in rows]})
+    except: return jsonify({'stores': []})
+    finally: release_db(conn)
+
+@app.route('/clear-wix-stores', methods=['POST'])
+@login_required
+def clear_wix_stores_route():
+    user_email = session.get('user_id')
+    conn = get_db()
+    if not conn: return jsonify({'success': False})
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM wix_stores WHERE user_email = %s", (user_email,))
+        conn.commit(); cur.close()
+        return jsonify({'success': True})
+    except: return jsonify({'success': False})
+    finally: release_db(conn)
+
+# ==========================================
+# DISCOVERY API (Shopify)
 # ==========================================
 @app.route('/import-from-huggingface', methods=['POST'])
 @login_required
@@ -2739,6 +3107,7 @@ function renderReport(r){
   const ch=r.checks||{};const sc=r.scores||{};const iss=r.issues||[];
   let h='';
   h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:15px"><h2 style="margin:0">Store Audit Overview</h2><div style="color:#666;font-size:13px;margin-top:6px">Store: <a href="https://'+r.domain+'" target="_blank" style="color:#3b82f6">https://'+r.domain+'/</a></div>'+(r.case_id?'<div style="background:#f3f4f6;padding:6px 12px;border-radius:6px;font-size:13px;color:#374151;margin-top:8px;display:inline-block">Case ID: <b>'+r.case_id+'</b></div>':'')+'</div>';
+  if(ch.platform) h+='<div style="background:#f3f4f6;padding:6px 12px;border-radius:6px;font-size:13px;color:#374151;margin-bottom:15px;display:inline-block">Platform: <b>'+ch.platform+'</b></div>';
   h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:15px"><h3 style="margin-top:0">📈 Scores</h3>'+scoreBar('Overall',sc.overall_score||0)+scoreBar('Trust',sc.trust_score||0)+scoreBar('Technical',sc.technical_score||0)+scoreBar('Marketing',sc.marketing_score||0)+'</div>';
 
   if(r.catalogue){
