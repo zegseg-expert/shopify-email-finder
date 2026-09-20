@@ -212,6 +212,7 @@ def wix_process_email_job(job_id):
             conn.commit(); cur.close()
         finally: wix_release(conn)
 
+    # Save emails to wix_state — with retry and explicit logging
     if user_email:
         pairs = []
         for r in results:
@@ -219,7 +220,24 @@ def wix_process_email_job(job_id):
             for e in r.get('emails', []):
                 pairs.append(f"{e}:::{store}")
         if pairs:
-            wix_save_state(user_email, found_emails='|||'.join(pairs))
+            save_conn = wix_get_db()
+            if save_conn:
+                try:
+                    cur = save_conn.cursor()
+                    cur.execute("""INSERT INTO wix_state (user_email, found_emails)
+                        VALUES (%s, %s)
+                        ON CONFLICT (user_email) DO UPDATE SET
+                        found_emails = EXCLUDED.found_emails,
+                        updated_at = NOW()""",
+                        (user_email, '|||'.join(pairs)))
+                    save_conn.commit(); cur.close()
+                    print(f"✅ wix job {job_id}: saved {len(pairs)} email pairs for {user_email}")
+                except Exception as e:
+                    print(f"❌ wix job {job_id}: failed to save emails: {e}")
+                finally:
+                    wix_release(save_conn)
+            else:
+                print(f"❌ wix job {job_id}: could not connect to save emails")
 
 def wix_verify_email(email):
     try:
@@ -476,6 +494,51 @@ def run_wix_ingest():
     except Exception as e:
         return {'status': 'error', 'error': f'{e}'}
 
+# ==========================================
+# RECOVERY ROUTE — pulls emails from any past job into wix_state
+# ==========================================
+@wix_bp.route('/wix/recover-job/<int:job_id>', methods=['GET', 'POST'])
+def wix_recover_job(job_id):
+    if 'user_id' not in session:
+        return jsonify({'success': False, 'error': 'auth'}), 401
+    user_email = session.get('user_id')
+    conn = wix_get_db()
+    if not conn:
+        return jsonify({'success': False, 'error': 'db'}), 500
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT results FROM wix_email_jobs WHERE id=%s AND user_email=%s", (job_id, user_email))
+        row = cur.fetchone(); cur.close()
+        if not row:
+            return jsonify({'success': False, 'error': 'job not found'}), 404
+        try:
+            results = json.loads(row[0]) if row[0] else []
+        except:
+            results = []
+
+        pairs = []
+        for r in results:
+            store = r.get('store', '')
+            for e in r.get('emails', []):
+                pairs.append(f"{e}:::{store}")
+
+        if not pairs:
+            return jsonify({'success': False, 'error': 'no emails found in job'}), 400
+
+        cur = conn.cursor()
+        cur.execute("""INSERT INTO wix_state (user_email, found_emails)
+            VALUES (%s, %s)
+            ON CONFLICT (user_email) DO UPDATE SET
+            found_emails = EXCLUDED.found_emails,
+            updated_at = NOW()""",
+            (user_email, '|||'.join(pairs)))
+        conn.commit(); cur.close()
+        return jsonify({'success': True, 'recovered': len(pairs)})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:200]}), 500
+    finally:
+        wix_release(conn)
+
 def _navbar():
     return '''
 <style>
@@ -626,10 +689,48 @@ async function loadJobs(){
     if(!d.jobs || !d.jobs.length){ c.innerHTML='<p style="color:#666">None yet.</p>'; return; }
     let html='';
     d.jobs.forEach(j => {
-      html += '<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+(j.status==='completed'?'#16a34a':'#f59e0b')+'"><b>Job #'+j.id+'</b> — '+j.emails+' emails from '+j.total+' stores</div>';
+      const color = j.status==='completed'?'#16a34a':'#f59e0b';
+      html += '<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+color+'">';
+      html += '<b>Job #'+j.id+'</b> — '+j.emails+' emails from '+j.total+' stores';
+      html += '<div style="display:flex;gap:6px;margin-top:8px">';
+      html += '<button onclick="viewJob('+j.id+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">View</button>';
+      if(j.status === 'completed' && j.emails > 0){
+        html += '<button onclick="sendToVerify('+j.id+')" style="background:#f59e0b;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px">📨 Send to Verify</button>';
+      }
+      html += '</div>';
+      html += '<div id="job-'+j.id+'" style="display:none;margin-top:10px"></div>';
+      html += '</div>';
     });
     c.innerHTML=html;
   }catch(e){}
+}
+async function viewJob(id){
+  const c = document.getElementById('job-'+id);
+  if(c.style.display === 'block'){ c.style.display = 'none'; return; }
+  c.innerHTML = '<p style="color:#666">Loading…</p>';
+  c.style.display = 'block';
+  try{
+    const r = await fetch('/wix/get-email-finder-job/'+id); const d = await r.json();
+    if(!d.results || !d.results.length){ c.innerHTML = '<p style="color:#666">No results yet.</p>'; return; }
+    let html = '<div style="background:white;padding:10px;border-radius:6px;max-height:300px;overflow-y:auto;font-size:13px">';
+    d.results.forEach(r => {
+      html += '<div style="padding:8px 0;border-bottom:1px solid #eee"><b>📦 '+r.store+'</b>';
+      (r.emails||[]).forEach(e => { html += '<div style="padding-left:14px;color:#333">📧 '+e+'</div>'; });
+      html += '</div>';
+    });
+    c.innerHTML = html + '</div>';
+  }catch(e){ c.innerHTML = '<p style="color:red">Error</p>'; }
+}
+async function sendToVerify(id){
+  try{
+    const r = await fetch('/wix/get-email-finder-job/'+id); const d = await r.json();
+    if(!d.results) return;
+    const pairs = [];
+    d.results.forEach(r => { (r.emails||[]).forEach(e => pairs.push({email:e, store:r.store||''})); });
+    if(!pairs.length){ alert('No emails'); return; }
+    await fetch('/wix/store-emails', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({pairs:pairs})});
+    alert('✅ '+pairs.length+' emails saved. Go to Wix Verify → From Finder.');
+  }catch(e){ alert('Error: '+e.message); }
 }
 </script>'''
     return _page("Wix Email Finder", body)
