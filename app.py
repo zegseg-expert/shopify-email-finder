@@ -1860,6 +1860,7 @@ def discover_page():
 <button onclick="pullShopifyFromWarehouse()" style="background:rgba(255,255,255,0.25);color:white;padding:10px 18px;border:none;border-radius:6px;cursor:pointer;font-weight:bold;font-size:14px;margin:4px 0">📧 Send to Discovery List</button>
 <div id="shopifyIngestStatus" style="margin-top:10px;font-size:13px"></div>
 </div>
+
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
 <h3 style="margin-top:0">🔎 Other Discovery Methods</h3>
 <button onclick="runDiscovery('shodan')" style="background:#8b5cf6;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">🔍 Shodan</button>
@@ -1876,38 +1877,6 @@ def discover_page():
 <button onclick="clearStores()" style="background:#ef4444;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px;margin-top:10px">🗑️ Clear</button>
 </div>
 </div>
-async function loadShopifyWarehouse(){
-  try{
-    const r = await fetch('/shopify/warehouse'); const d = await r.json();
-    let rows = '';
-    (d.daily_last_14||[]).slice(0,5).forEach(x => { rows += '<div>'+x.date+': <b>+'+x.count+'</b></div>'; });
-    document.getElementById('shopifyWarehouseStats').innerHTML = '<div><b>Total:</b> '+d.total+' | <b>Pending:</b> '+d.pending+' | <b>Processing:</b> '+d.processing+'</div><div style="margin-top:6px;opacity:0.85">Last 5 days:</div>'+rows;
-  }catch(e){ document.getElementById('shopifyWarehouseStats').textContent = 'Error'; }
-}
-async function ingestShopifyNow(){
-  const s = document.getElementById('shopifyIngestStatus');
-  s.innerHTML = '⏳ Ingesting…';
-  try{
-    const r = await fetch('/shopify/ingest', {method:'POST'});
-    const d = await r.json();
-    if(d.status === 'ok'){ s.innerHTML = '<b>✅ +'+d.new+' new</b> (skipped '+d.duplicates_skipped+')'; loadShopifyWarehouse(); }
-    else { s.innerHTML = 'Error: '+(d.error||'Unknown'); }
-  }catch(e){ s.innerHTML = 'Error: '+e.message; }
-}
-async function pullShopifyFromWarehouse(){
-  const s = document.getElementById('shopifyIngestStatus');
-  s.innerHTML = '⏳ Pulling…';
-  try{
-    const r = await fetch('/shopify/request', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({count:500})});
-    const d = await r.json();
-    if(d.success && d.pulled > 0){
-      s.innerHTML = '<b>✅ Pulled '+d.pulled+'</b>. Loading into Finder below…';
-      document.getElementById('urls') /* not on this page */;
-      window.location.href = '/?url=' + encodeURIComponent(d.domains.join('\\n'));
-    }
-    else { s.innerHTML = 'No pending rows. Run Ingest first.'; }
-  }catch(e){ s.innerHTML = 'Error: '+e.message; }
-}
 <script>
 async function importFromHF(){
   const count = parseInt(document.getElementById('hfCount').value) || 200;
@@ -2018,6 +1987,7 @@ async function runDiscovery(method){
 }
 
 async function clearStores(){if(!confirm('Delete all discovered stores?'))return;await fetch('/clear-discovered',{method:'POST'});loadStores()}
+
 async function loadShopifyWarehouse(){
   try{
     const r = await fetch('/shopify/warehouse'); const d = await r.json();
@@ -2026,6 +1996,7 @@ async function loadShopifyWarehouse(){
     document.getElementById('shopifyWarehouseStats').innerHTML = '<div><b>Total:</b> '+d.total+' | <b>Pending:</b> '+d.pending+' | <b>Processing:</b> '+d.processing+'</div><div style="margin-top:6px;opacity:0.85">Last 5 days:</div>'+rows;
   }catch(e){ document.getElementById('shopifyWarehouseStats').textContent = 'Error'; }
 }
+
 async function ingestShopifyNow(){
   const s = document.getElementById('shopifyIngestStatus');
   s.innerHTML = '⏳ Ingesting...';
@@ -2036,6 +2007,7 @@ async function ingestShopifyNow(){
     else { s.innerHTML = 'Error: '+(d.error||'Unknown'); }
   }catch(e){ s.innerHTML = 'Error: '+e.message; }
 }
+
 async function pullShopifyFromWarehouse(){
   const s = document.getElementById('shopifyIngestStatus');
   s.innerHTML = '⏳ Pulling...';
@@ -2044,11 +2016,12 @@ async function pullShopifyFromWarehouse(){
     const d = await r.json();
     if(d.success && d.pulled > 0){
       s.innerHTML = '<b>✅ Pulled '+d.pulled+'</b>. Loading into Finder...';
-      window.location.href = '/?url=' + encodeURIComponent(d.domains.join('\n'));
+      window.location.href = '/?url=' + encodeURIComponent(d.domains.join('\\n'));
     }
     else { s.innerHTML = 'No pending rows. Run Ingest first.'; }
   }catch(e){ s.innerHTML = 'Error: '+e.message; }
 }
+
 window.onload = function(){ loadStores(); loadHFHistory(); loadShopifyWarehouse(); };
 </script>'''
     return render_page("Store Discovery", body)
