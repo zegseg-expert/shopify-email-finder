@@ -518,9 +518,108 @@ WIX_SIGNOFF_LINES = {
 }
 WIX_SIGNOFFS = ["Best regards,", "Cheers,", "Best,", "Warmly,"]
 
+# ==========================================
+# WIX SUBJECT TEMPLATE POOLS
+# ==========================================
+WIX_SUBJECT_TEMPLATES = {
+    'friendly': {
+        'low_score': [
+            "Quick note about {brand}",
+            "Spotted something on {brand}",
+            "A few things on {brand}",
+            "{brand} — quick heads up",
+            "Small things I noticed on {brand}",
+            "Just checked {brand} — 3 quick wins",
+            "Idea for {brand}",
+            "Noticed a few things on {brand}",
+            "One thing about {brand}",
+            "Had a look at {brand}"
+        ],
+        'mid_score': [
+            "Idea for {brand}",
+            "Quick thought on {brand}",
+            "Possible tweak for {brand}",
+            "One thing for {brand}",
+            "{brand} — small idea",
+            "Spotted an opportunity on {brand}"
+        ],
+        'high_score': [
+            "Nice store — {brand}",
+            "Liked {brand} — one small thing",
+            "{brand} is looking good",
+            "One tweak for {brand}",
+            "{brand} — great job"
+        ]
+    },
+    'professional': {
+        'low_score': [
+            "Observations on {brand}'s online store",
+            "Review notes: {brand}",
+            "Findings from {brand} audit",
+            "Brief review of {brand}",
+            "{brand} — points for improvement",
+            "Notes from reviewing {brand}",
+            "Quick assessment of {brand}",
+            "Areas to strengthen on {brand}",
+            "Audit summary for {brand}",
+            "Feedback on {brand}'s storefront"
+        ],
+        'mid_score': [
+            "Consideration for {brand}",
+            "A small refinement for {brand}",
+            "Notes on {brand}",
+            "Brief observation on {brand}",
+            "One opportunity for {brand}"
+        ],
+        'high_score': [
+            "Positive note on {brand}",
+            "Small suggestion for {brand}",
+            "{brand} — well done",
+            "One observation on {brand}"
+        ]
+    },
+    'casual': {
+        'low_score': [
+            "Yo {brand} — checked your site",
+            "Quick look at {brand}",
+            "{brand} — few things",
+            "Poked around {brand}",
+            "Saw a few things on {brand}",
+            "Heads up on {brand}",
+            "Just looked at {brand}",
+            "{brand} — some easy fixes",
+            "Peeked at {brand}",
+            "Noticed some stuff on {brand}"
+        ],
+        'mid_score': [
+            "Idea for {brand}",
+            "One thing for {brand}",
+            "{brand} — small tweak",
+            "Quick thing on {brand}"
+        ],
+        'high_score': [
+            "Cool store — {brand}",
+            "{brand} looks solid",
+            "Nice — {brand}",
+            "One thing on {brand}"
+        ]
+    }
+}
+
 def _wix_pick(pool):
     try: return random.choice(pool)
     except: return pool[0] if pool else ''
+
+def _wix_pick_subject(report, tone):
+    tone = tone if tone in WIX_SUBJECT_TEMPLATES else 'friendly'
+    dom = report.get('domain', '')
+    brand = dom.split('.')[0].title() if dom and '.' in dom else 'there'
+    overall = (report.get('scores') or {}).get('overall_score', 50)
+    if overall < 50: tier = 'low_score'
+    elif overall < 75: tier = 'mid_score'
+    else: tier = 'high_score'
+    pool = WIX_SUBJECT_TEMPLATES[tone].get(tier) or WIX_SUBJECT_TEMPLATES[tone]['mid_score']
+    return random.choice(pool).replace('{brand}', brand)
 
 def generate_wix_email(report, tone='friendly', sender_name='', email=''):
     tone = tone if tone in WIX_GREETINGS else 'friendly'
@@ -542,10 +641,8 @@ def generate_wix_email(report, tone='friendly', sender_name='', email=''):
     top_issues = sorted_issues[:3]
     issue_bullets = [i.get('title','') for i in top_issues]
 
-    subj_target = display_url if display_url else 'your store'
-    if overall < 50: subject = f"Found {len(issues)} issues on {subj_target}"
-    elif overall < 75: subject = f"Quick idea for {subj_target}"
-    else: subject = f"Nice store! One thing I noticed on {subj_target}"
+    # Randomized subject
+    subject = _wix_pick_subject(report, tone)
 
     greeting = _wix_pick(WIX_GREETINGS[tone]).replace('{brand}', brand)
     opener = _wix_pick(WIX_OPENERS_WITH_URL[tone] if display_url else WIX_OPENERS_NO_URL[tone]).replace('{url}', display_url)
