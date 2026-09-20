@@ -52,39 +52,6 @@ PLACEHOLDER_DOMAINS = {
 }
 
 # ==========================================
-# WIX DISCOVERY CONFIG
-# ==========================================
-WIX_CATEGORIES = [
-    "fashion", "jewelry", "toys", "home-decor",
-    "beauty", "food", "accessories", "gifts"
-]
-
-# Common Crawl indexes to query (6 months of coverage)
-CC_INDEXES = [
-    "CC-MAIN-2024-44", "CC-MAIN-2024-40", "CC-MAIN-2024-33",
-    "CC-MAIN-2024-26", "CC-MAIN-2024-18", "CC-MAIN-2024-10"
-]
-
-# URL patterns that only exist on real Wix Stores
-WIX_STORE_PATTERNS = [
-    "*/product-page/*",
-    "*/shop/*",
-    "*/store/*"
-]
-
-# Signals that prove a page is a real Wix Store
-WIX_STORE_SIGNALS = [
-    'wixstores',
-    'wix-ecom',
-    'product-page',
-    'add-to-cart',
-    'add_to_cart',
-    'shopping-cart',
-    'wixstore',
-    'wixstorefront'
-]
-
-# ==========================================
 # DB POOL
 # ==========================================
 _db_pool = None
@@ -171,23 +138,6 @@ def init_db():
             has_email BOOLEAN DEFAULT FALSE,
             discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_email, domain))""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS wix_stores (
-            id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
-            domain VARCHAR(255) NOT NULL, source VARCHAR(50),
-            country VARCHAR(10),
-            has_email BOOLEAN DEFAULT FALSE,
-            discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_email, domain))""")
-        try: cur.execute("ALTER TABLE wix_stores ADD COLUMN IF NOT EXISTS country VARCHAR(10)")
-        except: pass
-        cur.execute("""CREATE TABLE IF NOT EXISTS wix_discovery_jobs (
-            id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
-            category VARCHAR(100),
-            total INTEGER DEFAULT 0, processed INTEGER DEFAULT 0,
-            found INTEGER DEFAULT 0, saved INTEGER DEFAULT 0,
-            status VARCHAR(50) DEFAULT 'pending',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
         cur.execute("""CREATE TABLE IF NOT EXISTS email_scans (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             results JSONB, emails TEXT, email_count INTEGER DEFAULT 0, store_count INTEGER DEFAULT 0,
@@ -509,7 +459,7 @@ def counter_status(user_email):
     }
 
 # ==========================================
-# CATALOGUE CRAWLER (Shopify)
+# CATALOGUE CRAWLER
 # ==========================================
 def get_cached_catalogue(domain, max_age_hours=24):
     conn = get_db()
@@ -620,7 +570,7 @@ def crawl_catalogue(domain, limit=50):
         return None
 
 # ==========================================
-# EMAIL FINDER BACKGROUND JOBS (Shopify)
+# EMAIL FINDER BACKGROUND JOBS
 # ==========================================
 def process_subjob(subjob_id):
     conn = get_db()
@@ -775,7 +725,7 @@ def get_email_finder_master_detail(job_id, user_email):
     finally: release_db(conn)
 
 # ==========================================
-# HUGGING FACE IMPORT (Shopify)
+# HUGGING FACE IMPORT
 # ==========================================
 def fetch_hf_batch(offset, length):
     try:
@@ -868,231 +818,6 @@ def get_hf_import_detail(import_id, user_email):
         cur.execute("SELECT domains FROM hf_imports WHERE id = %s AND user_email = %s", (import_id, user_email))
         row = cur.fetchone(); cur.close()
         return row[0].split('|||') if row and row[0] else []
-    except: return []
-    finally: release_db(conn)
-
-# ==========================================
-# WIX DISCOVERY - Common Crawl CDX (6 indexes × 3 patterns)
-# ==========================================
-def is_wix_site(html):
-    if not html: return False
-    low = html.lower()
-    return any(x in low for x in [
-        'wix.com', 'wixstatic.com', 'wix-code', 'wixstores',
-        '_wixcss', 'parastorage.com', 'wixsite.com'
-    ])
-
-def has_wix_store_signals(html):
-    if not html: return False
-    low = html.lower()
-    return any(sig in low for sig in WIX_STORE_SIGNALS)
-
-def verify_wix_store(domain, timeout=8):
-    """Fetch homepage and check for Wix + Store signals."""
-    try:
-        domain = domain.strip().lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
-        if not domain or '.' not in domain: return False, ''
-        url = f"https://{domain}"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
-        if r.status_code != 200:
-            return False, ''
-        html = r.text
-        if not is_wix_site(html):
-            return False, ''
-        if not has_wix_store_signals(html):
-            return False, ''
-        # Determine country from final URL or HTML
-        country = detect_country(r.url, html)
-        return True, country
-    except Exception as e:
-        print(f"verify_wix_store({domain}): {e}")
-        return False, ''
-
-def detect_country(url, html):
-    """Very lightweight country detection."""
-    low_url = (url or '').lower()
-    low_html = (html or '').lower()[:20000]
-    if '.co.uk' in low_url or '£' in low_html or 'gbp' in low_html: return 'UK'
-    if '.ca' in low_url or 'cad' in low_html: return 'CA'
-    if '.com.au' in low_url or 'aud' in low_html: return 'AU'
-    if '.de' in low_url or 'eur' in low_html: return 'EU'
-    return 'US'
-
-def save_wix_stores(user_email, stores):
-    conn = get_db()
-    if not conn: return 0
-    saved = 0
-    try:
-        cur = conn.cursor()
-        for store in stores:
-            try:
-                cur.execute("""INSERT INTO wix_stores (user_email, domain, source, country)
-                    VALUES (%s, %s, %s, %s) ON CONFLICT (user_email, domain) DO NOTHING""",
-                    (user_email, store['domain'], store.get('source', 'unknown'), store.get('country', '')))
-                if cur.rowcount > 0: saved += 1
-            except: pass
-        conn.commit(); cur.close()
-    except: pass
-    finally: release_db(conn)
-    return saved
-
-def query_cc_index(index_name, pattern, limit=50):
-    """Query one Common Crawl index for one URL pattern. Returns list of domains."""
-    discovered = []
-    seen = set()
-    try:
-        query_url = f"*.wixsite.com/{pattern}"
-        api = f"https://index.commoncrawl.org/{index_name}-index?url={requests.utils.quote(query_url)}&output=json&limit={limit}"
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; WixDiscovery/1.0)"}
-        r = requests.get(api, headers=headers, timeout=30)
-        if r.status_code != 200:
-            return []
-        for line in r.text.strip().split("\n"):
-            if not line.strip(): continue
-            try:
-                data = json.loads(line)
-                raw = data.get('url', '')
-                clean = raw.replace("https://", "").replace("http://", "").split("/")[0].strip().lower()
-                if not clean or '.' not in clean: continue
-                if not clean.endswith('.wixsite.com'): continue
-                if clean in seen: continue
-                seen.add(clean)
-                discovered.append(clean)
-            except: continue
-    except Exception as e:
-        print(f"  ⚠️ CC [{index_name}/{pattern}]: {e}")
-    return discovered
-
-def discover_wix_via_commoncrawl_all():
-    """Query all 6 indexes × 3 store patterns = 18 queries. Returns unique domains."""
-    all_domains = set()
-    for index_name in CC_INDEXES:
-        for pattern in WIX_STORE_PATTERNS:
-            try:
-                domains = query_cc_index(index_name, pattern, limit=50)
-                all_domains.update(domains)
-                print(f"  📡 {index_name} / {pattern}: {len(domains)} (total unique: {len(all_domains)})")
-            except Exception as e:
-                print(f"  ⚠️ {index_name}/{pattern}: {e}")
-            time.sleep(1)
-    return [{'domain': d, 'source': 'wix_cc'} for d in all_domains]
-
-def discover_wix_via_related(user_email, seeds_limit=8):
-    discovered = []; seen_roots = set()
-    conn = get_db()
-    if not conn: return discovered
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT domain FROM wix_stores WHERE user_email = %s ORDER BY discovered_at DESC LIMIT %s", (user_email, seeds_limit))
-        seeds = [r[0] for r in cur.fetchall()]; cur.close()
-    finally: release_db(conn)
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    for seed in seeds:
-        try:
-            r = requests.get(f"https://{seed}", headers=headers, timeout=8)
-            if r.status_code != 200: continue
-            if not is_wix_site(r.text): continue
-            for ext in re.findall(r'href="https?://([a-zA-Z0-9\.\-]+\.wixsite\.com)', r.text)[:20]:
-                if ext in seen_roots or ext == seed: continue
-                seen_roots.add(ext)
-                discovered.append({'domain': ext, 'source': 'wix_related'})
-        except: continue
-    return discovered
-
-def background_wix_discovery(job_id):
-    print(f"🛍️ Wix discovery job #{job_id} started")
-    conn = get_db()
-    if not conn: return
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT user_email FROM wix_discovery_jobs WHERE id = %s", (job_id,))
-        row = cur.fetchone(); cur.close()
-        if not row: return
-        user_email = row[0]
-    finally: release_db(conn)
-
-    # Phase 1: Common Crawl query (all indexes × patterns)
-    print(f"  🔎 Phase 1: querying {len(CC_INDEXES)} indexes × {len(WIX_STORE_PATTERNS)} patterns")
-    candidates = discover_wix_via_commoncrawl_all()
-    print(f"  ✅ Found {len(candidates)} candidate domains")
-
-    # Update progress
-    conn = get_db()
-    if conn:
-        try:
-            cur = conn.cursor()
-            cur.execute("UPDATE wix_discovery_jobs SET total=%s, processed=%s, found=%s, status='running', updated_at=NOW() WHERE id=%s",
-                        (len(candidates), 1, len(candidates), job_id))
-            conn.commit(); cur.close()
-        finally: release_db(conn)
-
-    # Phase 2: Verify each candidate
-    print(f"  🔍 Phase 2: verifying {len(candidates)} candidates")
-    verified = []
-    verified_count = 0
-    for i, cand in enumerate(candidates):
-        try:
-            is_store, country = verify_wix_store(cand['domain'])
-            if is_store:
-                verified.append({'domain': cand['domain'], 'source': cand['source'], 'country': country})
-                verified_count += 1
-        except: pass
-        # Update progress every 10
-        if (i + 1) % 10 == 0:
-            conn = get_db()
-            if conn:
-                try:
-                    cur = conn.cursor()
-                    cur.execute("UPDATE wix_discovery_jobs SET processed=%s, saved=%s, updated_at=NOW() WHERE id=%s",
-                                (i + 1 + 1, verified_count, job_id))
-                    conn.commit(); cur.close()
-                finally: release_db(conn)
-            print(f"    Verified {i+1}/{len(candidates)}, {verified_count} real stores")
-    print(f"  ✅ Verified {verified_count} real Wix Stores")
-
-    # Save verified stores
-    saved = save_wix_stores(user_email, verified)
-
-    # Phase 3: Related discovery (from verified stores)
-    print(f"  🔗 Phase 3: related discovery")
-    try:
-        related = discover_wix_via_related(user_email, seeds_limit=8)
-        if related:
-            # Verify related too
-            verified_related = []
-            for r in related[:30]:
-                try:
-                    is_store, country = verify_wix_store(r['domain'])
-                    if is_store:
-                        verified_related.append({'domain': r['domain'], 'source': 'wix_related', 'country': country})
-                except: pass
-            saved += save_wix_stores(user_email, verified_related)
-    except Exception as e:
-        print(f"related error: {e}")
-
-    # Mark complete
-    conn = get_db()
-    if conn:
-        try:
-            cur = conn.cursor()
-            cur.execute("UPDATE wix_discovery_jobs SET status='completed', processed=%s, saved=%s, updated_at=NOW() WHERE id=%s",
-                        (len(candidates) + 1, saved, job_id))
-            conn.commit(); cur.close()
-        finally: release_db(conn)
-
-    print(f"✅ Wix discovery job #{job_id} complete ({saved} stores saved)")
-
-def get_wix_discovery_jobs(user_email):
-    conn = get_db()
-    if not conn: return []
-    try:
-        cur = conn.cursor()
-        cur.execute("""SELECT id, category, total, processed, found, saved, status, created_at
-            FROM wix_discovery_jobs WHERE user_email = %s ORDER BY created_at DESC LIMIT 3""", (user_email,))
-        rows = cur.fetchall(); cur.close()
-        return [{'id': r[0], 'category': r[1] or 'all', 'total': r[2], 'processed': r[3],
-                 'found': r[4], 'saved': r[5], 'status': r[6], 'created_at': str(r[7])[:16]} for r in rows]
     except: return []
     finally: release_db(conn)
 
@@ -1277,6 +1002,37 @@ def save_email_scan(user_email, results, store_count):
     except Exception as e: print(f"save_email_scan: {e}")
     finally: release_db(conn)
 
+def get_email_scans(user_email):
+    conn = get_db()
+    if not conn: return []
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, email_count, store_count, created_at FROM email_scans WHERE user_email = %s ORDER BY created_at DESC LIMIT 3", (user_email,))
+        rows = cur.fetchall(); cur.close()
+        return [{'id': r[0], 'count': r[1], 'stores': r[2], 'created_at': str(r[3])[:16]} for r in rows]
+    except: return []
+    finally: release_db(conn)
+
+def get_email_scan_detail(scan_id, user_email):
+    conn = get_db()
+    if not conn: return []
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT results, emails FROM email_scans WHERE id = %s AND user_email = %s", (scan_id, user_email))
+        row = cur.fetchone(); cur.close()
+        if not row: return []
+        if row[0]:
+            try:
+                parsed = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                if parsed and len(parsed) > 0: return parsed
+            except: pass
+        if row[1]:
+            flat = row[1].split(',') if isinstance(row[1], str) else row[1]
+            return [{'store': '(old format)', 'emails': [e for e in flat if e.strip()]}]
+        return []
+    except: return []
+    finally: release_db(conn)
+
 # ==========================================
 # AUDIT HISTORY
 # ==========================================
@@ -1418,12 +1174,8 @@ def audit_store(domain, case_id, include_catalogue=False):
         report["checks"]["https"] = False
         report["error"] = f"Could not reach store: {str(e)[:100]}"; return report
     is_shop = any(x in html.lower() for x in ['cdn.shopify.com', 'shopify.theme', 'shopify-section', 'myshopify.com'])
-    is_wix = is_wix_site(html)
     report["checks"]["is_shopify"] = is_shop
-    report["checks"]["is_wix"] = is_wix
-    report["checks"]["platform"] = "Shopify" if is_shop else ("Wix" if is_wix else "Unknown")
     if is_shop: report["positives"].append("Confirmed Shopify store")
-    if is_wix: report["positives"].append("Confirmed Wix store")
     try:
         r2 = requests.get(f"{base_url}/products.json?limit=250", headers=headers, timeout=10)
         if r2.status_code == 200:
@@ -1756,13 +1508,12 @@ NAVBAR = '''
 .navbar{position:fixed;top:0;left:0;right:0;height:56px;background:#1f2937;color:white;display:flex;align-items:center;padding:0 16px;z-index:9999;box-shadow:0 2px 8px rgba(0,0,0,0.2)}
 .navbar-title{font-size:18px;font-weight:bold;margin-left:12px}
 .hamburger{background:none;border:none;color:white;font-size:24px;cursor:pointer;padding:4px 10px}
-.drawer{position:fixed;top:0;left:-300px;width:300px;height:100vh;background:#111827;color:white;transition:left 0.3s ease;z-index:10000;padding-top:20px;overflow-y:auto}
+.drawer{position:fixed;top:0;left:-280px;width:280px;height:100vh;background:#111827;color:white;transition:left 0.3s ease;z-index:10000;padding-top:20px;overflow-y:auto}
 .drawer.open{left:0}
 .drawer-header{padding:16px 20px;font-size:18px;font-weight:bold;border-bottom:1px solid #374151;display:flex;justify-content:space-between;align-items:center}
 .drawer-close{background:none;border:none;color:white;font-size:24px;cursor:pointer}
-.drawer a{display:block;padding:14px 20px;color:white;text-decoration:none;border-bottom:1px solid #1f2937;font-size:15px}
+.drawer a{display:block;padding:16px 20px;color:white;text-decoration:none;border-bottom:1px solid #1f2937;font-size:16px}
 .drawer a:hover{background:#1f2937}
-.drawer-section{padding:12px 20px 6px;font-size:12px;font-weight:bold;color:#9ca3af;letter-spacing:1px;text-transform:uppercase;background:#0f172a}
 .drawer-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:9998;display:none}
 .drawer-overlay.show{display:block}
 .page-content{padding-top:70px}
@@ -1774,19 +1525,13 @@ NAVBAR = '''
 <div class="drawer-overlay" id="drawerOverlay" onclick="toggleDrawer()"></div>
 <div class="drawer" id="drawer">
 <div class="drawer-header"><span>📧 Menu</span><button class="drawer-close" onclick="toggleDrawer()">×</button></div>
-
-<div class="drawer-section">🛍️ Shopify</div>
 <a href="/" onclick="closeDrawer()">🔍 Email Finder</a>
 <a href="/discover" onclick="closeDrawer()">🎯 Store Discovery</a>
 <a href="/verify" onclick="closeDrawer()">✅ Verify Emails</a>
 <a href="/scout" onclick="closeDrawer()">📨 Email Scout</a>
 <a href="/audit" onclick="closeDrawer()">🚀 Analyze & Send</a>
-
-<div class="drawer-section">🛍️ Wix</div>
-<a href="/wix" onclick="closeDrawer()">🔍 Wix Store Finder</a>
-
-<div class="drawer-section">⚙️ Account</div>
 <a href="/settings" onclick="closeDrawer()">⚙️ Settings</a>
+<hr style="border-color:#374151;margin:20px 0">
 <a href="/logout" onclick="closeDrawer()" style="color:#ef4444">🚪 Logout</a>
 </div>
 <script>
@@ -1882,7 +1627,7 @@ def settings():
     return render_page("Settings", body)
 
 # ==========================================
-# HOME (Email Finder - Shopify)
+# HOME (Email Finder)
 # ==========================================
 @app.route('/')
 @login_required
@@ -2075,7 +1820,7 @@ def store_emails():
     return jsonify({'success': True})
 
 # ==========================================
-# STORE DISCOVERY (Shopify)
+# STORE DISCOVERY
 # ==========================================
 @app.route('/discover')
 @login_required
@@ -2232,173 +1977,7 @@ window.onload = function(){ loadStores(); loadHFHistory(); };
     return render_page("Store Discovery", body)
 
 # ==========================================
-# WIX STORE FINDER PAGE
-# ==========================================
-@app.route('/wix')
-@login_required
-def wix_page():
-    body = '''<div style="max-width:900px;margin:20px auto;padding:20px">
-<div style="background:linear-gradient(135deg,#0d9488,#0891b2);color:white;padding:20px;border-radius:10px;margin-bottom:20px">
-<h1 style="margin:0">🔍 Wix Store Finder</h1>
-<p style="margin:4px 0 0 0;font-size:14px;opacity:0.9">Common Crawl CDX · 6 indexes × 3 store patterns · verified</p>
-</div>
-
-<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
-<h3 style="margin-top:0">🚀 Automated Discovery</h3>
-<p style="font-size:14px;color:#555;margin:5px 0">Queries 6 Common Crawl indexes × 3 store-specific patterns, then verifies each URL is a real Wix Store.</p>
-<div style="background:#f3f4f6;padding:10px;border-radius:6px;margin:10px 0;font-size:13px;line-height:1.7">
-  <b>How it works:</b><br>
-  1️⃣ Query <code>/product-page/</code>, <code>/shop/</code>, <code>/store/</code> paths across 6 CC indexes<br>
-  2️⃣ Verify each URL loads as a real Wix Store (has <code>wixstores</code>, cart widgets, etc.)<br>
-  3️⃣ Filter out blogs, portfolios, and other non-store Wix sites<br>
-  4️⃣ Detect country (US / UK / CA / AU / EU)
-</div>
-<button onclick="startWixDiscovery()" style="background:#0d9488;color:white;padding:14px 28px;border:none;border-radius:8px;cursor:pointer;font-size:16px;font-weight:bold;width:100%">🚀 Discover Wix Stores</button>
-<div id="wixStatus" style="margin-top:12px"></div>
-<div style="font-size:12px;color:#666;margin-top:8px;text-align:center">⚠️ Takes 10-20 minutes (Common Crawl queries are slow, but reliable)</div>
-</div>
-
-<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
-<h3 style="margin-top:0">📋 Last 3 Discovery Jobs</h3>
-<div id="wixJobs">Loading...</div>
-</div>
-
-<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1)">
-<h3 style="margin-top:0">📋 Discovered Wix Stores (<span id="wixCount">0</span>)</h3>
-<div id="wixList">Loading...</div>
-<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
-<button onclick="sendAllToWixFinder()" style="background:#667eea;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;font-size:14px;opacity:0.6" disabled title="Coming in Step 2">📧 Send All to Wix Email Finder</button>
-<button onclick="clearWixStores()" style="background:#ef4444;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px">🗑️ Clear</button>
-</div>
-</div>
-</div>
-<script>
-async function startWixDiscovery(){
-  const status = document.getElementById('wixStatus');
-  status.innerHTML = '<p style="color:#666">⏳ Starting Wix discovery...<br>Querying 6 Common Crawl indexes × 3 patterns.<br>Then verifying each URL. This takes 10-20 minutes.<br><b>You can close the browser — runs in the background.</b></p>';
-  try{
-    const res = await fetch('/start-wix-discovery', {method:'POST'});
-    const data = await res.json();
-    if(data.success){
-      status.innerHTML = '<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:12px;border-radius:5px;color:#166534"><b>✅ Job #'+data.job_id+' started!</b><br>Querying Common Crawl + verifying each URL.<br><br><b>You can close the browser now.</b><br>Come back in 10-20 min to see results.</div>';
-      loadWixJobs();
-    } else {
-      status.innerHTML = '<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">Error: '+(data.error||'Unknown')+'</div>';
-    }
-  }catch(e){ status.innerHTML = '<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">Error: '+e.message+'</div>'; }
-}
-
-async function loadWixJobs(){
-  try{
-    const res = await fetch('/get-wix-jobs');
-    const data = await res.json();
-    const c = document.getElementById('wixJobs');
-    if(!data.jobs || data.jobs.length === 0){ c.innerHTML = '<p style="color:#666">No Wix discovery jobs yet.</p>'; return; }
-    let html = '';
-    data.jobs.forEach(j => {
-      let color = '#f59e0b';
-      let icon = '🔄';
-      if(j.status === 'completed'){ color = '#16a34a'; icon = '✅'; }
-      else if(j.status === 'cancelled'){ color = '#ef4444'; icon = '⏹️'; }
-      const pct = j.total > 0 ? Math.round((j.processed / j.total) * 100) : 0;
-      html += '<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+color+'">';
-      html += '<div><b>'+icon+' Job #'+j.id+'</b> — '+j.saved+' real stores saved ('+j.processed+'/'+j.total+' verified)<br>';
-      html += '<span style="font-size:12px;color:#666">'+j.created_at+' · found '+j.found+' candidates</span></div>';
-      html += '<div style="margin-top:8px;background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+pct+'%;height:14px;background:'+color+';text-align:center;color:white;font-size:11px;line-height:14px">'+pct+'%</div></div>';
-      html += '</div>';
-    });
-    c.innerHTML = html;
-  }catch(e){ console.error(e); }
-}
-
-async function loadWixStores(){
-  try{
-    const res = await fetch('/get-wix-stores');
-    const data = await res.json();
-    document.getElementById('wixCount').textContent = data.stores ? data.stores.length : 0;
-    const c = document.getElementById('wixList');
-    if(!data.stores || data.stores.length === 0){ c.innerHTML = '<p style="color:#666">No Wix stores discovered yet.</p>'; return; }
-    let html = '';
-    data.stores.slice(0, 50).forEach(s => {
-      html += '<div style="background:#f9f9f9;padding:10px;border-radius:6px;margin:6px 0;border-left:4px solid #0d9488">';
-      html += '<b><a href="https://'+s.domain+'" target="_blank" style="color:#3b82f6">'+s.domain+'</a></b>';
-      if(s.country) html += ' <span style="font-size:11px;background:#e0f2fe;color:#0369a1;padding:2px 6px;border-radius:4px">'+s.country+'</span>';
-      html += ' <span style="font-size:11px;color:#666">('+s.source+')</span>';
-      html += '</div>';
-    });
-    if(data.stores.length > 50){ html += '<p style="color:#666;font-size:13px">... and '+(data.stores.length - 50)+' more</p>'; }
-    c.innerHTML = html;
-  }catch(e){ console.error(e); }
-}
-
-async function clearWixStores(){
-  if(!confirm('Delete all discovered Wix stores?')) return;
-  await fetch('/clear-wix-stores', {method:'POST'});
-  loadWixStores();
-}
-
-function sendAllToWixFinder(){ alert('Wix Email Finder is coming in Step 2!'); }
-
-window.onload = function(){ loadWixJobs(); loadWixStores(); setInterval(loadWixJobs, 5000); };
-</script>'''
-    return render_page("Wix Store Finder", body)
-
-# ==========================================
-# WIX API ROUTES
-# ==========================================
-@app.route('/start-wix-discovery', methods=['POST'])
-@login_required
-def start_wix_discovery():
-    user_email = session.get('user_id')
-    conn = get_db()
-    if not conn: return jsonify({'success': False, 'error': 'No DB'})
-    try:
-        cur = conn.cursor()
-        cur.execute("""INSERT INTO wix_discovery_jobs (user_email, category, total, status)
-            VALUES (%s, %s, %s, 'running') RETURNING id""",
-            (user_email, 'cc_multi', 1))
-        job_id = cur.fetchone()[0]
-        conn.commit(); cur.close()
-    finally: release_db(conn)
-    threading.Thread(target=background_wix_discovery, args=(job_id,), daemon=True).start()
-    return jsonify({'success': True, 'job_id': job_id})
-
-@app.route('/get-wix-jobs')
-@login_required
-def get_wix_jobs_route():
-    user_email = session.get('user_id')
-    return jsonify({'jobs': get_wix_discovery_jobs(user_email)})
-
-@app.route('/get-wix-stores')
-@login_required
-def get_wix_stores_route():
-    user_email = session.get('user_id')
-    conn = get_db()
-    if not conn: return jsonify({'stores': []})
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT domain, source, country, discovered_at FROM wix_stores WHERE user_email = %s ORDER BY discovered_at DESC LIMIT 10000", (user_email,))
-        rows = cur.fetchall(); cur.close()
-        return jsonify({'stores': [{'domain': r[0], 'source': r[1], 'country': r[2] or '', 'discovered_at': str(r[3])[:16]} for r in rows]})
-    except: return jsonify({'stores': []})
-    finally: release_db(conn)
-
-@app.route('/clear-wix-stores', methods=['POST'])
-@login_required
-def clear_wix_stores_route():
-    user_email = session.get('user_id')
-    conn = get_db()
-    if not conn: return jsonify({'success': False})
-    try:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM wix_stores WHERE user_email = %s", (user_email,))
-        conn.commit(); cur.close()
-        return jsonify({'success': True})
-    except: return jsonify({'success': False})
-    finally: release_db(conn)
-
-# ==========================================
-# DISCOVERY API (Shopify)
+# DISCOVERY API
 # ==========================================
 @app.route('/import-from-huggingface', methods=['POST'])
 @login_required
@@ -3160,7 +2739,6 @@ function renderReport(r){
   const ch=r.checks||{};const sc=r.scores||{};const iss=r.issues||[];
   let h='';
   h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:15px"><h2 style="margin:0">Store Audit Overview</h2><div style="color:#666;font-size:13px;margin-top:6px">Store: <a href="https://'+r.domain+'" target="_blank" style="color:#3b82f6">https://'+r.domain+'/</a></div>'+(r.case_id?'<div style="background:#f3f4f6;padding:6px 12px;border-radius:6px;font-size:13px;color:#374151;margin-top:8px;display:inline-block">Case ID: <b>'+r.case_id+'</b></div>':'')+'</div>';
-  if(ch.platform) h+='<div style="background:#f3f4f6;padding:6px 12px;border-radius:6px;font-size:13px;color:#374151;margin-bottom:15px;display:inline-block">Platform: <b>'+ch.platform+'</b></div>';
   h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:15px"><h3 style="margin-top:0">📈 Scores</h3>'+scoreBar('Overall',sc.overall_score||0)+scoreBar('Trust',sc.trust_score||0)+scoreBar('Technical',sc.technical_score||0)+scoreBar('Marketing',sc.marketing_score||0)+'</div>';
 
   if(r.catalogue){
