@@ -13,9 +13,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 wix_bp = Blueprint('wix_bp', __name__)
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
-# ==========================================================
-# Local DB helpers — independent of app.py's pool
-# ==========================================================
 import psycopg2
 
 def wix_get_db():
@@ -44,9 +41,6 @@ def _resolve_mx(domain):
         _dns_cache[domain] = None
         return None
 
-# ==========================================================
-# Wix-only DB tables (created on first attach)
-# ==========================================================
 def wix_init_db():
     conn = wix_get_db()
     if not conn: return
@@ -60,43 +54,36 @@ def wix_init_db():
             audited_at TIMESTAMPTZ, notes TEXT)""")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_wix_warehouse_status ON wix_warehouse(status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_wix_warehouse_created ON wix_warehouse(created_at DESC)")
-
         cur.execute("""CREATE TABLE IF NOT EXISTS wix_email_jobs (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             total INTEGER DEFAULT 0, processed INTEGER DEFAULT 0, emails_found INTEGER DEFAULT 0,
             status VARCHAR(50) DEFAULT 'pending', remaining_urls TEXT, results TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-
         cur.execute("""CREATE TABLE IF NOT EXISTS wix_verify_jobs (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             job_name VARCHAR(255), total INTEGER DEFAULT 0, processed INTEGER DEFAULT 0,
             valid_emails TEXT, invalid_emails TEXT, remaining_emails TEXT,
             status VARCHAR(50) DEFAULT 'pending',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-
         cur.execute("""CREATE TABLE IF NOT EXISTS wix_audit_queue (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             email VARCHAR(255) NOT NULL, domain VARCHAR(255) NOT NULL,
             status VARCHAR(50) DEFAULT 'pending', report JSONB, subject TEXT, message TEXT,
             added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_email, email))""")
-
         cur.execute("""CREATE TABLE IF NOT EXISTS wix_sent_log (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             email VARCHAR(255) NOT NULL, sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_email, email))""")
-
         cur.execute("""CREATE TABLE IF NOT EXISTS wix_audit_history (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             domain VARCHAR(255) NOT NULL, report JSONB,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-
         cur.execute("""CREATE TABLE IF NOT EXISTS wix_state (
             user_email VARCHAR(255) PRIMARY KEY,
             found_emails TEXT, verified_emails TEXT, scout_recipients TEXT,
             scout_subject TEXT, scout_message TEXT, session_sent_count INTEGER DEFAULT 0,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-
         conn.commit(); cur.close()
         print("✅ wix tables ready")
     except Exception as e:
@@ -104,9 +91,6 @@ def wix_init_db():
     finally:
         wix_release(conn)
 
-# ==========================================================
-# Wix state helpers (own table, separate from user_state)
-# ==========================================================
 def wix_load_state(user_email):
     conn = wix_get_db()
     if not conn: return {}
@@ -145,23 +129,12 @@ def wix_save_state(user_email, **kwargs):
     finally:
         wix_release(conn)
 
-# ==========================================================
-# Wix email finder (background)
-# ==========================================================
 def wix_find_emails(domain):
-    """Wix email finder. Same logic as Shopify but standalone."""
     domain = domain.strip().lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
     if not domain or '.' not in domain: return []
-    # Try Wix-specific contact pages first
     emails = []
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    urls_to_try = [
-        f"https://{domain}/contact",
-        f"https://{domain}/contact-us",
-        f"https://{domain}/pages/contact",
-        f"https://{domain}",
-    ]
-    for url in urls_to_try:
+    for url in [f"https://{domain}/contact", f"https://{domain}/contact-us", f"https://{domain}/pages/contact", f"https://{domain}"]:
         try:
             r = requests.get(url, headers=headers, timeout=6)
             if r.status_code == 200:
@@ -179,8 +152,8 @@ def wix_find_emails(domain):
                     emails.append(e.lower())
                 if len(set(emails)) >= 3: break
         except: continue
-    skip = ['wix', 'sentry', 'facebook.com', 'instagram.com', 'twitter.com', 'pinterest.com',
-            'example.com', 'example.org', 'wixpress', 'cloudflare', 'sentry.io',
+    skip = ['wix','sentry','facebook.com','instagram.com','twitter.com','pinterest.com',
+            'example.com','example.org','wixpress','cloudflare','sentry.io',
             '.jpg','.png','.jpeg','.gif','.svg','@2x','@3x']
     final = [e for e in set(emails) if len(e) > 5 and '.' in e and not any(x in e for x in skip)]
     return final
@@ -248,9 +221,6 @@ def wix_process_email_job(job_id):
         if pairs:
             wix_save_state(user_email, found_emails='|||'.join(pairs))
 
-# ==========================================================
-# Wix verify (background)
-# ==========================================================
 def wix_verify_email(email):
     try:
         import smtplib
@@ -309,9 +279,6 @@ def wix_verify_worker(job_id):
     if user_email and valid:
         wix_save_state(user_email, verified_emails='|||'.join(valid))
 
-# ==========================================================
-# Wix audit — extracts top products from HTML
-# ==========================================================
 def extract_wix_products(html, base_url, max_products=3):
     products = []
     product_links = re.findall(r'href="(https?://[^"]*?/(?:product-page|shop|store|product)/[^"?#]+)"', html)
@@ -462,9 +429,6 @@ def audit_store_wix(domain, case_id):
     report["scores"]["overall_score"] = int((report["scores"]["trust_score"] + report["scores"]["technical_score"] + report["scores"]["marketing_score"]) / 3)
     return report
 
-# ==========================================================
-# Wix email generator
-# ==========================================================
 def generate_wix_email(report, tone='friendly', sender_name='', email=''):
     dom = report.get('domain','')
     brand = dom.split('.')[0].title() if dom and '.' in dom else 'there'
@@ -504,9 +468,6 @@ def generate_wix_email(report, tone='friendly', sender_name='', email=''):
 
     return {'subject': subject, 'body': "\n".join(parts), 'tone': tone}
 
-# ==========================================================
-# Ingestion helper (reads ingest_leadita.py if it exists)
-# ==========================================================
 def run_wix_ingest():
     try:
         import importlib, ingest_leadita
@@ -515,9 +476,6 @@ def run_wix_ingest():
     except Exception as e:
         return {'status': 'error', 'error': f'{e}'}
 
-# ==========================================================
-# PAGES
-# ==========================================================
 def _navbar():
     return '''
 <style>
@@ -542,14 +500,21 @@ def _navbar():
 <div class="drawer-overlay" id="drawerOverlay" onclick="toggleDrawer()"></div>
 <div class="drawer" id="drawer">
 <div class="drawer-header"><span>📧 Menu</span><button class="drawer-close" onclick="toggleDrawer()">×</button></div>
+
 <div class="drawer-section">🎨 Wix</div>
 <a href="/wix" onclick="closeDrawer()">🔍 Wix Store Finder</a>
 <a href="/wix/finder" onclick="closeDrawer()">📧 Wix Email Finder</a>
 <a href="/wix/verify" onclick="closeDrawer()">✅ Wix Verify</a>
 <a href="/wix/scout" onclick="closeDrawer()">📨 Wix Scout</a>
 <a href="/wix/audit" onclick="closeDrawer()">🚀 Wix Analyze & Send</a>
+
 <div class="drawer-section">🛍️ Shopify</div>
-<a href="/" onclick="closeDrawer()">← Back to Shopify</a>
+<a href="/" onclick="closeDrawer()">🔍 Email Finder</a>
+<a href="/discover" onclick="closeDrawer()">🎯 Store Discovery</a>
+<a href="/verify" onclick="closeDrawer()">✅ Verify Emails</a>
+<a href="/scout" onclick="closeDrawer()">📨 Email Scout</a>
+<a href="/audit" onclick="closeDrawer()">🚀 Analyze & Send</a>
+
 <div class="drawer-section">⚙️ Account</div>
 <a href="/settings" onclick="closeDrawer()">⚙️ Settings</a>
 <a href="/logout" onclick="closeDrawer()" style="color:#ef4444">🚪 Logout</a>
@@ -562,10 +527,6 @@ function closeDrawer(){document.getElementById('drawer').classList.remove('open'
 
 def _page(title, body):
     return f'<!DOCTYPE html><html><head><title>{title}</title><meta name="viewport" content="width=device-width,initial-scale=1">{_navbar()}</head><body style="margin:0;font-family:Arial"><div class="page-content">{body}</div></body></html>'
-
-# ==========================================================
-# BLUEPRINT ROUTES
-# ==========================================================
 
 @wix_bp.route('/wix')
 def wix_home():
@@ -632,7 +593,6 @@ window.onload = loadStats;
 </script>'''
     return _page("Wix Store Finder", body)
 
-
 @wix_bp.route('/wix/finder')
 def wix_finder():
     if 'user_id' not in session: return redirect('/login')
@@ -674,7 +634,6 @@ async function loadJobs(){
 </script>'''
     return _page("Wix Email Finder", body)
 
-
 @wix_bp.route('/wix/verify')
 def wix_verify_page():
     if 'user_id' not in session: return redirect('/login')
@@ -698,7 +657,6 @@ async function refresh(){ const r = await fetch('/wix/verify-jobs'); const d = a
 window.onload = function(){ refresh(); setInterval(refresh, 10000); };
 </script>'''
     return _page("Wix Verify", body)
-
 
 @wix_bp.route('/wix/scout')
 def wix_scout_page():
@@ -728,7 +686,6 @@ function next(){ if(!running || i>=recipients.length){ running=false; return; } 
 document.addEventListener('visibilitychange', function(){ if(document.visibilityState==='visible' && running) setTimeout(next, 2000); });
 </script>'''
     return _page("Wix Scout", body)
-
 
 @wix_bp.route('/wix/audit')
 def wix_audit_page():
@@ -774,34 +731,24 @@ window.onload = loadQueue;
 </script>'''
     return _page("Wix Analyze & Send", body)
 
-# ==========================================================
-# API ROUTES
-# ==========================================================
-
 @wix_bp.route('/wix/ingest', methods=['GET','POST'])
 def wix_ingest():
     header_secret = request.headers.get('X-Cron-Secret', '')
     cron_secret = os.environ.get('CRON_SECRET', '')
     valid_cron = bool(cron_secret) and header_secret == cron_secret
     valid_user = ('user_id' in session) and header_secret == 'MANUAL_FROM_UI'
-    # Also allow logged-in user via direct browser POST (no header needed)
     if 'user_id' in session and request.method == 'POST' and not header_secret:
         valid_user = True
     if not (valid_cron or valid_user):
         return jsonify({'status': 'error', 'error': 'forbidden'}), 403
-
     if valid_user and not valid_cron:
         result = run_wix_ingest()
         return jsonify(result), (200 if result.get('status') == 'ok' else 500)
-
     def _bg():
-        try:
-            print(f"🕒 [wix cron] {run_wix_ingest()}")
-        except Exception as e:
-            print(f"🕒 [wix cron] error: {e}")
+        try: print(f"🕒 [wix cron] {run_wix_ingest()}")
+        except Exception as e: print(f"🕒 [wix cron] error: {e}")
     threading.Thread(target=_bg, daemon=True).start()
     return jsonify({'status': 'accepted'}), 202
-
 
 @wix_bp.route('/wix/warehouse')
 def wix_warehouse():
@@ -822,7 +769,6 @@ def wix_warehouse():
         return jsonify({'error':str(e)[:200]}), 500
     finally: wix_release(conn)
 
-
 @wix_bp.route('/wix/request', methods=['POST'])
 def wix_request():
     if 'user_id' not in session: return jsonify({'success':False,'error':'auth'}), 401
@@ -840,7 +786,6 @@ def wix_request():
         return jsonify({'success':False,'error':str(e)[:200]})
     finally: wix_release(conn)
 
-
 @wix_bp.route('/wix/warehouse/reset', methods=['POST'])
 def wix_reset():
     if 'user_id' not in session: return jsonify({'success':False}), 401
@@ -854,8 +799,6 @@ def wix_reset():
     except: return jsonify({'success':False})
     finally: wix_release(conn)
 
-
-# --- Email finder API ---
 @wix_bp.route('/wix/start-email-finder-job', methods=['POST'])
 def wix_start_finder():
     if 'user_id' not in session: return jsonify({'success':False,'error':'auth'}), 401
@@ -873,7 +816,6 @@ def wix_start_finder():
     threading.Thread(target=wix_process_email_job, args=(job_id,), daemon=True).start()
     return jsonify({'success':True,'job_id':job_id,'total':len(urls)})
 
-
 @wix_bp.route('/wix/get-email-finder-jobs')
 def wix_get_finder_jobs():
     if 'user_id' not in session: return jsonify({'jobs':[]}), 401
@@ -887,7 +829,6 @@ def wix_get_finder_jobs():
         return jsonify({'jobs':[{'id':r[0],'total':r[1],'emails':r[2],'status':r[3],'created_at':str(r[4])[:16]} for r in rows]})
     except: return jsonify({'jobs':[]})
     finally: wix_release(conn)
-
 
 @wix_bp.route('/wix/get-email-finder-job/<int:jid>')
 def wix_get_finder_job(jid):
@@ -905,7 +846,6 @@ def wix_get_finder_job(jid):
     except: return jsonify({'results':[]})
     finally: wix_release(conn)
 
-
 @wix_bp.route('/wix/store-emails', methods=['POST'])
 def wix_store_emails():
     if 'user_id' not in session: return jsonify({'success':False}), 401
@@ -918,7 +858,6 @@ def wix_store_emails():
     if items: wix_save_state(session.get('user_id'), found_emails='|||'.join(items))
     return jsonify({'success':True})
 
-
 @wix_bp.route('/wix/get-wix-emails')
 def wix_get_emails():
     if 'user_id' not in session: return jsonify({'emails':[]}), 401
@@ -929,8 +868,6 @@ def wix_get_emails():
         emails.append(item.split(':::',1)[0].strip() if ':::' in item else item.strip())
     return jsonify({'emails':[e for e in emails if e]})
 
-
-# --- Verify API ---
 @wix_bp.route('/wix/verify-async', methods=['POST'])
 def wix_verify_async():
     if 'user_id' not in session: return jsonify({'error':'auth'}), 401
@@ -950,7 +887,6 @@ def wix_verify_async():
     threading.Thread(target=wix_verify_worker, args=(job_id,), daemon=True).start()
     return jsonify({'success':True,'job_id':job_id,'total':len(emails)})
 
-
 @wix_bp.route('/wix/verify-jobs')
 def wix_verify_jobs():
     if 'user_id' not in session: return jsonify({'jobs':[]}), 401
@@ -967,15 +903,12 @@ def wix_verify_jobs():
     except: return jsonify({'jobs':[]})
     finally: wix_release(conn)
 
-
 @wix_bp.route('/wix/get-wix-verified-emails')
 def wix_get_verified():
     if 'user_id' not in session: return jsonify({'emails':[]}), 401
     state = wix_load_state(session.get('user_id'))
     return jsonify({'emails':[e.strip() for e in state.get('verified_emails', []) if e.strip()]})
 
-
-# --- Audit queue API ---
 @wix_bp.route('/wix/import-to-queue', methods=['POST'])
 def wix_import_to_queue():
     if 'user_id' not in session: return jsonify({'success':False}), 401
@@ -1015,7 +948,6 @@ def wix_import_to_queue():
     finally: wix_release(conn)
     return jsonify({'success':True,'added':added,'skipped':skipped})
 
-
 @wix_bp.route('/wix/get-audit-queue')
 def wix_get_queue():
     if 'user_id' not in session: return jsonify({'items':[]}), 401
@@ -1028,7 +960,6 @@ def wix_get_queue():
         rows = cur.fetchall(); cur.close()
         return jsonify({'items':[{'id':r[0],'email':r[1],'domain':r[2],'status':r[3]} for r in rows]})
     finally: wix_release(conn)
-
 
 @wix_bp.route('/wix/update-queue-item', methods=['POST'])
 def wix_update_queue():
@@ -1047,7 +978,6 @@ def wix_update_queue():
     except: return jsonify({'success':False})
     finally: wix_release(conn)
 
-
 @wix_bp.route('/wix/delete-queue-item', methods=['POST'])
 def wix_delete_queue():
     if 'user_id' not in session: return jsonify({'success':False}), 401
@@ -1061,7 +991,6 @@ def wix_delete_queue():
     except: return jsonify({'success':False})
     finally: wix_release(conn)
 
-
 @wix_bp.route('/wix/get-next-pending')
 def wix_next_pending():
     if 'user_id' not in session: return jsonify({'item':None}), 401
@@ -1074,7 +1003,6 @@ def wix_next_pending():
         if not row: return jsonify({'item':None})
         return jsonify({'item':{'id':row[0],'email':row[1],'domain':row[2]}})
     finally: wix_release(conn)
-
 
 @wix_bp.route('/wix/analyze-queue-item', methods=['POST'])
 def wix_analyze_item():
@@ -1104,7 +1032,6 @@ def wix_analyze_item():
         finally: wix_release(conn)
     return jsonify({'success':True,'item':{'id':item_id,'email':email,'domain':domain,'report':report}})
 
-
 @wix_bp.route('/wix/generate-email', methods=['POST'])
 def wix_generate_email():
     if 'user_id' not in session: return jsonify({'success':False}), 401
@@ -1120,7 +1047,6 @@ def wix_generate_email():
     except Exception as e:
         return jsonify({'success':False,'error':str(e)})
 
-
 @wix_bp.route('/wix/mark-sent', methods=['POST'])
 def wix_mark_sent():
     if 'user_id' not in session: return jsonify({'success':False}), 401
@@ -1135,10 +1061,6 @@ def wix_mark_sent():
     except: return jsonify({'success':False})
     finally: wix_release(conn)
 
-
-# ==========================================================
-# ATTACH — called by wsgi.py
-# ==========================================================
 def attach(app):
     """Register Wix blueprint on the existing Flask app. Does not modify app.py."""
     wix_init_db()
