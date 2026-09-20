@@ -2461,7 +2461,7 @@ def clear_wix_stores_route():
 # ==========================================
 # WIX WAREHOUSE — daily ingest + warehouse view
 # ==========================================
-@app.route('/wix/ingest', methods=['POST'])
+@app.route('/wix/ingest', methods=['GET', 'POST'])
 def wix_ingest_route():
     header_secret = request.headers.get('X-Cron-Secret', '')
     cron_secret = os.environ.get('CRON_SECRET', '')
@@ -2469,15 +2469,32 @@ def wix_ingest_route():
     valid_user = ('user_id' in session) and header_secret == 'MANUAL_FROM_UI'
     if not (valid_cron or valid_user):
         return jsonify({'status': 'error', 'error': 'forbidden'}), 403
-    try:
-        import importlib
-        import ingest_leadita
-        importlib.reload(ingest_leadita)
-        result = ingest_leadita.run(get_db, release_db)
-        code = 200 if result.get('status') == 'ok' else 500
-        return jsonify(result), code
-    except Exception as e:
-        return jsonify({'status': 'error', 'error': str(e)[:300]}), 500
+
+    # Manual UI button → run synchronously so the user sees live results
+    if valid_user and not valid_cron:
+        try:
+            import importlib
+            import ingest_leadita
+            importlib.reload(ingest_leadita)
+            result = ingest_leadita.run(get_db, release_db)
+            code = 200 if result.get('status') == 'ok' else 500
+            return jsonify(result), code
+        except Exception as e:
+            return jsonify({'status': 'error', 'error': str(e)[:300]}), 500
+
+    # Cron path → return immediately, run in background thread
+    def _bg_ingest():
+        try:
+            import importlib
+            import ingest_leadita
+            importlib.reload(ingest_leadita)
+            result = ingest_leadita.run(get_db, release_db)
+            print(f"🕒 [cron ingest] {result}")
+        except Exception as e:
+            print(f"🕒 [cron ingest] error: {e}")
+
+    threading.Thread(target=_bg_ingest, daemon=True).start()
+    return jsonify({'status': 'accepted', 'message': 'Ingest running in background'}), 202
 
 @app.route('/wix/warehouse')
 @login_required
