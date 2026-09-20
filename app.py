@@ -250,6 +250,23 @@ def init_db():
             sold_out_count INTEGER DEFAULT 0,
             bestsellers TEXT,
             crawled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS wix_warehouse (
+            id BIGSERIAL PRIMARY KEY,
+            url TEXT UNIQUE NOT NULL,
+            domain TEXT NOT NULL,
+            source TEXT,
+            title TEXT,
+            country TEXT,
+            status TEXT DEFAULT 'pending',
+            seo_score INTEGER,
+            tech_spend INTEGER,
+            crawled_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            verified_at TIMESTAMPTZ,
+            audited_at TIMESTAMPTZ,
+            notes TEXT)""")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_wix_warehouse_status ON wix_warehouse(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_wix_warehouse_created ON wix_warehouse(created_at DESC)")
         conn.commit(); cur.close()
         print("✅ DB ready")
     except Exception as e: print(f"❌ DB: {e}")
@@ -2259,6 +2276,14 @@ def wix_page():
 </div>
 
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
+<h3 style="margin-top:0">🏭 Warehouse (Daily Auto-Ingest)</h3>
+<p style="font-size:14px;color:#555;margin:5px 0">Pulls 501 fresh Wix domains from Leadita's daily GitHub sample, dedupes, saves to warehouse. Grows every day you run it.</p>
+<div id="warehouseStats" style="background:#f3f4f6;padding:12px;border-radius:6px;margin:10px 0;font-size:13px;line-height:1.7">Loading…</div>
+<button onclick="ingestNow()" style="background:#7c3aed;color:white;padding:12px 24px;border:none;border-radius:8px;cursor:pointer;font-size:15px;font-weight:bold;width:100%">📥 Ingest Today's Batch</button>
+<div id="ingestStatus" style="margin-top:10px"></div>
+</div>
+
+<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
 <h3 style="margin-top:0">📋 Last 3 Discovery Jobs</h3>
 <div id="wixJobs">Loading...</div>
 </div>
@@ -2339,7 +2364,43 @@ async function clearWixStores(){
 
 function sendAllToWixFinder(){ alert('Wix Email Finder is coming in Step 2!'); }
 
-window.onload = function(){ loadWixJobs(); loadWixStores(); setInterval(loadWixJobs, 5000); };
+async function loadWarehouseStats(){
+  try{
+    const res = await fetch('/wix/warehouse');
+    const d = await res.json();
+    let rows = '';
+    (d.daily_last_14 || []).slice(0,5).forEach(x => {
+      rows += '<div>' + x.date + ': <b>+' + x.count + '</b></div>';
+    });
+    document.getElementById('warehouseStats').innerHTML =
+      '<div><b>Total:</b> ' + d.total + ' &nbsp;|&nbsp; <b>Pending:</b> ' + d.pending + ' &nbsp;|&nbsp; <b>Verified:</b> ' + d.verified + '</div>' +
+      '<div style="margin-top:6px;color:#666">Last 5 days:</div>' + rows;
+  }catch(e){
+    document.getElementById('warehouseStats').textContent = 'Error: ' + e.message;
+  }
+}
+
+async function ingestNow(){
+  const status = document.getElementById('ingestStatus');
+  status.innerHTML = '<p style="color:#666">⏳ Fetching Leadita sample + inserting… (5-10 sec)</p>';
+  try{
+    const res = await fetch('/wix/ingest', {
+      method: 'POST',
+      headers: {'X-Cron-Secret': 'MANUAL_FROM_UI'}
+    });
+    const d = await res.json();
+    if(d.status === 'ok'){
+      status.innerHTML = '<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:10px;border-radius:5px;color:#166534"><b>✅ +' + d.new + ' new</b> &nbsp;(skipped ' + d.duplicates_skipped + ' duplicates)</div>';
+      loadWarehouseStats();
+    } else {
+      status.innerHTML = '<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">Error: ' + (d.error || 'Unknown') + '</div>';
+    }
+  }catch(e){
+    status.innerHTML = '<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">Error: ' + e.message + '</div>';
+  }
+}
+
+window.onload = function(){ loadWixJobs(); loadWixStores(); loadWarehouseStats(); setInterval(loadWixJobs, 5000); };
 </script>'''
     return render_page("Wix Store Finder", body)
 
@@ -2396,6 +2457,62 @@ def clear_wix_stores_route():
         return jsonify({'success': True})
     except: return jsonify({'success': False})
     finally: release_db(conn)
+
+# ==========================================
+# WIX WAREHOUSE — daily ingest + warehouse view
+# ==========================================
+@app.route('/wix/ingest', methods=['POST'])
+def wix_ingest_route():
+    header_secret = request.headers.get('X-Cron-Secret', '')
+    cron_secret = os.environ.get('CRON_SECRET', '')
+    valid_cron = bool(cron_secret) and header_secret == cron_secret
+    valid_user = ('user_id' in session) and header_secret == 'MANUAL_FROM_UI'
+    if not (valid_cron or valid_user):
+        return jsonify({'status': 'error', 'error': 'forbidden'}), 403
+    try:
+        import importlib
+        import ingest_leadita
+        importlib.reload(ingest_leadita)
+        result = ingest_leadita.run(get_db, release_db)
+        code = 200 if result.get('status') == 'ok' else 500
+        return jsonify(result), code
+    except Exception as e:
+        return jsonify({'status': 'error', 'error': str(e)[:300]}), 500
+
+@app.route('/wix/warehouse')
+@login_required
+def wix_warehouse_status():
+    conn = get_db()
+    if not conn:
+        return jsonify({'error': 'no db'}), 500
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM wix_warehouse")
+        total = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM wix_warehouse WHERE status='pending'")
+        pending = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM wix_warehouse WHERE status='processing'")
+        processing = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM wix_warehouse WHERE status='verified'")
+        verified = cur.fetchone()[0]
+        cur.execute("""SELECT DATE(created_at) AS d, COUNT(*) AS c
+            FROM wix_warehouse
+            GROUP BY DATE(created_at)
+            ORDER BY DATE(created_at) DESC
+            LIMIT 14""")
+        daily = [{'date': str(r[0]), 'count': r[1]} for r in cur.fetchall()]
+        cur.close()
+        return jsonify({
+            'total': total,
+            'pending': pending,
+            'processing': processing,
+            'verified': verified,
+            'daily_last_14': daily,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)[:200]}), 500
+    finally:
+        release_db(conn)
 
 # ==========================================
 # DISCOVERY API (Shopify)
