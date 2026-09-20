@@ -1,11 +1,10 @@
-# wix_app.py — self-contained Wix pipeline. Attaches to app.py via attach().
-# Does NOT modify app.py. Uses its own DB tables and helpers.
-
+# wix_app.py — self-contained Wix pipeline. Independent from Shopify.
 import os
 import re
 import json
 import time
 import threading
+import random
 import requests
 from flask import Blueprint, request, jsonify, session, redirect
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -83,7 +82,10 @@ def wix_init_db():
             user_email VARCHAR(255) PRIMARY KEY,
             found_emails TEXT, verified_emails TEXT, scout_recipients TEXT,
             scout_subject TEXT, scout_message TEXT, session_sent_count INTEGER DEFAULT 0,
+            send_limit INTEGER DEFAULT 70,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        try: cur.execute("ALTER TABLE wix_state ADD COLUMN IF NOT EXISTS send_limit INTEGER DEFAULT 70")
+        except: pass
         conn.commit(); cur.close()
         print("✅ wix tables ready")
     except Exception as e:
@@ -96,7 +98,7 @@ def wix_load_state(user_email):
     if not conn: return {}
     try:
         cur = conn.cursor()
-        cur.execute("SELECT found_emails, verified_emails, scout_recipients, scout_subject, scout_message, session_sent_count FROM wix_state WHERE user_email = %s", (user_email,))
+        cur.execute("SELECT found_emails, verified_emails, scout_recipients, scout_subject, scout_message, session_sent_count, send_limit FROM wix_state WHERE user_email = %s", (user_email,))
         row = cur.fetchone(); cur.close()
         if row:
             return {
@@ -106,6 +108,7 @@ def wix_load_state(user_email):
                 'scout_subject': row[3] or '',
                 'scout_message': row[4] or '',
                 'session_sent_count': row[5] or 0,
+                'send_limit': row[6] or 70,
             }
         return {}
     except Exception as e:
@@ -128,6 +131,20 @@ def wix_save_state(user_email, **kwargs):
         print(f"wix_save_state: {e}")
     finally:
         wix_release(conn)
+
+def wix_get_send_limit(user_email):
+    state = wix_load_state(user_email)
+    val = state.get('send_limit', 70) or 70
+    if val < 1: val = 70
+    return val
+
+def wix_counter_status(user_email):
+    state = wix_load_state(user_email)
+    count = state.get('session_sent_count', 0) or 0
+    limit = wix_get_send_limit(user_email)
+    at_milestone = (count > 0 and count % limit == 0)
+    next_milestone = ((count // limit) + 1) * limit
+    return {'count': count, 'limit': limit, 'next_milestone': next_milestone, 'at_milestone': at_milestone}
 
 def wix_find_emails(domain):
     domain = domain.strip().lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
@@ -192,7 +209,6 @@ def wix_process_email_job(job_id):
                 except: pass
         results.extend(chunk_results)
         total = sum(len(r.get('emails', [])) for r in results)
-
         conn = wix_get_db()
         if not conn: break
         try:
@@ -212,7 +228,6 @@ def wix_process_email_job(job_id):
             conn.commit(); cur.close()
         finally: wix_release(conn)
 
-    # Save emails to wix_state — with retry and explicit logging
     if user_email:
         pairs = []
         for r in results:
@@ -227,17 +242,13 @@ def wix_process_email_job(job_id):
                     cur.execute("""INSERT INTO wix_state (user_email, found_emails)
                         VALUES (%s, %s)
                         ON CONFLICT (user_email) DO UPDATE SET
-                        found_emails = EXCLUDED.found_emails,
-                        updated_at = NOW()""",
+                        found_emails = EXCLUDED.found_emails, updated_at = NOW()""",
                         (user_email, '|||'.join(pairs)))
                     save_conn.commit(); cur.close()
-                    print(f"✅ wix job {job_id}: saved {len(pairs)} email pairs for {user_email}")
+                    print(f"✅ wix job {job_id}: saved {len(pairs)} pairs")
                 except Exception as e:
-                    print(f"❌ wix job {job_id}: failed to save emails: {e}")
-                finally:
-                    wix_release(save_conn)
-            else:
-                print(f"❌ wix job {job_id}: could not connect to save emails")
+                    print(f"❌ wix save: {e}")
+                finally: wix_release(save_conn)
 
 def wix_verify_email(email):
     try:
@@ -281,7 +292,6 @@ def wix_verify_worker(job_id):
                 email, ok, reason = f.result()
                 if ok: valid.append(email)
                 else: invalid.append(email + " - " + reason)
-
         conn = wix_get_db()
         if not conn: break
         try:
@@ -307,7 +317,6 @@ def extract_wix_products(html, base_url, max_products=3):
         if l in seen: continue
         seen.add(l); unique.append(l)
         if len(unique) >= max_products: break
-
     try:
         sm = requests.get(f"{base_url.rstrip('/')}/store-products-sitemap.xml", timeout=8,
                           headers={"User-Agent": "Mozilla/5.0"})
@@ -317,7 +326,6 @@ def extract_wix_products(html, base_url, max_products=3):
                     unique.append(sl); seen.add(sl)
                     if len(unique) >= max_products: break
     except: pass
-
     for link in unique[:max_products]:
         try:
             pr = requests.get(link, timeout=8,
@@ -357,36 +365,30 @@ def audit_store_wix(domain, case_id):
         report["checks"]["https"] = False
         report["error"] = f"Unreachable: {str(e)[:100]}"
         return report
-
     low = html.lower()
     is_wix = any(x in low for x in ['wix.com','wixstatic.com','wix-code','wixstores','parastorage.com'])
     report["checks"]["is_wix"] = is_wix
     if is_wix: report["positives"].append("Confirmed Wix site")
-
     try:
         products = extract_wix_products(html, base_url, 3)
         report["top_products"] = products
         if products: report["positives"].append(f"Detected {len(products)} products")
         else: report["issues"].append({"title":"No Products Detected","description":"Could not find product pages","recommendation":"Feature products on homepage","severity":"high"})
     except: pass
-
     hv = 'name="viewport"' in low
     report["checks"]["mobile_responsive"] = hv
     if hv: report["positives"].append("Mobile responsive")
     else: report["issues"].append({"title":"Not Mobile Responsive","description":"Missing viewport","recommendation":"Enable mobile in Wix","severity":"high"})
-
     he = bool(re.search(r'mailto:[^"\']+', html))
     hp = bool(re.search(r'tel:[^"\']+', html))
     report["checks"]["has_email_link"] = he
     report["checks"]["has_phone_link"] = hp
     if he or hp: report["positives"].append("Contact info present")
     else: report["issues"].append({"title":"No Contact Info","description":"No email/phone","recommendation":"Add Contact page","severity":"high"})
-
     socials = [p.split('.')[0] for p in ['facebook.com','instagram.com','twitter.com','tiktok.com','youtube.com','pinterest.com'] if p in low]
     report["checks"]["social_links"] = socials
     if len(socials) >= 2: report["positives"].append(f"{len(socials)} socials")
     elif not socials: report["issues"].append({"title":"No Social Media","description":"None found","recommendation":"Add social profiles","severity":"medium"})
-
     pf = 0
     for pol in ['/terms','/privacy','/shipping','/returns','/policies']:
         try:
@@ -396,7 +398,6 @@ def audit_store_wix(domain, case_id):
     report["checks"]["policy_pages_found"] = f"{pf}/5"
     if pf >= 4: report["positives"].append("Policies present")
     elif pf < 2: report["issues"].append({"title":"Missing Policies","description":f"{pf}/5","recommendation":"Add terms, privacy, shipping","severity":"high"})
-
     payments = []
     for name, sigs in {"PayPal":["paypal.com","paypal"],"Stripe":["stripe.com","js.stripe"],"Apple Pay":["apple-pay","applepay"],"Google Pay":["google-pay","googlepay"]}.items():
         for s in sigs:
@@ -404,12 +405,10 @@ def audit_store_wix(domain, case_id):
     report["checks"]["payment_methods"] = payments
     if len(payments) >= 2: report["positives"].append(f"{len(payments)} payment options")
     else: report["issues"].append({"title":"Limited Payment Options","description":f"{len(payments)} detected","recommendation":"Add PayPal/Stripe","severity":"medium"})
-
     free_ship = any(x in low for x in ['free shipping','free delivery','shipping on us'])
     report["checks"]["free_shipping_advertised"] = free_ship
     if free_ship: report["positives"].append("Free shipping banner")
     else: report["issues"].append({"title":"No Free Shipping Banner","description":"Buyer priority","recommendation":"Add free shipping threshold","severity":"medium"})
-
     tm = re.search(r'<title[^>]*>(.*?)</title>', html, re.I | re.S)
     dm = re.search(r'<meta[^>]*name=["\']description["\'][^>]*content=["\']([^"\']*)["\']', html, re.I | re.S)
     title = tm.group(1).strip() if tm else ''
@@ -418,7 +417,6 @@ def audit_store_wix(domain, case_id):
     report["checks"]["meta_description_length"] = len(desc)
     if not title: report["issues"].append({"title":"Missing Page Title","description":"No title","recommendation":"Add SEO title","severity":"high"})
     if not desc: report["issues"].append({"title":"Missing Meta Description","description":"None","recommendation":"Add 150-160 chars","severity":"medium"})
-
     trust = 0
     if he or hp: trust += 20
     trust += min(int((pf/5)*30), 30)
@@ -426,7 +424,6 @@ def audit_store_wix(domain, case_id):
     elif socials: trust += 8
     if len(payments) >= 2: trust += 10
     report["scores"]["trust_score"] = min(trust, 100)
-
     tech = 0
     if report["checks"].get("https"): tech += 25
     if report["checks"].get("http_status") == 200: tech += 15
@@ -435,7 +432,6 @@ def audit_store_wix(domain, case_id):
     elif lt < 3: tech += 12
     elif lt < 5: tech += 5
     report["scores"]["technical_score"] = min(tech, 100)
-
     mkt = 0
     if products: mkt += 20
     if len(socials) >= 3: mkt += 20
@@ -443,47 +439,148 @@ def audit_store_wix(domain, case_id):
     if free_ship: mkt += 10
     if len(payments) >= 3: mkt += 10
     report["scores"]["marketing_score"] = min(mkt, 100)
-
     report["scores"]["overall_score"] = int((report["scores"]["trust_score"] + report["scores"]["technical_score"] + report["scores"]["marketing_score"]) / 3)
     return report
 
+# ==========================================
+# WIX EMAIL GENERATOR — RANDOMIZED TONES
+# ==========================================
+WIX_GREETINGS = {
+    'friendly': ["Hi {brand} team,", "Hey {brand} folks,", "Hello {brand},", "Hey {brand},", "Hi {brand},", "Hey there {brand},"],
+    'professional': ["Hello {brand} team,", "Dear {brand} team,", "Greetings {brand} team,", "Hello {brand},", "Good day {brand} team,"],
+    'casual': ["Hey {brand},", "Yo {brand},", "What's up {brand}?", "Hey {brand} team,"]
+}
+WIX_OPENERS_WITH_URL = {
+    'friendly': [
+        "Just had a quick look at {url} — spotted a few things.",
+        "Went through {url} today and noticed a few issues.",
+        "Spent a few minutes on {url} — here's what stood out.",
+        "Checked out {url} and found some quick wins.",
+        "Browsed {url} today and jotted down a few notes.",
+        "Took a peek at {url} — found some easy fixes."
+    ],
+    'professional': [
+        "I reviewed {url} and identified several areas for improvement.",
+        "After analyzing {url}, I found a few notable issues.",
+        "I ran a quick audit of {url} today and wanted to share the findings.",
+        "Here are some observations from my review of {url}.",
+        "I spent some time analyzing {url} — here's what I found."
+    ],
+    'casual': [
+        "Just checked {url} — found a few things.",
+        "Took a look at {url} and noticed some stuff.",
+        "Was browsing {url} and saw a few issues.",
+        "Had a look at {url} — here's what popped up.",
+        "Quick peek at {url}, and I found some wins."
+    ]
+}
+WIX_OPENERS_NO_URL = {
+    'friendly': [
+        "Just had a quick look at your store — spotted a few things.",
+        "Went through your store today and noticed a few issues.",
+        "Spent a few minutes on your store — here's what stood out."
+    ],
+    'professional': [
+        "I reviewed your store and identified several areas for improvement.",
+        "After analyzing your store, I found a few notable issues.",
+        "I ran a quick audit of your store today and wanted to share the findings."
+    ],
+    'casual': [
+        "Just checked your store — found a few things.",
+        "Took a look at your store and noticed some stuff.",
+        "Was browsing your store and saw a few issues."
+    ]
+}
+WIX_ISSUES_INTROS = {
+    'friendly': ["Top issues I found:", "Here's what I noticed:", "Quick list:", "What stood out:", "A few things off:"],
+    'professional': ["Key findings:", "Issues identified:", "Summary of findings:", "The main issues I found:", "Notable findings:"],
+    'casual': ["Here's what I found:", "Quick rundown:", "Stuff I noticed:", "What's off:", "Quick list:"]
+}
+WIX_PROD_INTROS = {
+    'friendly': ["Also noticed in your catalogue:", "On the product side:", "One more thing:", "About your products:"],
+    'professional': ["Additionally, regarding your product catalogue:", "I also noted the following about your catalogue:", "On the product side:", "Catalogue observations:"],
+    'casual': ["Also saw this about your products:", "About your catalogue:", "One more thing:", "Also on the product side:"]
+}
+WIX_SCORE_LINES = [
+    "Overall score: {score}/100 — most are 1-day fixes.",
+    "Overall: {score}/100. Fixable in a day or two.",
+    "Score: {score}/100. Easy wins."
+]
+WIX_CTAS = {
+    'friendly': ["Want me to send a quick 2-min video?", "Want a short checklist?", "Should I send over the details?", "Want me to send a quick Loom?", "Interested in a quick fix list?", "Can I send a short walkthrough?"],
+    'professional': ["Would a short walkthrough be useful?", "Shall I send over the detailed findings?", "Would you like me to send a brief video?", "Can I share a quick report on this?", "Would a 15-min call be worth scheduling?"],
+    'casual': ["Want a quick video?", "Should I send the details?", "Want a checklist?", "Send over a Loom?", "Want a quick fix list?"]
+}
+WIX_SIGNOFF_LINES = {
+    'friendly': ["No pitch — just thought it was worth sharing.", "No pressure either way.", "Just sharing in case it's useful.", "Not selling anything — just helping.", "Thought you'd want to know."],
+    'professional': ["Happy to provide a detailed report if helpful.", "Let me know if you'd like the full breakdown.", "No obligation — just wanted to flag it.", "Feel free to reach out if this is useful."],
+    'casual': ["No pitch — just sharing.", "No pressure.", "Just thought I'd share.", "No strings attached."]
+}
+WIX_SIGNOFFS = ["Best regards,", "Cheers,", "Best,", "Warmly,"]
+
+def _wix_pick(pool):
+    try: return random.choice(pool)
+    except: return pool[0] if pool else ''
+
 def generate_wix_email(report, tone='friendly', sender_name='', email=''):
+    tone = tone if tone in WIX_GREETINGS else 'friendly'
     dom = report.get('domain','')
-    brand = dom.split('.')[0].title() if dom and '.' in dom else 'there'
+    is_email_dom = '@' in dom if dom else False
+    if is_email_dom:
+        brand = dom.split('@')[0]; display_url = ''
+    elif dom and dom.lower() in ('gmail.com','yahoo.com','hotmail.com','outlook.com','icloud.com'):
+        brand = email.split('@')[0] if email and '@' in email else 'there'; display_url = ''
+    else:
+        brand = dom.split('.')[0].title() if dom else 'there'
+        display_url = dom
+
     overall = (report.get('scores') or {}).get('overall_score', 0)
     issues = report.get('issues') or []
     prods = report.get('top_products') or []
+    priority = {'high': 0, 'medium': 1, 'low': 2}
+    sorted_issues = sorted(issues, key=lambda x: priority.get(x.get('severity','low'), 3))
+    top_issues = sorted_issues[:3]
+    issue_bullets = [i.get('title','') for i in top_issues]
 
-    greetings = {
-        'friendly': f"Hi {brand} team,",
-        'professional': f"Hello {brand} team,",
-        'casual': f"Hey {brand},",
-    }
-    greeting = greetings.get(tone, greetings['friendly'])
+    subj_target = display_url if display_url else 'your store'
+    if overall < 50: subject = f"Found {len(issues)} issues on {subj_target}"
+    elif overall < 75: subject = f"Quick idea for {subj_target}"
+    else: subject = f"Nice store! One thing I noticed on {subj_target}"
 
-    if overall < 50: subject = f"Found {len(issues)} issues on {dom}"
-    elif overall < 75: subject = f"Quick idea for {dom}"
-    else: subject = f"Nice store! One thing I noticed on {dom}"
+    greeting = _wix_pick(WIX_GREETINGS[tone]).replace('{brand}', brand)
+    opener = _wix_pick(WIX_OPENERS_WITH_URL[tone] if display_url else WIX_OPENERS_NO_URL[tone]).replace('{url}', display_url)
+    issues_intro = _wix_pick(WIX_ISSUES_INTROS[tone])
+    score_line = _wix_pick(WIX_SCORE_LINES).replace('{score}', str(overall))
+    cta = _wix_pick(WIX_CTAS[tone])
+    signoff_line = _wix_pick(WIX_SIGNOFF_LINES[tone])
+    signoff = _wix_pick(WIX_SIGNOFFS)
+    signature = sender_name.strip() if sender_name and sender_name.strip() else "[Your name]"
 
-    parts = [greeting, "", f"Just took a look at {dom} and spotted a few things.", ""]
+    parts = [greeting, "", opener, ""]
     if prods:
-        names = [p['title'][:40] for p in prods[:3] if p.get('title')]
-        if names:
-            parts.append("Nice lineup — noticed you're selling " + ", ".join(f'"{n}"' for n in names) + ".")
+        prod_names = [p.get('title','') for p in prods[:3] if p.get('title')]
+        if prod_names:
+            prod_intro = _wix_pick(WIX_PROD_INTROS[tone])
+            parts.append(prod_intro)
+            names = ", ".join([f'"{n[:40]}"' for n in prod_names[:2]])
+            if len(prod_names) >= 3:
+                names += f', and "{prod_names[2][:40]}"'
+            parts.append(f"• {names}")
             parts.append("")
-    parts.append("Top issues I found:")
-    for i in issues[:3]:
-        parts.append(f"• {i.get('title','')}")
-    parts.append("")
-    parts.append(f"Overall score: {overall}/100 — most are 1-day fixes.")
-    parts.append("")
-    parts.append("Want me to send a quick 2-min video?")
-    parts.append("")
-    parts.append("No pitch — just thought it was worth sharing.")
-    parts.append("")
-    parts.append("Best,")
-    parts.append(sender_name.strip() if sender_name and sender_name.strip() else "[Your name]")
 
+    parts.append(issues_intro)
+    parts.append("")
+    for b in issue_bullets:
+        parts.append(f"• {b}")
+    parts.append("")
+    parts.append(score_line)
+    parts.append("")
+    parts.append(cta)
+    parts.append("")
+    parts.append(signoff_line)
+    parts.append("")
+    parts.append(signoff)
+    parts.append(signature)
     return {'subject': subject, 'body': "\n".join(parts), 'tone': tone}
 
 def run_wix_ingest():
@@ -494,50 +591,35 @@ def run_wix_ingest():
     except Exception as e:
         return {'status': 'error', 'error': f'{e}'}
 
-# ==========================================
-# RECOVERY ROUTE — pulls emails from any past job into wix_state
-# ==========================================
 @wix_bp.route('/wix/recover-job/<int:job_id>', methods=['GET', 'POST'])
 def wix_recover_job(job_id):
-    if 'user_id' not in session:
-        return jsonify({'success': False, 'error': 'auth'}), 401
+    if 'user_id' not in session: return jsonify({'success': False, 'error': 'auth'}), 401
     user_email = session.get('user_id')
     conn = wix_get_db()
-    if not conn:
-        return jsonify({'success': False, 'error': 'db'}), 500
+    if not conn: return jsonify({'success': False, 'error': 'db'}), 500
     try:
         cur = conn.cursor()
         cur.execute("SELECT results FROM wix_email_jobs WHERE id=%s AND user_email=%s", (job_id, user_email))
         row = cur.fetchone(); cur.close()
-        if not row:
-            return jsonify({'success': False, 'error': 'job not found'}), 404
-        try:
-            results = json.loads(row[0]) if row[0] else []
-        except:
-            results = []
-
+        if not row: return jsonify({'success': False, 'error': 'job not found'}), 404
+        try: results = json.loads(row[0]) if row[0] else []
+        except: results = []
         pairs = []
         for r in results:
             store = r.get('store', '')
             for e in r.get('emails', []):
                 pairs.append(f"{e}:::{store}")
-
-        if not pairs:
-            return jsonify({'success': False, 'error': 'no emails found in job'}), 400
-
+        if not pairs: return jsonify({'success': False, 'error': 'no emails found in job'}), 400
         cur = conn.cursor()
-        cur.execute("""INSERT INTO wix_state (user_email, found_emails)
-            VALUES (%s, %s)
+        cur.execute("""INSERT INTO wix_state (user_email, found_emails) VALUES (%s, %s)
             ON CONFLICT (user_email) DO UPDATE SET
-            found_emails = EXCLUDED.found_emails,
-            updated_at = NOW()""",
+            found_emails = EXCLUDED.found_emails, updated_at = NOW()""",
             (user_email, '|||'.join(pairs)))
         conn.commit(); cur.close()
         return jsonify({'success': True, 'recovered': len(pairs)})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:200]}), 500
-    finally:
-        wix_release(conn)
+    finally: wix_release(conn)
 
 def _navbar():
     return '''
@@ -563,21 +645,18 @@ def _navbar():
 <div class="drawer-overlay" id="drawerOverlay" onclick="toggleDrawer()"></div>
 <div class="drawer" id="drawer">
 <div class="drawer-header"><span>📧 Menu</span><button class="drawer-close" onclick="toggleDrawer()">×</button></div>
-
 <div class="drawer-section">🎨 Wix</div>
 <a href="/wix" onclick="closeDrawer()">🔍 Wix Store Finder</a>
 <a href="/wix/finder" onclick="closeDrawer()">📧 Wix Email Finder</a>
 <a href="/wix/verify" onclick="closeDrawer()">✅ Wix Verify</a>
 <a href="/wix/scout" onclick="closeDrawer()">📨 Wix Scout</a>
 <a href="/wix/audit" onclick="closeDrawer()">🚀 Wix Analyze & Send</a>
-
 <div class="drawer-section">🛍️ Shopify</div>
 <a href="/" onclick="closeDrawer()">🔍 Email Finder</a>
 <a href="/discover" onclick="closeDrawer()">🎯 Store Discovery</a>
 <a href="/verify" onclick="closeDrawer()">✅ Verify Emails</a>
 <a href="/scout" onclick="closeDrawer()">📨 Email Scout</a>
 <a href="/audit" onclick="closeDrawer()">🚀 Analyze & Send</a>
-
 <div class="drawer-section">⚙️ Account</div>
 <a href="/settings" onclick="closeDrawer()">⚙️ Settings</a>
 <a href="/logout" onclick="closeDrawer()" style="color:#ef4444">🚪 Logout</a>
@@ -807,39 +886,389 @@ def wix_audit_page():
 <div id="queue" style="margin-top:12px">Loading…</div>
 </div>
 <div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
-<input type="text" id="senderName" placeholder="Your name" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:5px;margin-bottom:10px;box-sizing:border-box">
-<button onclick="analyzeNext()" style="background:#3b82f6;color:white;padding:12px 24px;border:none;border-radius:8px;cursor:pointer;font-size:15px">▶️ Analyze Next</button>
+<h3 style="margin-top:0">🚀 Start Processing</h3>
+<label style="font-weight:bold;font-size:13px">Your name:</label>
+<input type="text" id="senderName" placeholder="e.g. Daniel Phillips" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:5px;margin:5px 0 15px 0;box-sizing:border-box">
+<div style="background:linear-gradient(135deg,#1f2937,#374151);color:white;padding:16px;border-radius:10px;margin-bottom:15px">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+<span style="font-size:15px;font-weight:bold">📧 Sent this session</span>
+<span id="counterText" style="font-size:20px;font-weight:bold">0 / 70</span>
+</div>
+<div style="background:#111827;border-radius:8px;overflow:hidden;height:14px">
+<div id="counterBar" style="width:0%;height:100%;background:linear-gradient(90deg,#22c55e,#16a34a)"></div>
+</div>
+<div id="counterHint" style="font-size:12px;margin-top:8px;opacity:0.85">Auto mode pauses at every milestone.</div>
+<div style="margin-top:12px;padding-top:12px;border-top:1px solid #4b5563">
+<label style="font-size:13px;font-weight:bold;display:block;margin-bottom:6px">⚙️ Pause every N emails:</label>
+<div style="display:flex;gap:8px;align-items:center">
+<input type="number" id="limitInput" value="70" min="1" max="10000" style="flex:1;padding:8px;border:1px solid #4b5563;border-radius:6px;background:#111827;color:white;font-size:14px;box-sizing:border-box">
+<button onclick="saveLimit()" style="background:#0d9488;color:white;padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-weight:bold">Save</button>
+</div>
+<div id="limitMsg" style="font-size:12px;color:#86efac;margin-top:4px"></div>
+</div>
+<div style="display:flex;gap:8px;margin-top:12px">
+<button id="continueBtn" onclick="continueAuto()" style="display:none;flex:1;background:#0d9488;color:white;padding:10px;border:none;border-radius:6px;cursor:pointer;font-weight:bold">▶️ Continue</button>
+<button onclick="resetCounter()" style="background:#dc2626;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer">🔄 Reset</button>
+</div>
+</div>
+<div id="pipelineBox" style="background:#eff6ff;border-left:4px solid #3b82f6;padding:10px 14px;border-radius:8px;margin-bottom:15px;font-size:13px;color:#1e40af;display:none"><span id="pipelineText"></span></div>
+<button onclick="startManual()" style="background:#3b82f6;color:white;padding:14px 24px;border:none;border-radius:8px;cursor:pointer;font-size:16px;margin-right:10px;margin-bottom:10px">▶️ Start Manual</button>
+<button onclick="startAutoMode()" style="background:#0d9488;color:white;padding:14px 24px;border:none;border-radius:8px;cursor:pointer;font-size:16px;margin-bottom:10px">⚡ Start Auto</button>
+<button onclick="stopAutoMode()" id="stopBtn" style="background:#ef4444;color:white;padding:14px 24px;border:none;border-radius:8px;cursor:pointer;font-size:16px;display:none;margin-left:10px">⏹️ Stop Auto</button>
+<div id="modeStatus" style="margin-top:10px"></div>
 </div>
 <div id="auditBox" style="display:none">
 <div id="label" style="background:#65a30d;color:white;padding:10px;border-radius:8px;font-weight:bold;margin-bottom:15px"></div>
 <div id="result"></div>
 <div id="outreach" style="display:none;background:white;padding:20px;border-radius:10px;margin-top:20px">
+<h3 style="margin-top:0">✉️ Email</h3>
+<div style="margin-bottom:10px">
+<button onclick="regen('friendly')" style="background:#0d9488;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;margin-right:5px">😊 Friendly</button>
+<button onclick="regen('professional')" style="background:#3b82f6;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;margin-right:5px">💼 Professional</button>
+<button onclick="regen('casual')" style="background:#f59e0b;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px">😎 Casual</button>
+</div>
+<label style="font-weight:bold;font-size:13px">Subject:</label>
 <input type="text" id="genSubject" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;margin:5px 0 10px 0;box-sizing:border-box">
+<label style="font-weight:bold;font-size:13px">Message:</label>
 <textarea id="genBody" rows="10" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;font-family:monospace;box-sizing:border-box"></textarea>
-<button onclick="sendIt()" style="background:#0d9488;color:white;padding:12px 24px;border:none;border-radius:6px;cursor:pointer;font-size:15px;margin-top:12px">📨 Send & Open Gmail</button>
+<button onclick="sendIt()" style="background:#0d9488;color:white;padding:12px 24px;border:none;border-radius:6px;cursor:pointer;font-size:15px;margin-top:12px;margin-right:8px">📨 Send & Open Gmail</button>
+<button onclick="skipCurrent()" style="background:#6b7280;color:white;padding:12px 24px;border:none;border-radius:6px;cursor:pointer;font-size:15px;margin-top:12px">⏭️ Skip</button>
 </div>
 </div>
 </div>
+
+<div id="toneModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);z-index:10000;align-items:center;justify-content:center">
+  <div style="background:white;padding:24px;border-radius:12px;max-width:340px;width:90%;text-align:center">
+    <h3 style="margin:0 0 16px 0">Choose Email Tone</h3>
+    <button onclick="pickTone('friendly')" style="display:block;width:100%;background:#0d9488;color:white;padding:12px;border:none;border-radius:8px;cursor:pointer;font-size:15px;margin-bottom:8px">😊 Friendly</button>
+    <button onclick="pickTone('professional')" style="display:block;width:100%;background:#3b82f6;color:white;padding:12px;border:none;border-radius:8px;cursor:pointer;font-size:15px;margin-bottom:8px">💼 Professional</button>
+    <button onclick="pickTone('casual')" style="display:block;width:100%;background:#f59e0b;color:white;padding:12px;border:none;border-radius:8px;cursor:pointer;font-size:15px">😎 Casual</button>
+    <button onclick="closeToneModal()" style="display:block;width:100%;background:#e5e7eb;color:#374151;padding:10px;border:none;border-radius:8px;cursor:pointer;font-size:14px;margin-top:12px">Cancel</button>
+  </div>
+</div>
+
 <script>
-let currentItem = null, currentReport = null;
-async function imp(src){ const s = document.getElementById('impStatus'); s.innerHTML = '⏳'; const r = await fetch('/wix/import-to-queue', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({source:src})}); const d = await r.json(); s.innerHTML = d.success ? '<span style="color:green">✅ Added '+d.added+' (skipped '+d.skipped+')</span>' : '<span style="color:red">'+d.error+'</span>'; loadQueue(); }
-async function loadQueue(){ const r = await fetch('/wix/get-audit-queue'); const d = await r.json(); document.getElementById('qc').textContent = d.items.length; const c = document.getElementById('queue'); if(!d.items.length){ c.innerHTML='<p style="color:#666">Empty.</p>'; return; } let h=''; d.items.forEach(i => { const col = i.status==='done'?'#16a34a':(i.status==='current'?'#3b82f6':(i.status==='skipped'?'#6b7280':'#f59e0b')); h += '<div style="padding:10px;border-radius:6px;margin:6px 0;background:#f9f9f9;border-left:4px solid '+col+'"><b>'+i.email+'</b><br><span style="font-size:12px;color:#666">'+i.domain+'</span></div>'; }); c.innerHTML=h; }
-async function analyzeNext(){ const r = await fetch('/wix/get-next-pending'); const d = await r.json(); if(!d.item){ alert('Queue empty'); return; } currentItem = d.item; document.getElementById('auditBox').style.display='block'; document.getElementById('result').innerHTML='<p style="color:#666;padding:20px;text-align:center">⏳ Analyzing…</p>'; document.getElementById('outreach').style.display='none'; await fetch('/wix/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:currentItem.id, status:'current'})}); const rr = await fetch('/wix/analyze-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:currentItem.id})}); const dd = await rr.json(); if(dd.success){ currentReport = dd.item.report; document.getElementById('label').textContent = '📧 '+dd.item.email+' → '+dd.item.domain; renderReport(dd.item.report); document.getElementById('outreach').style.display='block'; await genEmail(); loadQueue(); } }
-function renderReport(r){ const sc=r.scores||{}, iss=r.issues||[], prods=r.top_products||[]; let h='<div style="background:white;padding:20px;border-radius:10px;margin-bottom:15px"><h3>Scores</h3>'; ['overall_score','trust_score','technical_score','marketing_score'].forEach(k => { const v = sc[k]||0; const c = v>=75?'#16a34a':(v>=50?'#f59e0b':'#ef4444'); h += '<div style="margin:10px 0"><b>'+k.replace('_score','')+'</b> <span style="color:'+c+'">'+v+'%</span><div style="background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+v+'%;height:12px;background:'+c+'"></div></div></div>'; }); h+='</div>'; if(prods.length){ h += '<div style="background:white;padding:20px;border-radius:10px;margin-bottom:15px"><h3>🛍️ Top Products</h3>'; prods.forEach(p => { h += '<div style="padding:8px 0;border-bottom:1px solid #eee"><b>'+p.title+'</b>'+(p.price?' — '+p.price:'')+'</div>'; }); h+='</div>'; } if(iss.length){ h += '<div style="background:white;padding:20px;border-radius:10px"><h3 style="color:#991b1b">⚠️ Issues</h3>'; iss.forEach(i => { h += '<div style="background:#fef2f2;border-left:4px solid #ef4444;padding:10px;border-radius:6px;margin:8px 0"><b>'+i.title+'</b><div style="font-size:13px">'+i.description+'</div></div>'; }); h+='</div>'; } document.getElementById('result').innerHTML = h; }
-async function genEmail(){ const r = await fetch('/wix/generate-email', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({report:currentReport, tone:'friendly', sender_name:document.getElementById('senderName').value, email:currentItem.email})}); const d = await r.json(); if(d.success){ document.getElementById('genSubject').value = d.subject; document.getElementById('genBody').value = d.body; } }
-async function sendIt(){ if(!currentItem) return; await fetch('/wix/mark-sent', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email:currentItem.email})}); await fetch('/wix/delete-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:currentItem.id})}); loadQueue(); window.location.href = 'mailto:'+currentItem.email+'?subject='+encodeURIComponent(document.getElementById('genSubject').value)+'&body='+encodeURIComponent(document.getElementById('genBody').value); }
-window.onload = loadQueue;
+let currentItem = null, currentReport = null, autoMode = false, autoTone = 'friendly', pendingAction = false;
+let SEND_LIMIT = 70;
+const MAX_PARALLEL = 3;
+let readyBuffer = [], preparingSet = new Set(), refilling = false;
+
+function updatePipelineUI(){
+  const box = document.getElementById('pipelineBox');
+  const txt = document.getElementById('pipelineText');
+  if(autoMode){ box.style.display='block'; txt.textContent = '⚡ Pipeline: '+readyBuffer.length+' ready · '+preparingSet.size+' preparing'; }
+  else { box.style.display='none'; }
+}
+
+async function loadCounter(){
+  try{ const r = await fetch('/wix/get-counter'); const d = await r.json(); SEND_LIMIT = d.limit; updateCounterUI(d.count, d.next_milestone, d.at_milestone); document.getElementById('limitInput').value = d.limit; }catch(e){}
+}
+
+function updateCounterUI(count, next, at){
+  document.getElementById('counterText').textContent = count + ' / ' + next;
+  const within = count % SEND_LIMIT;
+  const pct = count > 0 && within === 0 ? 100 : Math.round((within / SEND_LIMIT) * 100);
+  const bar = document.getElementById('counterBar');
+  bar.style.width = pct + '%';
+  const hint = document.getElementById('counterHint');
+  const contBtn = document.getElementById('continueBtn');
+  if(at){ bar.style.background='linear-gradient(90deg,#ef4444,#dc2626)'; hint.innerHTML='🛑 Milestone reached ('+count+' sent). Paused.'; hint.style.color='#fca5a5'; contBtn.style.display='block'; }
+  else { bar.style.background='linear-gradient(90deg,#22c55e,#16a34a)'; hint.innerHTML='Next pause at '+next+' emails.'; hint.style.color=''; contBtn.style.display='none'; }
+}
+
+async function saveLimit(){
+  const v = parseInt(document.getElementById('limitInput').value);
+  if(!v || v < 1){ alert('Enter >= 1'); return; }
+  const r = await fetch('/wix/set-limit', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({limit:v})});
+  const d = await r.json();
+  if(d.success){ SEND_LIMIT = d.limit; document.getElementById('limitMsg').textContent = '✅ Pause every '+d.limit; setTimeout(()=>{document.getElementById('limitMsg').textContent='';}, 2500); loadCounter(); }
+}
+
+async function resetCounter(){ if(!confirm('Reset counter?')) return; autoMode=false; readyBuffer=[]; updatePipelineUI(); await fetch('/wix/reset-counter', {method:'POST'}); await loadCounter(); document.getElementById('modeStatus').innerHTML='<p style="color:red">🔄 Reset.</p>'; document.getElementById('stopBtn').style.display='none'; }
+
+async function continueAuto(){ await loadCounter(); autoMode=true; pendingAction=false; document.getElementById('modeStatus').innerHTML='<p style="color:green">▶️ Continuing...</p>'; document.getElementById('stopBtn').style.display='inline-block'; refillPipeline(); nextAuto(); }
+
+function playAlarm(){
+  try{ const ctx = new (window.AudioContext||window.webkitAudioContext)(); const osc = ctx.createOscillator(); const g = ctx.createGain(); osc.connect(g); g.connect(ctx.destination); osc.type='square'; osc.frequency.value=880; g.gain.value=0.15; osc.start(); const t = ctx.currentTime; for(let i=0;i<3;i++){ g.gain.setValueAtTime(0.15, t+i*0.4); g.gain.setValueAtTime(0, t+i*0.4+0.2); } osc.stop(t+1.4); }catch(e){}
+}
+
+async function imp(src){ const s = document.getElementById('impStatus'); s.innerHTML='⏳'; const r = await fetch('/wix/import-to-queue', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({source:src})}); const d = await r.json(); s.innerHTML = d.success ? '<span style="color:green">✅ Added '+d.added+' (skipped '+d.skipped+')</span>' : '<span style="color:red">'+d.error+'</span>'; loadQueue(); }
+
+async function loadQueue(){
+  const r = await fetch('/wix/get-audit-queue'); const d = await r.json();
+  document.getElementById('qc').textContent = d.items.length;
+  const c = document.getElementById('queue');
+  if(!d.items.length){ c.innerHTML='<p style="color:#666">Empty.</p>'; return; }
+  let h='';
+  d.items.forEach(i => {
+    const col = i.status==='done'?'#16a34a':(i.status==='current'?'#3b82f6':(i.status==='skipped'?'#6b7280':'#f59e0b'));
+    h += '<div style="padding:10px;border-radius:6px;margin:6px 0;background:#f9f9f9;border-left:4px solid '+col+'"><b>'+i.email+'</b><br><span style="font-size:12px;color:#666">'+i.domain+'</span></div>';
+  });
+  c.innerHTML=h;
+}
+
+async function prepareItem(id){
+  try{
+    const r = await fetch('/wix/analyze-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:id})});
+    const d = await r.json();
+    if(!d.success || !d.item) return null;
+    const item = d.item;
+    const name = document.getElementById('senderName').value.trim();
+    const er = await fetch('/wix/generate-email', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({report:item.report, tone:autoTone, sender_name:name, email:item.email})});
+    const ed = await er.json();
+    return {id:item.id, email:item.email, domain:item.domain, report:item.report, subject: ed.success ? ed.subject : '', message: ed.success ? ed.body : ''};
+  }catch(e){ return null; }
+}
+
+async function refillPipeline(){
+  if(refilling) return;
+  refilling = true;
+  try{
+    while(autoMode && (readyBuffer.length + preparingSet.size) < MAX_PARALLEL){
+      let nr; try{ nr = await fetch('/wix/get-next-pending'); }catch(e){ break; }
+      const nd = await nr.json();
+      if(!nd.item) break;
+      const id = nd.item.id;
+      try{ await fetch('/wix/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:id, status:'current'})}); }catch(e){ break; }
+      preparingSet.add(id);
+      loadQueue(); updatePipelineUI();
+      (async () => { const item = await prepareItem(id); preparingSet.delete(id); if(item) readyBuffer.push(item); updatePipelineUI(); loadQueue(); refillPipeline(); })();
+      await new Promise(r => setTimeout(r, 100));
+    }
+  } finally { refilling = false; updatePipelineUI(); }
+}
+
+async function safeGetNextPending(retries=5){
+  for(let i=0;i<retries;i++){ try{ const r = await fetch('/wix/get-next-pending'); if(r.ok){ const d = await r.json(); return {ok:true, item:d.item||null}; } }catch(e){} await new Promise(r => setTimeout(r, 1000)); }
+  return {ok:false, item:null};
+}
+
+async function showNextReady(){
+  if(!autoMode) return;
+  while(autoMode && readyBuffer.length === 0){
+    document.getElementById('auditBox').style.display='block';
+    document.getElementById('label').textContent = '⏳ Preparing...';
+    document.getElementById('result').innerHTML = '<p style="color:#666;padding:20px;text-align:center">⚡ Running ('+preparingSet.size+' preparing, '+readyBuffer.length+' ready)...</p>';
+    document.getElementById('outreach').style.display='none';
+    updatePipelineUI();
+    await new Promise(r => setTimeout(r, 500));
+    refillPipeline();
+    if(preparingSet.size === 0 && readyBuffer.length === 0){
+      const chk = await safeGetNextPending(5);
+      if(chk.ok && !chk.item) break;
+    }
+  }
+  if(!autoMode) return;
+  if(readyBuffer.length === 0){ autoMode=false; updatePipelineUI(); document.getElementById('modeStatus').innerHTML='<p style="color:blue">🎉 Complete!</p>'; document.getElementById('stopBtn').style.display='none'; return; }
+  const item = readyBuffer.shift();
+  currentItem = {id:item.id, email:item.email, domain:item.domain, report:item.report};
+  currentReport = item.report;
+  document.getElementById('auditBox').style.display='block';
+  document.getElementById('label').textContent = '📧 '+item.email+' → '+item.domain+' (buffer: '+readyBuffer.length+', preparing: '+preparingSet.size+')';
+  renderReport(item.report);
+  document.getElementById('outreach').style.display='block';
+  document.getElementById('genSubject').value = item.subject;
+  document.getElementById('genBody').value = item.message;
+  updatePipelineUI(); loadQueue(); refillPipeline();
+  if(autoMode && !pendingAction){ pendingAction=true; setTimeout(async()=>{ pendingAction=false; await autoSend(); }, 150); }
+}
+
+async function nextAuto(){
+  if(!autoMode) return;
+  try{
+    const r = await fetch('/wix/get-counter'); const d = await r.json();
+    SEND_LIMIT = d.limit;
+    updateCounterUI(d.count, d.next_milestone, d.at_milestone);
+    if(d.at_milestone){ autoMode=false; pendingAction=false; playAlarm(); document.getElementById('modeStatus').innerHTML='<p style="color:red;font-weight:bold">🛑 Milestone ('+d.count+'). Paused.</p>'; document.getElementById('stopBtn').style.display='none'; return; }
+  }catch(e){}
+  await showNextReady();
+}
+
+async function autoSend(){
+  if(!autoMode) return;
+  if(!currentItem){ nextAuto(); return; }
+  const subj = document.getElementById('genSubject').value;
+  const body = document.getElementById('genBody').value;
+  if(!subj || !body){ await fetch('/wix/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:currentItem.id, status:'skipped'})}); nextAuto(); return; }
+  const id = currentItem.id, em = currentItem.email;
+  await fetch('/wix/mark-sent', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email:em})});
+  await fetch('/wix/delete-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:id})});
+  try{ const ir = await fetch('/wix/increment-counter', {method:'POST'}); const idt = await ir.json(); SEND_LIMIT = idt.limit; updateCounterUI(idt.count, idt.next_milestone, idt.at_milestone); }catch(e){}
+  loadQueue();
+  localStorage.setItem('wix_last_sent_id', id.toString());
+  window.location.href = 'mailto:'+em+'?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(body);
+}
+
+document.addEventListener('visibilitychange', function(){
+  if(document.visibilityState === 'visible' && autoMode){
+    const last = localStorage.getItem('wix_last_sent_id');
+    if(last){ localStorage.removeItem('wix_last_sent_id'); currentItem = null; setTimeout(nextAuto, 200); }
+  }
+});
+
+async function startManual(){
+  autoMode = false; pendingAction = false;
+  document.getElementById('modeStatus').innerHTML='<p style="color:blue">▶️ Manual mode: click Analyze Next</p>';
+  document.getElementById('stopBtn').style.display='none';
+  updatePipelineUI();
+}
+
+function showToneModal(){ document.getElementById('toneModal').style.display='flex'; }
+function closeToneModal(){ document.getElementById('toneModal').style.display='none'; }
+
+function pickTone(tone){
+  closeToneModal();
+  autoTone = tone;
+  autoMode = true;
+  pendingAction = false;
+  readyBuffer = []; preparingSet.clear();
+  document.getElementById('modeStatus').innerHTML='<p style="color:green">⚡ Auto mode ON ('+tone+')</p>';
+  document.getElementById('stopBtn').style.display='inline-block';
+  refillPipeline();
+  nextAuto();
+}
+
+async function startAutoMode(){ await fetch('/wix/reset-counter', {method:'POST'}); await loadCounter(); showToneModal(); }
+
+function stopAutoMode(){
+  autoMode=false; pendingAction=false;
+  for(const it of readyBuffer){ fetch('/wix/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:it.id, status:'pending'})}); }
+  readyBuffer = [];
+  updatePipelineUI();
+  document.getElementById('modeStatus').innerHTML='<p style="color:red">⏹️ Stopped</p>';
+  document.getElementById('stopBtn').style.display='none';
+}
+
+async function analyzeNext(){
+  autoMode = false;
+  const r = await fetch('/wix/get-next-pending'); const d = await r.json();
+  if(!d.item){ alert('Queue empty'); return; }
+  currentItem = d.item;
+  document.getElementById('auditBox').style.display='block';
+  document.getElementById('result').innerHTML='<p style="color:#666;padding:20px;text-align:center">⏳ Analyzing…</p>';
+  document.getElementById('outreach').style.display='none';
+  await fetch('/wix/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:currentItem.id, status:'current'})});
+  const rr = await fetch('/wix/analyze-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:currentItem.id})});
+  const dd = await rr.json();
+  if(dd.success){
+    currentReport = dd.item.report;
+    document.getElementById('label').textContent = '📧 '+dd.item.email+' → '+dd.item.domain;
+    renderReport(dd.item.report);
+    document.getElementById('outreach').style.display='block';
+    await genEmail();
+    loadQueue();
+  }
+}
+
+async function genEmail(){
+  const r = await fetch('/wix/generate-email', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({report:currentReport, tone:autoTone, sender_name:document.getElementById('senderName').value, email:currentItem?currentItem.email:''})});
+  const d = await r.json();
+  if(d.success){ document.getElementById('genSubject').value = d.subject; document.getElementById('genBody').value = d.body; }
+}
+function regen(tone){ autoTone = tone; genEmail(); }
+
+function renderReport(r){
+  const sc=r.scores||{}, iss=r.issues||[], prods=r.top_products||[];
+  let h='<div style="background:white;padding:20px;border-radius:10px;margin-bottom:15px"><h3>Scores</h3>';
+  ['overall_score','trust_score','technical_score','marketing_score'].forEach(k => {
+    const v = sc[k]||0;
+    const c = v>=75?'#16a34a':(v>=50?'#f59e0b':'#ef4444');
+    h += '<div style="margin:10px 0"><b>'+k.replace('_score','')+'</b> <span style="color:'+c+'">'+v+'%</span><div style="background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+v+'%;height:12px;background:'+c+'"></div></div></div>';
+  });
+  h+='</div>';
+  if(prods.length){ h += '<div style="background:white;padding:20px;border-radius:10px;margin-bottom:15px"><h3>🛍️ Top Products</h3>'; prods.forEach(p => { h += '<div style="padding:8px 0;border-bottom:1px solid #eee"><b>'+p.title+'</b>'+(p.price?' — '+p.price:'')+'</div>'; }); h+='</div>'; }
+  if(iss.length){ h += '<div style="background:white;padding:20px;border-radius:10px"><h3 style="color:#991b1b">⚠️ Issues</h3>'; iss.forEach(i => { h += '<div style="background:#fef2f2;border-left:4px solid #ef4444;padding:10px;border-radius:6px;margin:8px 0"><b>'+i.title+'</b><div style="font-size:13px">'+i.description+'</div></div>'; }); h+='</div>'; }
+  document.getElementById('result').innerHTML = h;
+}
+
+async function sendIt(){
+  if(!currentItem) return;
+  await fetch('/wix/mark-sent', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email:currentItem.email})});
+  await fetch('/wix/delete-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:currentItem.id})});
+  await fetch('/wix/increment-counter', {method:'POST'});
+  await loadCounter(); loadQueue();
+  window.location.href = 'mailto:'+currentItem.email+'?subject='+encodeURIComponent(document.getElementById('genSubject').value)+'&body='+encodeURIComponent(document.getElementById('genBody').value);
+}
+
+async function skipCurrent(){
+  if(!currentItem) return;
+  await fetch('/wix/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:currentItem.id, status:'skipped'})});
+  document.getElementById('auditBox').style.display='none';
+  currentItem = null;
+  loadQueue();
+  if(autoMode) nextAuto();
+}
+
+window.onload = function(){ loadQueue(); loadCounter(); };
 </script>'''
     return _page("Wix Analyze & Send", body)
 
+# ==========================================
+# WIX COUNTER ROUTES
+# ==========================================
+@wix_bp.route('/wix/get-counter')
+def wix_get_counter():
+    if 'user_id' not in session: return jsonify({'count':0,'limit':70,'next_milestone':70,'at_milestone':False}), 401
+    return jsonify(wix_counter_status(session.get('user_id')))
+
+@wix_bp.route('/wix/increment-counter', methods=['POST'])
+def wix_increment_counter():
+    if 'user_id' not in session: return jsonify({'count':0,'limit':70,'next_milestone':70,'at_milestone':False}), 401
+    user_email = session.get('user_id')
+    conn = wix_get_db()
+    if not conn: return jsonify(wix_counter_status(user_email))
+    try:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO wix_state (user_email, session_sent_count) VALUES (%s, 0) ON CONFLICT (user_email) DO NOTHING", (user_email,))
+        cur.execute("UPDATE wix_state SET session_sent_count = COALESCE(session_sent_count,0) + 1, updated_at=NOW() WHERE user_email=%s", (user_email,))
+        conn.commit(); cur.close()
+    except Exception as e:
+        print(f"increment: {e}")
+    finally: wix_release(conn)
+    return jsonify(wix_counter_status(user_email))
+
+@wix_bp.route('/wix/reset-counter', methods=['POST'])
+def wix_reset_counter():
+    if 'user_id' not in session: return jsonify(wix_counter_status(''))
+    user_email = session.get('user_id')
+    conn = wix_get_db()
+    if not conn: return jsonify(wix_counter_status(user_email))
+    try:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO wix_state (user_email, session_sent_count) VALUES (%s, 0) ON CONFLICT (user_email) DO NOTHING", (user_email,))
+        cur.execute("UPDATE wix_state SET session_sent_count = 0, updated_at=NOW() WHERE user_email=%s", (user_email,))
+        conn.commit(); cur.close()
+    except: pass
+    finally: wix_release(conn)
+    return jsonify(wix_counter_status(user_email))
+
+@wix_bp.route('/wix/set-limit', methods=['POST'])
+def wix_set_limit():
+    if 'user_id' not in session: return jsonify({'success':False}), 401
+    user_email = session.get('user_id')
+    try: limit = int(request.json.get('limit', 70))
+    except: limit = 70
+    if limit < 1: limit = 1
+    if limit > 10000: limit = 10000
+    conn = wix_get_db()
+    if not conn: return jsonify({'success':False})
+    try:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO wix_state (user_email, send_limit) VALUES (%s, %s) ON CONFLICT (user_email) DO UPDATE SET send_limit=EXCLUDED.send_limit, updated_at=NOW()", (user_email, limit))
+        conn.commit(); cur.close()
+    except: pass
+    finally: wix_release(conn)
+    return jsonify({'success':True, 'limit':limit})
+
+# ==========================================
+# WAREHOUSE / FINDER / VERIFY / QUEUE API
+# ==========================================
 @wix_bp.route('/wix/ingest', methods=['GET','POST'])
 def wix_ingest():
     header_secret = request.headers.get('X-Cron-Secret', '')
     cron_secret = os.environ.get('CRON_SECRET', '')
     valid_cron = bool(cron_secret) and header_secret == cron_secret
-    valid_user = ('user_id' in session) and header_secret == 'MANUAL_FROM_UI'
-    if 'user_id' in session and request.method == 'POST' and not header_secret:
-        valid_user = True
+    valid_user = ('user_id' in session) and (header_secret == 'MANUAL_FROM_UI' or (request.method == 'POST' and not header_secret))
     if not (valid_cron or valid_user):
         return jsonify({'status': 'error', 'error': 'forbidden'}), 403
     if valid_user and not valid_cron:
@@ -861,13 +1290,11 @@ def wix_warehouse():
         cur.execute("SELECT COUNT(*) FROM wix_warehouse"); total = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM wix_warehouse WHERE status='pending'"); pending = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM wix_warehouse WHERE status='processing'"); processing = cur.fetchone()[0]
-        cur.execute("""SELECT DATE(created_at) d, COUNT(*) c FROM wix_warehouse
-            GROUP BY DATE(created_at) ORDER BY DATE(created_at) DESC LIMIT 14""")
+        cur.execute("SELECT DATE(created_at) d, COUNT(*) c FROM wix_warehouse GROUP BY DATE(created_at) ORDER BY DATE(created_at) DESC LIMIT 14")
         daily = [{'date':str(r[0]),'count':r[1]} for r in cur.fetchall()]
         cur.close()
         return jsonify({'total':total,'pending':pending,'processing':processing,'daily_last_14':daily})
-    except Exception as e:
-        return jsonify({'error':str(e)[:200]}), 500
+    except Exception as e: return jsonify({'error':str(e)[:200]}), 500
     finally: wix_release(conn)
 
 @wix_bp.route('/wix/request', methods=['POST'])
@@ -878,13 +1305,10 @@ def wix_request():
     if not conn: return jsonify({'success':False})
     try:
         cur = conn.cursor()
-        cur.execute("""UPDATE wix_warehouse SET status='processing'
-            WHERE id IN (SELECT id FROM wix_warehouse WHERE status='pending'
-            ORDER BY created_at DESC LIMIT %s) RETURNING domain""", (n,))
+        cur.execute("UPDATE wix_warehouse SET status='processing' WHERE id IN (SELECT id FROM wix_warehouse WHERE status='pending' ORDER BY created_at DESC LIMIT %s) RETURNING domain", (n,))
         rows = cur.fetchall(); conn.commit(); cur.close()
         return jsonify({'success':True, 'pulled': len(rows), 'domains': [r[0] for r in rows]})
-    except Exception as e:
-        return jsonify({'success':False,'error':str(e)[:200]})
+    except Exception as e: return jsonify({'success':False,'error':str(e)[:200]})
     finally: wix_release(conn)
 
 @wix_bp.route('/wix/warehouse/reset', methods=['POST'])
@@ -910,8 +1334,7 @@ def wix_start_finder():
     if not conn: return jsonify({'success':False})
     try:
         cur = conn.cursor()
-        cur.execute("INSERT INTO wix_email_jobs (user_email, total, remaining_urls, results, status) VALUES (%s,%s,%s,'[]','pending') RETURNING id",
-                    (user_email, len(urls), '|||'.join(urls)))
+        cur.execute("INSERT INTO wix_email_jobs (user_email, total, remaining_urls, results, status) VALUES (%s,%s,%s,'[]','pending') RETURNING id", (user_email, len(urls), '|||'.join(urls)))
         job_id = cur.fetchone()[0]; conn.commit(); cur.close()
     finally: wix_release(conn)
     threading.Thread(target=wix_process_email_job, args=(job_id,), daemon=True).start()
@@ -920,12 +1343,11 @@ def wix_start_finder():
 @wix_bp.route('/wix/get-email-finder-jobs')
 def wix_get_finder_jobs():
     if 'user_id' not in session: return jsonify({'jobs':[]}), 401
-    user_email = session.get('user_id')
     conn = wix_get_db()
     if not conn: return jsonify({'jobs':[]})
     try:
         cur = conn.cursor()
-        cur.execute("SELECT id, total, emails_found, status, created_at FROM wix_email_jobs WHERE user_email=%s ORDER BY created_at DESC LIMIT 5", (user_email,))
+        cur.execute("SELECT id, total, emails_found, status, created_at FROM wix_email_jobs WHERE user_email=%s ORDER BY created_at DESC LIMIT 5", (session.get('user_id'),))
         rows = cur.fetchall(); cur.close()
         return jsonify({'jobs':[{'id':r[0],'total':r[1],'emails':r[2],'status':r[3],'created_at':str(r[4])[:16]} for r in rows]})
     except: return jsonify({'jobs':[]})
@@ -973,16 +1395,14 @@ def wix_get_emails():
 def wix_verify_async():
     if 'user_id' not in session: return jsonify({'error':'auth'}), 401
     user_email = session.get('user_id')
-    d = request.json
-    emails = d.get('emails', [])
+    d = request.json; emails = d.get('emails', [])
     name = d.get('name', f"Wix Job {int(time.time())}")
     if not emails: return jsonify({'error':'No emails'}), 400
     conn = wix_get_db()
     if not conn: return jsonify({'error':'No DB'}), 500
     try:
         cur = conn.cursor()
-        cur.execute("""INSERT INTO wix_verify_jobs (user_email, job_name, total, remaining_emails, valid_emails, invalid_emails, status)
-            VALUES (%s,%s,%s,%s,'','','pending') RETURNING id""", (user_email, name, len(emails), '|||'.join(emails)))
+        cur.execute("INSERT INTO wix_verify_jobs (user_email, job_name, total, remaining_emails, valid_emails, invalid_emails, status) VALUES (%s,%s,%s,%s,'','','pending') RETURNING id", (user_email, name, len(emails), '|||'.join(emails)))
         job_id = cur.fetchone()[0]; conn.commit(); cur.close()
     finally: wix_release(conn)
     threading.Thread(target=wix_verify_worker, args=(job_id,), daemon=True).start()
@@ -995,12 +1415,9 @@ def wix_verify_jobs():
     if not conn: return jsonify({'jobs':[]})
     try:
         cur = conn.cursor()
-        cur.execute("""SELECT id, job_name, total, processed, status, created_at, valid_emails, invalid_emails
-            FROM wix_verify_jobs WHERE user_email=%s ORDER BY created_at DESC LIMIT 5""", (session.get('user_id'),))
+        cur.execute("SELECT id, job_name, total, processed, status, created_at, valid_emails, invalid_emails FROM wix_verify_jobs WHERE user_email=%s ORDER BY created_at DESC LIMIT 5", (session.get('user_id'),))
         rows = cur.fetchall(); cur.close()
-        return jsonify({'jobs':[{'id':r[0],'name':r[1],'total':r[2],'processed':r[3],'status':r[4],
-            'created_at':str(r[5]),'valid':len(r[6].split('|||')) if r[6] else 0,
-            'invalid':len(r[7].split('|||')) if r[7] else 0} for r in rows]})
+        return jsonify({'jobs':[{'id':r[0],'name':r[1],'total':r[2],'processed':r[3],'status':r[4],'created_at':str(r[5]),'valid':len(r[6].split('|||')) if r[6] else 0,'invalid':len(r[7].split('|||')) if r[7] else 0} for r in rows]})
     except: return jsonify({'jobs':[]})
     finally: wix_release(conn)
 
@@ -1039,8 +1456,7 @@ def wix_import_to_queue():
             if not email or '@' not in email: continue
             store = (store or email).strip().lower()
             try:
-                cur.execute("""INSERT INTO wix_audit_queue (user_email,email,domain,status) VALUES (%s,%s,%s,'pending')
-                    ON CONFLICT (user_email, email) DO NOTHING""", (user_email, email, store))
+                cur.execute("INSERT INTO wix_audit_queue (user_email,email,domain,status) VALUES (%s,%s,%s,'pending') ON CONFLICT (user_email, email) DO NOTHING", (user_email, email, store))
                 if cur.rowcount > 0: added += 1
                 else: skipped += 1
             except: pass
@@ -1056,8 +1472,7 @@ def wix_get_queue():
     if not conn: return jsonify({'items':[]})
     try:
         cur = conn.cursor()
-        cur.execute("""SELECT id,email,domain,status FROM wix_audit_queue WHERE user_email=%s
-            ORDER BY CASE status WHEN 'pending' THEN 1 WHEN 'current' THEN 2 ELSE 3 END, added_at ASC""", (session.get('user_id'),))
+        cur.execute("SELECT id,email,domain,status FROM wix_audit_queue WHERE user_email=%s ORDER BY CASE status WHEN 'pending' THEN 1 WHEN 'current' THEN 2 ELSE 3 END, added_at ASC", (session.get('user_id'),))
         rows = cur.fetchall(); cur.close()
         return jsonify({'items':[{'id':r[0],'email':r[1],'domain':r[2],'status':r[3]} for r in rows]})
     finally: wix_release(conn)
@@ -1145,8 +1560,7 @@ def wix_generate_email():
     try:
         r = generate_wix_email(report, tone, name, email)
         return jsonify({'success':True,'subject':r['subject'],'body':r['body']})
-    except Exception as e:
-        return jsonify({'success':False,'error':str(e)})
+    except Exception as e: return jsonify({'success':False,'error':str(e)})
 
 @wix_bp.route('/wix/mark-sent', methods=['POST'])
 def wix_mark_sent():
@@ -1155,15 +1569,13 @@ def wix_mark_sent():
     if not conn: return jsonify({'success':False})
     try:
         cur = conn.cursor()
-        cur.execute("INSERT INTO wix_sent_log (user_email,email) VALUES (%s,%s) ON CONFLICT DO NOTHING",
-                    (session.get('user_id'), request.json.get('email','')))
+        cur.execute("INSERT INTO wix_sent_log (user_email,email) VALUES (%s,%s) ON CONFLICT DO NOTHING", (session.get('user_id'), request.json.get('email','')))
         conn.commit(); cur.close()
         return jsonify({'success':True})
     except: return jsonify({'success':False})
     finally: wix_release(conn)
 
 def attach(app):
-    """Register Wix blueprint on the existing Flask app. Does not modify app.py."""
     wix_init_db()
     app.register_blueprint(wix_bp)
     print("✅ wix_routes attached")
