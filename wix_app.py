@@ -341,14 +341,72 @@ def extract_wix_products(html, base_url, max_products=3):
         if len(products) >= max_products: break
     return products
 
+# ==========================================
+# WIX SITE TYPE DETECTION
+# ==========================================
+def _detect_wix_site_type(html, url=""):
+    """Classify a Wix site: physical_store, digital_store, service_site, informational, unknown."""
+    if not html:
+        return "unknown"
+    low = html.lower()
+
+    store_paths = ['/product-page/', '/shop/', '/store/', '/product/']
+    store_words = ['add to cart', 'add-to-cart', 'add_to_cart', 'shopping cart',
+                   'checkout', 'wixstores', 'wix-ecom', 'buy now', 'out of stock',
+                   'in stock', 'free shipping', 'shipping policy']
+    store_score = 0
+    for p in store_paths:
+        if p in low: store_score += 2
+    for w in store_words:
+        if w in low: store_score += 1
+
+    digital_words = ['instant download', 'instant access', 'download now', 'digital download',
+                     'pdf download', 'ebook', 'e-book', 'online course', 'membership',
+                     'lifetime access', 'course access', 'digital product', 'template pack',
+                     'printable', 'download link']
+    digital_score = 0
+    for w in digital_words:
+        if w in low: digital_score += 2
+
+    service_words = ['book now', 'book a', 'booking', 'schedule a', 'appointment',
+                     'consultation', 'free consultation', 'our services', 'service packages',
+                     'hire us', 'hire me', 'coaching', 'therapy', 'counseling', 'counselling',
+                     'clinic', 'session', 'our team of', 'get a quote', 'request a quote']
+    service_score = 0
+    for w in service_words:
+        if w in low: service_score += 2
+
+    info_words = ['blog', 'our mission', 'about us', 'nonprofit', 'non-profit', 'community',
+                  'resources', 'school', 'education', 'church', 'foundation', 'awareness',
+                  'research', 'news', 'articles', 'portfolio', 'our story']
+    info_score = 0
+    for w in info_words:
+        if w in low: info_score += 1
+
+    scores = {
+        'physical_store': store_score,
+        'digital_store': digital_score,
+        'service_site': service_score,
+        'informational': info_score,
+    }
+    best = max(scores, key=scores.get)
+    if scores[best] < 2:
+        return "unknown"
+    return best
+
+# ==========================================
+# WIX AUDIT — SITE-TYPE AWARE
+# ==========================================
 def audit_store_wix(domain, case_id):
     from datetime import datetime
     raw = domain.strip().lower().replace("https://","").replace("http://","").replace("www.","").split("/")[0]
     report = {"domain": raw, "case_id": case_id, "platform": "Wix",
               "audited_at": datetime.now().isoformat(),
+              "site_type": "unknown",
               "checks": {}, "scores": {}, "issues": [], "positives": [], "top_products": []}
     if not raw or '.' not in raw:
         report['error'] = "Invalid domain"; return report
+
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     base_url = f"https://{raw}"
     try:
@@ -365,65 +423,137 @@ def audit_store_wix(domain, case_id):
         report["checks"]["https"] = False
         report["error"] = f"Unreachable: {str(e)[:100]}"
         return report
+
     low = html.lower()
     is_wix = any(x in low for x in ['wix.com','wixstatic.com','wix-code','wixstores','parastorage.com'])
     report["checks"]["is_wix"] = is_wix
     if is_wix: report["positives"].append("Confirmed Wix site")
-    try:
-        products = extract_wix_products(html, base_url, 3)
-        report["top_products"] = products
-        if products: report["positives"].append(f"Detected {len(products)} products")
-        else: report["issues"].append({"title":"No Products Detected","description":"Could not find product pages","recommendation":"Feature products on homepage","severity":"high"})
-    except: pass
+
+    site_type = _detect_wix_site_type(html, r.url)
+    report["site_type"] = site_type
+    report["checks"]["site_type"] = site_type
+
+    # Products — physical + digital stores only
+    if site_type in ('physical_store', 'digital_store'):
+        try:
+            products = extract_wix_products(html, base_url, 3)
+            report["top_products"] = products
+            if products:
+                report["positives"].append(f"Detected {len(products)} products")
+            else:
+                report["issues"].append({"title":"No Products Detected","description":"Could not find product pages","recommendation":"Feature products on homepage","severity":"high"})
+        except: pass
+
+    # Mobile — all
     hv = 'name="viewport"' in low
     report["checks"]["mobile_responsive"] = hv
     if hv: report["positives"].append("Mobile responsive")
-    else: report["issues"].append({"title":"Not Mobile Responsive","description":"Missing viewport","recommendation":"Enable mobile in Wix","severity":"high"})
+    else: report["issues"].append({"title":"Not Mobile Responsive","description":"Missing viewport","recommendation":"Enable mobile in Wix editor","severity":"high"})
+
+    # Contact — all
     he = bool(re.search(r'mailto:[^"\']+', html))
     hp = bool(re.search(r'tel:[^"\']+', html))
     report["checks"]["has_email_link"] = he
     report["checks"]["has_phone_link"] = hp
     if he or hp: report["positives"].append("Contact info present")
-    else: report["issues"].append({"title":"No Contact Info","description":"No email/phone","recommendation":"Add Contact page","severity":"high"})
-    socials = [p.split('.')[0] for p in ['facebook.com','instagram.com','twitter.com','tiktok.com','youtube.com','pinterest.com'] if p in low]
+    else: report["issues"].append({"title":"No Contact Info","description":"No email/phone link on homepage","recommendation":"Add a Contact page with email","severity":"high"})
+
+    # Social — all
+    socials = [p.split('.')[0] for p in ['facebook.com','instagram.com','twitter.com','tiktok.com','youtube.com','pinterest.com','linkedin.com'] if p in low]
     report["checks"]["social_links"] = socials
     if len(socials) >= 2: report["positives"].append(f"{len(socials)} socials")
-    elif not socials: report["issues"].append({"title":"No Social Media","description":"None found","recommendation":"Add social profiles","severity":"medium"})
+    elif not socials: report["issues"].append({"title":"No Social Media","description":"None found on homepage","recommendation":"Add social profiles","severity":"medium"})
+
+    # Policies — physical + digital only
     pf = 0
-    for pol in ['/terms','/privacy','/shipping','/returns','/policies']:
-        try:
-            pr = requests.get(f"{base_url}{pol}", headers=headers, timeout=5)
-            if pr.status_code == 200: pf += 1
-        except: pass
-    report["checks"]["policy_pages_found"] = f"{pf}/5"
-    if pf >= 4: report["positives"].append("Policies present")
-    elif pf < 2: report["issues"].append({"title":"Missing Policies","description":f"{pf}/5","recommendation":"Add terms, privacy, shipping","severity":"high"})
+    if site_type in ('physical_store', 'digital_store'):
+        policy_paths = ['/terms', '/privacy', '/shipping', '/returns', '/policies',
+                        '/terms-and-conditions', '/privacy-policy', '/refund-policy']
+        found_paths = set()
+        for pol in policy_paths:
+            try:
+                pr = requests.get(f"{base_url}{pol}", headers=headers, timeout=5, allow_redirects=False)
+                if pr.status_code == 200:
+                    key = pol.split('-')[0] if '-' in pol else pol
+                    if key not in found_paths:
+                        found_paths.add(key); pf += 1
+            except: pass
+        report["checks"]["policy_pages_found"] = f"{pf}"
+        if pf >= 3: report["positives"].append(f"{pf} policy pages present")
+        elif pf < 2: report["issues"].append({"title":"Missing Policies","description":f"Only {pf} policy pages found","recommendation":"Add terms, privacy, and returns/refund policy","severity":"high"})
+
+    # Payments — physical + digital only
     payments = []
-    for name, sigs in {"PayPal":["paypal.com","paypal"],"Stripe":["stripe.com","js.stripe"],"Apple Pay":["apple-pay","applepay"],"Google Pay":["google-pay","googlepay"]}.items():
-        for s in sigs:
-            if s in low: payments.append(name); break
-    report["checks"]["payment_methods"] = payments
-    if len(payments) >= 2: report["positives"].append(f"{len(payments)} payment options")
-    else: report["issues"].append({"title":"Limited Payment Options","description":f"{len(payments)} detected","recommendation":"Add PayPal/Stripe","severity":"medium"})
-    free_ship = any(x in low for x in ['free shipping','free delivery','shipping on us'])
-    report["checks"]["free_shipping_advertised"] = free_ship
-    if free_ship: report["positives"].append("Free shipping banner")
-    else: report["issues"].append({"title":"No Free Shipping Banner","description":"Buyer priority","recommendation":"Add free shipping threshold","severity":"medium"})
+    if site_type in ('physical_store', 'digital_store'):
+        for name, sigs in {"PayPal":["paypal.com","paypal"],"Stripe":["stripe.com","js.stripe"],"Apple Pay":["apple-pay","applepay"],"Google Pay":["google-pay","googlepay"]}.items():
+            for s in sigs:
+                if s in low: payments.append(name); break
+        report["checks"]["payment_methods"] = payments
+        if len(payments) >= 2: report["positives"].append(f"{len(payments)} payment options")
+        elif len(payments) == 0: report["issues"].append({"title":"No Payment Method Detected","description":"Could not detect a payment provider","recommendation":"Add PayPal or Stripe for checkout","severity":"medium"})
+
+    # Free shipping — physical only
+    free_ship = False
+    if site_type == 'physical_store':
+        free_ship = any(x in low for x in ['free shipping','free delivery','shipping on us'])
+        report["checks"]["free_shipping_advertised"] = free_ship
+        if free_ship: report["positives"].append("Free shipping banner present")
+        else: report["issues"].append({"title":"No Free Shipping Banner","description":"Free shipping is a top buyer priority","recommendation":"Advertise a free shipping threshold on your homepage","severity":"medium"})
+
+    # Service-specific
+    if site_type == 'service_site':
+        has_booking = any(x in low for x in ['book now','booking','schedule','appointment','calendly','wix-bookings','book a'])
+        report["checks"]["has_booking"] = has_booking
+        if has_booking: report["positives"].append("Booking system present")
+        else: report["issues"].append({"title":"No Booking System","description":"Service sites convert better with online booking","recommendation":"Add Wix Bookings or a scheduling link","severity":"high"})
+
+        has_testimonials = any(x in low for x in ['testimonial','review','clients say','what our clients','trusted by'])
+        report["checks"]["has_testimonials"] = has_testimonials
+        if has_testimonials: report["positives"].append("Testimonials present")
+        else: report["issues"].append({"title":"No Testimonials","description":"Social proof is critical for service businesses","recommendation":"Add 3-5 client testimonials","severity":"high"})
+
+        has_services_list = any(x in low for x in ['our services','service packages','what we offer','our expertise','services'])
+        report["checks"]["has_services_section"] = has_services_list
+        if not has_services_list:
+            report["issues"].append({"title":"No Services Section","description":"Clear services list is missing","recommendation":"Add a dedicated Services section","severity":"medium"})
+
+    # Informational-specific
+    if site_type == 'informational':
+        has_about = any(x in low for x in ['about us','our story','our mission','who we are'])
+        report["checks"]["has_about"] = has_about
+        if has_about: report["positives"].append("About section present")
+        else: report["issues"].append({"title":"No About Section","description":"Visitors want to know who's behind the site","recommendation":"Add an About/Mission section","severity":"medium"})
+
+        has_donate_or_contact = any(x in low for x in ['donate','contact us','get in touch','subscribe','join us'])
+        report["checks"]["has_cta"] = has_donate_or_contact
+        if has_donate_or_contact: report["positives"].append("Clear call-to-action")
+        else: report["issues"].append({"title":"No Call-to-Action","description":"No obvious next step for visitors","recommendation":"Add a Contact / Subscribe / Donate CTA","severity":"medium"})
+
+    # SEO — all
     tm = re.search(r'<title[^>]*>(.*?)</title>', html, re.I | re.S)
     dm = re.search(r'<meta[^>]*name=["\']description["\'][^>]*content=["\']([^"\']*)["\']', html, re.I | re.S)
     title = tm.group(1).strip() if tm else ''
     desc = dm.group(1).strip() if dm else ''
     report["checks"]["meta_title_length"] = len(title)
     report["checks"]["meta_description_length"] = len(desc)
-    if not title: report["issues"].append({"title":"Missing Page Title","description":"No title","recommendation":"Add SEO title","severity":"high"})
-    if not desc: report["issues"].append({"title":"Missing Meta Description","description":"None","recommendation":"Add 150-160 chars","severity":"medium"})
+    if not title: report["issues"].append({"title":"Missing Page Title","description":"No <title> tag","recommendation":"Add a descriptive page title","severity":"high"})
+    if not desc: report["issues"].append({"title":"Missing Meta Description","description":"No meta description","recommendation":"Add a 150-160 character description","severity":"medium"})
+
+    # Scoring
     trust = 0
-    if he or hp: trust += 20
-    trust += min(int((pf/5)*30), 30)
+    if he or hp: trust += 25
     if len(socials) >= 2: trust += 15
     elif socials: trust += 8
-    if len(payments) >= 2: trust += 10
+    if site_type in ('physical_store', 'digital_store'):
+        trust += min(pf * 8, 40)
+        if len(payments) >= 2: trust += 20
+    elif site_type == 'service_site':
+        if report["checks"].get("has_testimonials"): trust += 30
+        if report["checks"].get("has_booking"): trust += 20
+    elif site_type == 'informational':
+        if report["checks"].get("has_about"): trust += 30
     report["scores"]["trust_score"] = min(trust, 100)
+
     tech = 0
     if report["checks"].get("https"): tech += 25
     if report["checks"].get("http_status") == 200: tech += 15
@@ -432,63 +562,49 @@ def audit_store_wix(domain, case_id):
     elif lt < 3: tech += 12
     elif lt < 5: tech += 5
     report["scores"]["technical_score"] = min(tech, 100)
+
     mkt = 0
-    if products: mkt += 20
-    if len(socials) >= 3: mkt += 20
-    elif socials: mkt += 10
-    if free_ship: mkt += 10
-    if len(payments) >= 3: mkt += 10
+    if len(socials) >= 3: mkt += 25
+    elif socials: mkt += 12
+    if site_type in ('physical_store', 'digital_store'):
+        if report.get("top_products"): mkt += 20
+        if free_ship: mkt += 15
+        if len(payments) >= 3: mkt += 15
+    elif site_type == 'service_site':
+        if report["checks"].get("has_booking"): mkt += 20
+        if report["checks"].get("has_testimonials"): mkt += 20
+        if report["checks"].get("has_services_section"): mkt += 15
+    elif site_type == 'informational':
+        if report["checks"].get("has_cta"): mkt += 25
+        if report["checks"].get("has_about"): mkt += 20
     report["scores"]["marketing_score"] = min(mkt, 100)
+
     report["scores"]["overall_score"] = int((report["scores"]["trust_score"] + report["scores"]["technical_score"] + report["scores"]["marketing_score"]) / 3)
     return report
 
 # ==========================================
-# WIX EMAIL GENERATOR — RANDOMIZED TONES
+# WIX EMAIL GENERATOR — RANDOMIZED TONES + SITE-AWARE
 # ==========================================
 WIX_GREETINGS = {
     'friendly': ["Hi {brand} team,", "Hey {brand} folks,", "Hello {brand},", "Hey {brand},", "Hi {brand},", "Hey there {brand},"],
     'professional': ["Hello {brand} team,", "Dear {brand} team,", "Greetings {brand} team,", "Hello {brand},", "Good day {brand} team,"],
     'casual': ["Hey {brand},", "Yo {brand},", "What's up {brand}?", "Hey {brand} team,"]
 }
-WIX_OPENERS_WITH_URL = {
-    'friendly': [
-        "Just had a quick look at {url} — spotted a few things.",
-        "Went through {url} today and noticed a few issues.",
-        "Spent a few minutes on {url} — here's what stood out.",
-        "Checked out {url} and found some quick wins.",
-        "Browsed {url} today and jotted down a few notes.",
-        "Took a peek at {url} — found some easy fixes."
-    ],
-    'professional': [
-        "I reviewed {url} and identified several areas for improvement.",
-        "After analyzing {url}, I found a few notable issues.",
-        "I ran a quick audit of {url} today and wanted to share the findings.",
-        "Here are some observations from my review of {url}.",
-        "I spent some time analyzing {url} — here's what I found."
-    ],
-    'casual': [
-        "Just checked {url} — found a few things.",
-        "Took a look at {url} and noticed some stuff.",
-        "Was browsing {url} and saw a few issues.",
-        "Had a look at {url} — here's what popped up.",
-        "Quick peek at {url}, and I found some wins."
-    ]
-}
 WIX_OPENERS_NO_URL = {
     'friendly': [
-        "Just had a quick look at your store — spotted a few things.",
-        "Went through your store today and noticed a few issues.",
-        "Spent a few minutes on your store — here's what stood out."
+        "Just had a quick look at your site — spotted a few things.",
+        "Went through your site today and noticed a few issues.",
+        "Spent a few minutes on your site — here's what stood out."
     ],
     'professional': [
-        "I reviewed your store and identified several areas for improvement.",
-        "After analyzing your store, I found a few notable issues.",
-        "I ran a quick audit of your store today and wanted to share the findings."
+        "I reviewed your site and identified several areas for improvement.",
+        "After analyzing your site, I found a few notable issues.",
+        "I ran a quick audit of your site today and wanted to share the findings."
     ],
     'casual': [
-        "Just checked your store — found a few things.",
-        "Took a look at your store and noticed some stuff.",
-        "Was browsing your store and saw a few issues."
+        "Just checked your site — found a few things.",
+        "Took a look at your site and noticed some stuff.",
+        "Was browsing your site and saw a few issues."
     ]
 }
 WIX_ISSUES_INTROS = {
@@ -518,91 +634,47 @@ WIX_SIGNOFF_LINES = {
 }
 WIX_SIGNOFFS = ["Best regards,", "Cheers,", "Best,", "Warmly,"]
 
-# ==========================================
-# WIX SUBJECT TEMPLATE POOLS
-# ==========================================
-WIX_SUBJECT_TEMPLATES = {
+# Site-type-aware openers
+WIX_TYPE_OPENERS = {
     'friendly': {
-        'low_score': [
-            "Quick note about {brand}",
-            "Spotted something on {brand}",
-            "A few things on {brand}",
-            "{brand} — quick heads up",
-            "Small things I noticed on {brand}",
-            "Just checked {brand} — 3 quick wins",
-            "Idea for {brand}",
-            "Noticed a few things on {brand}",
-            "One thing about {brand}",
-            "Had a look at {brand}"
-        ],
-        'mid_score': [
-            "Idea for {brand}",
-            "Quick thought on {brand}",
-            "Possible tweak for {brand}",
-            "One thing for {brand}",
-            "{brand} — small idea",
-            "Spotted an opportunity on {brand}"
-        ],
-        'high_score': [
-            "Nice store — {brand}",
-            "Liked {brand} — one small thing",
-            "{brand} is looking good",
-            "One tweak for {brand}",
-            "{brand} — great job"
-        ]
+        'physical_store': "Just had a quick look at {url} — nice product lineup. Spotted a few things.",
+        'digital_store': "Took a look at {url} today — solid digital offering. Noticed a few things.",
+        'service_site': "Just went through {url} — clear services. Found a couple of things worth flagging.",
+        'informational': "Checked out {url} today — nice mission. Spotted a few things that could help.",
+        'unknown': "Just had a quick look at {url} — spotted a few things.",
     },
     'professional': {
-        'low_score': [
-            "Observations on {brand}'s online store",
-            "Review notes: {brand}",
-            "Findings from {brand} audit",
-            "Brief review of {brand}",
-            "{brand} — points for improvement",
-            "Notes from reviewing {brand}",
-            "Quick assessment of {brand}",
-            "Areas to strengthen on {brand}",
-            "Audit summary for {brand}",
-            "Feedback on {brand}'s storefront"
-        ],
-        'mid_score': [
-            "Consideration for {brand}",
-            "A small refinement for {brand}",
-            "Notes on {brand}",
-            "Brief observation on {brand}",
-            "One opportunity for {brand}"
-        ],
-        'high_score': [
-            "Positive note on {brand}",
-            "Small suggestion for {brand}",
-            "{brand} — well done",
-            "One observation on {brand}"
-        ]
+        'physical_store': "I reviewed {url} and identified several areas for improvement in your online store.",
+        'digital_store': "After analyzing {url}, I found a few notable issues for your digital offering.",
+        'service_site': "I reviewed {url} and identified a few areas that could strengthen your service site.",
+        'informational': "After reviewing {url}, I found a few opportunities to improve clarity and reach.",
+        'unknown': "I reviewed {url} and identified several areas for improvement.",
     },
     'casual': {
-        'low_score': [
-            "Yo {brand} — checked your site",
-            "Quick look at {brand}",
-            "{brand} — few things",
-            "Poked around {brand}",
-            "Saw a few things on {brand}",
-            "Heads up on {brand}",
-            "Just looked at {brand}",
-            "{brand} — some easy fixes",
-            "Peeked at {brand}",
-            "Noticed some stuff on {brand}"
-        ],
-        'mid_score': [
-            "Idea for {brand}",
-            "One thing for {brand}",
-            "{brand} — small tweak",
-            "Quick thing on {brand}"
-        ],
-        'high_score': [
-            "Cool store — {brand}",
-            "{brand} looks solid",
-            "Nice — {brand}",
-            "One thing on {brand}"
-        ]
+        'physical_store': "Just checked {url} — cool products. Found a few things to fix.",
+        'digital_store': "Looked at {url} — cool digital stuff. Saw a few issues.",
+        'service_site': "Peeked at {url} — nice services. Saw a few things off.",
+        'informational': "Checked {url} — cool mission. Found some stuff.",
+        'unknown': "Just checked {url} — found a few things.",
+    }
+}
+
+# Subject pools
+WIX_SUBJECT_TEMPLATES = {
+    'friendly': {
+        'low_score': ["Quick note about {brand}","Spotted something on {brand}","A few things on {brand}","{brand} — quick heads up","Small things I noticed on {brand}","Just checked {brand} — 3 quick wins","Idea for {brand}","Noticed a few things on {brand}","One thing about {brand}","Had a look at {brand}"],
+        'mid_score': ["Idea for {brand}","Quick thought on {brand}","Possible tweak for {brand}","One thing for {brand}","{brand} — small idea","Spotted an opportunity on {brand}"],
+        'high_score': ["Nice site — {brand}","Liked {brand} — one small thing","{brand} is looking good","One tweak for {brand}","{brand} — great job"]
+    },
+    'professional': {
+        'low_score': ["Observations on {brand}","Review notes: {brand}","Findings from {brand} audit","Brief review of {brand}","{brand} — points for improvement","Notes from reviewing {brand}","Quick assessment of {brand}","Areas to strengthen on {brand}","Audit summary for {brand}","Feedback on {brand}"],
+        'mid_score': ["Consideration for {brand}","A small refinement for {brand}","Notes on {brand}","Brief observation on {brand}","One opportunity for {brand}"],
+        'high_score': ["Positive note on {brand}","Small suggestion for {brand}","{brand} — well done","One observation on {brand}"]
+    },
+    'casual': {
+        'low_score': ["Yo {brand} — checked your site","Quick look at {brand}","{brand} — few things","Poked around {brand}","Saw a few things on {brand}","Heads up on {brand}","Just looked at {brand}","{brand} — some easy fixes","Peeked at {brand}","Noticed some stuff on {brand}"],
+        'mid_score': ["Idea for {brand}","One thing for {brand}","{brand} — small tweak","Quick thing on {brand}"],
+        'high_score': ["Cool site — {brand}","{brand} looks solid","Nice — {brand}","One thing on {brand}"]
     }
 }
 
@@ -636,6 +708,8 @@ def generate_wix_email(report, tone='friendly', sender_name='', email=''):
     overall = (report.get('scores') or {}).get('overall_score', 0)
     issues = report.get('issues') or []
     prods = report.get('top_products') or []
+    site_type = report.get('site_type', 'unknown')
+
     priority = {'high': 0, 'medium': 1, 'low': 2}
     sorted_issues = sorted(issues, key=lambda x: priority.get(x.get('severity','low'), 3))
     top_issues = sorted_issues[:3]
@@ -644,8 +718,14 @@ def generate_wix_email(report, tone='friendly', sender_name='', email=''):
     # Randomized subject
     subject = _wix_pick_subject(report, tone)
 
+    # Site-aware opener
+    if display_url:
+        opener_template = WIX_TYPE_OPENERS.get(tone, WIX_TYPE_OPENERS['friendly']).get(site_type, WIX_TYPE_OPENERS[tone]['unknown'])
+        opener = opener_template.replace('{url}', display_url)
+    else:
+        opener = _wix_pick(WIX_OPENERS_NO_URL[tone])
+
     greeting = _wix_pick(WIX_GREETINGS[tone]).replace('{brand}', brand)
-    opener = _wix_pick(WIX_OPENERS_WITH_URL[tone] if display_url else WIX_OPENERS_NO_URL[tone]).replace('{url}', display_url)
     issues_intro = _wix_pick(WIX_ISSUES_INTROS[tone])
     score_line = _wix_pick(WIX_SCORE_LINES).replace('{score}', str(overall))
     cta = _wix_pick(WIX_CTAS[tone])
@@ -654,7 +734,7 @@ def generate_wix_email(report, tone='friendly', sender_name='', email=''):
     signature = sender_name.strip() if sender_name and sender_name.strip() else "[Your name]"
 
     parts = [greeting, "", opener, ""]
-    if prods:
+    if prods and site_type in ('physical_store', 'digital_store'):
         prod_names = [p.get('title','') for p in prods[:3] if p.get('title')]
         if prod_names:
             prod_intro = _wix_pick(WIX_PROD_INTROS[tone])
@@ -665,11 +745,13 @@ def generate_wix_email(report, tone='friendly', sender_name='', email=''):
             parts.append(f"• {names}")
             parts.append("")
 
-    parts.append(issues_intro)
-    parts.append("")
-    for b in issue_bullets:
-        parts.append(f"• {b}")
-    parts.append("")
+    if issue_bullets:
+        parts.append(issues_intro)
+        parts.append("")
+        for b in issue_bullets:
+            parts.append(f"• {b}")
+        parts.append("")
+
     parts.append(score_line)
     parts.append("")
     parts.append(cta)
@@ -970,7 +1052,7 @@ def wix_audit_page():
     body = '''<div style="max-width:900px;margin:20px auto;padding:20px">
 <div style="background:#65a30d;color:white;padding:20px;border-radius:10px;margin-bottom:20px">
 <h1 style="margin:0">🚀 Wix Analyze & Send</h1>
-<p style="margin:4px 0 0 0;font-size:14px">Extracts top products from HTML</p>
+<p style="margin:4px 0 0 0;font-size:14px">Site-type aware · auto-detects store / service / info sites</p>
 </div>
 <div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
 <h3 style="margin-top:0">📥 Import Wix Emails</h3>
@@ -1266,7 +1348,10 @@ function regen(tone){ autoTone = tone; genEmail(); }
 
 function renderReport(r){
   const sc=r.scores||{}, iss=r.issues||[], prods=r.top_products||[];
-  let h='<div style="background:white;padding:20px;border-radius:10px;margin-bottom:15px"><h3>Scores</h3>';
+  const st = r.site_type || 'unknown';
+  let h='<div style="background:white;padding:20px;border-radius:10px;margin-bottom:15px">';
+  h += '<div style="background:#f3f4f6;padding:6px 12px;border-radius:6px;font-size:13px;color:#374151;display:inline-block;margin-bottom:10px">Site type: <b>'+st+'</b></div>';
+  h += '<h3>Scores</h3>';
   ['overall_score','trust_score','technical_score','marketing_score'].forEach(k => {
     const v = sc[k]||0;
     const c = v>=75?'#16a34a':(v>=50?'#f59e0b':'#ef4444');
