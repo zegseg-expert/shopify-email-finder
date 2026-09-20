@@ -1530,6 +1530,12 @@ NAVBAR = '''
 <a href="/verify" onclick="closeDrawer()">✅ Verify Emails</a>
 <a href="/scout" onclick="closeDrawer()">📨 Email Scout</a>
 <a href="/audit" onclick="closeDrawer()">🚀 Analyze & Send</a>
+<div style="padding:12px 20px 6px;font-size:12px;font-weight:bold;color:#9ca3af;letter-spacing:1px;text-transform:uppercase;background:#0f172a">🎨 Wix</div>
+<a href="/wix" onclick="closeDrawer()">🔍 Wix Store Finder</a>
+<a href="/wix/finder" onclick="closeDrawer()">📧 Wix Email Finder</a>
+<a href="/wix/verify" onclick="closeDrawer()">✅ Wix Verify</a>
+<a href="/wix/scout" onclick="closeDrawer()">📨 Wix Scout</a>
+<a href="/wix/audit" onclick="closeDrawer()">🚀 Wix Analyze & Send</a>
 <a href="/settings" onclick="closeDrawer()">⚙️ Settings</a>
 <hr style="border-color:#374151;margin:20px 0">
 <a href="/logout" onclick="closeDrawer()" style="color:#ef4444">🚪 Logout</a>
