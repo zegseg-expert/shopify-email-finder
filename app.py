@@ -158,19 +158,6 @@ def init_db():
         except: pass
         try: cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS send_limit INTEGER DEFAULT 70")
         except: pass
-        # ===== WIX COLUMNS (ADDITIVE) =====
-        try: cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS wix_found_emails TEXT")
-        except: pass
-        try: cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS wix_verified_emails TEXT")
-        except: pass
-        try: cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS wix_scout_recipients TEXT")
-        except: pass
-        try: cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS wix_scout_subject TEXT")
-        except: pass
-        try: cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS wix_scout_message TEXT")
-        except: pass
-        try: cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS wix_session_sent_count INTEGER DEFAULT 0")
-        except: pass
         cur.execute("""CREATE TABLE IF NOT EXISTS verify_jobs (
             id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
             job_name VARCHAR(255), total INTEGER DEFAULT 0, processed INTEGER DEFAULT 0,
@@ -263,57 +250,6 @@ def init_db():
             sold_out_count INTEGER DEFAULT 0,
             bestsellers TEXT,
             crawled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        # ===== WIX WAREHOUSE TABLE =====
-        cur.execute("""CREATE TABLE IF NOT EXISTS wix_warehouse (
-            id BIGSERIAL PRIMARY KEY,
-            url TEXT UNIQUE NOT NULL,
-            domain TEXT NOT NULL,
-            source TEXT,
-            title TEXT,
-            country TEXT,
-            status TEXT DEFAULT 'pending',
-            seo_score INTEGER,
-            tech_spend INTEGER,
-            crawled_at TIMESTAMPTZ,
-            created_at TIMESTAMPTZ DEFAULT NOW(),
-            verified_at TIMESTAMPTZ,
-            audited_at TIMESTAMPTZ,
-            notes TEXT)""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_wix_warehouse_status ON wix_warehouse(status)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_wix_warehouse_created ON wix_warehouse(created_at DESC)")
-        # ===== WIX PIPELINE TABLES =====
-        cur.execute("""CREATE TABLE IF NOT EXISTS wix_email_jobs (
-            id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
-            total INTEGER DEFAULT 0, processed INTEGER DEFAULT 0,
-            emails_found INTEGER DEFAULT 0,
-            status VARCHAR(50) DEFAULT 'pending',
-            remaining_urls TEXT, results TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS wix_verify_jobs (
-            id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
-            job_name VARCHAR(255), total INTEGER DEFAULT 0, processed INTEGER DEFAULT 0,
-            valid_emails TEXT, invalid_emails TEXT, remaining_emails TEXT,
-            status VARCHAR(50) DEFAULT 'pending',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS wix_audit_queue (
-            id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
-            email VARCHAR(255) NOT NULL, domain VARCHAR(255) NOT NULL,
-            status VARCHAR(50) DEFAULT 'pending',
-            report JSONB, subject TEXT, message TEXT,
-            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_email, email))""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS wix_sent_log (
-            id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
-            email VARCHAR(255) NOT NULL,
-            sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_email, email))""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS wix_audit_history (
-            id SERIAL PRIMARY KEY, user_email VARCHAR(255) NOT NULL,
-            domain VARCHAR(255) NOT NULL, report JSONB,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
         conn.commit(); cur.close()
         print("✅ DB ready")
     except Exception as e: print(f"❌ DB: {e}")
@@ -329,8 +265,6 @@ def reset_stuck_current_items():
     try:
         cur = conn.cursor()
         cur.execute("UPDATE audit_queue SET status='pending', updated_at=NOW() WHERE status='current'")
-        try: cur.execute("UPDATE wix_audit_queue SET status='pending', updated_at=NOW() WHERE status='current'")
-        except: pass
         n = cur.rowcount
         conn.commit(); cur.close()
         if n > 0:
@@ -1462,7 +1396,7 @@ def find_emails(domain):
     return final
 
 # ==========================================
-# AUDIT (Shopify — UNCHANGED)
+# AUDIT
 # ==========================================
 def audit_store(domain, case_id, include_catalogue=False):
     raw = domain.strip().lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
@@ -1646,7 +1580,7 @@ def audit_store(domain, case_id, include_catalogue=False):
     return report
 
 # ==========================================
-# EMAIL GENERATOR (RANDOMIZED) — SHOPIFY (UNCHANGED)
+# EMAIL GENERATOR (RANDOMIZED)
 # ==========================================
 GREETINGS = {
     'friendly': ["Hi {brand} team,", "Hey {brand} folks,", "Hello {brand},", "Hey {brand},", "Hi {brand},", "Hey there {brand},"],
@@ -1848,12 +1782,8 @@ NAVBAR = '''
 <a href="/scout" onclick="closeDrawer()">📨 Email Scout</a>
 <a href="/audit" onclick="closeDrawer()">🚀 Analyze & Send</a>
 
-<div class="drawer-section">🎨 Wix</div>
+<div class="drawer-section">🛍️ Wix</div>
 <a href="/wix" onclick="closeDrawer()">🔍 Wix Store Finder</a>
-<a href="/wix/finder" onclick="closeDrawer()">📧 Wix Email Finder</a>
-<a href="/wix/verify" onclick="closeDrawer()">✅ Wix Verify</a>
-<a href="/wix/scout" onclick="closeDrawer()">📨 Wix Scout</a>
-<a href="/wix/audit" onclick="closeDrawer()">🚀 Wix Analyze & Send</a>
 
 <div class="drawer-section">⚙️ Account</div>
 <a href="/settings" onclick="closeDrawer()">⚙️ Settings</a>
@@ -1950,7 +1880,7 @@ def settings():
 {f'<p style="color:green;margin-top:10px">{msg}</p>' if msg else ''}
 </div></div>'''
     return render_page("Settings", body)
-    
+
 # ==========================================
 # HOME (Email Finder - Shopify)
 # ==========================================
@@ -2310,7 +2240,7 @@ def wix_page():
     body = '''<div style="max-width:900px;margin:20px auto;padding:20px">
 <div style="background:linear-gradient(135deg,#0d9488,#0891b2);color:white;padding:20px;border-radius:10px;margin-bottom:20px">
 <h1 style="margin:0">🔍 Wix Store Finder</h1>
-<p style="margin:4px 0 0 0;font-size:14px;opacity:0.9">Warehouse · 500 fresh domains daily from Leadita</p>
+<p style="margin:4px 0 0 0;font-size:14px;opacity:0.9">Common Crawl CDX · 6 indexes × 3 store patterns · verified</p>
 </div>
 
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
@@ -2329,20 +2259,6 @@ def wix_page():
 </div>
 
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
-<h3 style="margin-top:0">🏭 Warehouse (Daily Auto-Ingest)</h3>
-<p style="font-size:14px;color:#555;margin:5px 0">Grows every day at 14:00 UTC. Pull any number when you're ready.</p>
-<div id="warehouseStats" style="background:#f3f4f6;padding:12px;border-radius:6px;margin:10px 0;font-size:13px;line-height:1.7">Loading…</div>
-<button onclick="ingestNow()" style="background:#7c3aed;color:white;padding:12px 24px;border:none;border-radius:8px;cursor:pointer;font-size:15px;font-weight:bold;width:100%;margin-bottom:10px">📥 Ingest Today's Batch</button>
-<div style="display:flex;gap:8px;flex-wrap:wrap">
-<input type="number" id="wixPullCount" value="500" min="1" max="5000" style="flex:1;min-width:100px;padding:10px;border:1px solid #ddd;border-radius:6px;font-size:14px;box-sizing:border-box">
-<button onclick="pullFromWarehouse()" style="flex:2;background:#0d9488;color:white;padding:12px 24px;border:none;border-radius:8px;cursor:pointer;font-size:15px;font-weight:bold">📧 Send to Wix Finder</button>
-</div>
-<button onclick="resetWarehouse()" style="background:#6b7280;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;font-size:12px;margin-top:8px">🔄 Reset pulled rows to pending</button>
-<div id="ingestStatus" style="margin-top:10px"></div>
-<div id="pullStatus" style="margin-top:10px"></div>
-</div>
-
-<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
 <h3 style="margin-top:0">📋 Last 3 Discovery Jobs</h3>
 <div id="wixJobs">Loading...</div>
 </div>
@@ -2350,18 +2266,21 @@ def wix_page():
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1)">
 <h3 style="margin-top:0">📋 Discovered Wix Stores (<span id="wixCount">0</span>)</h3>
 <div id="wixList">Loading...</div>
-<button onclick="clearWixStores()" style="background:#ef4444;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px;margin-top:10px">🗑️ Clear</button>
+<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+<button onclick="sendAllToWixFinder()" style="background:#667eea;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;font-size:14px;opacity:0.6" disabled title="Coming in Step 2">📧 Send All to Wix Email Finder</button>
+<button onclick="clearWixStores()" style="background:#ef4444;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-size:14px">🗑️ Clear</button>
+</div>
 </div>
 </div>
 <script>
 async function startWixDiscovery(){
   const status = document.getElementById('wixStatus');
-  status.innerHTML = '<p style="color:#666">⏳ Starting Wix discovery...<br>This takes 10-20 minutes. You can close the browser.</p>';
+  status.innerHTML = '<p style="color:#666">⏳ Starting Wix discovery...<br>Querying 6 Common Crawl indexes × 3 patterns.<br>Then verifying each URL. This takes 10-20 minutes.<br><b>You can close the browser — runs in the background.</b></p>';
   try{
     const res = await fetch('/start-wix-discovery', {method:'POST'});
     const data = await res.json();
     if(data.success){
-      status.innerHTML = '<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:12px;border-radius:5px;color:#166534"><b>✅ Job #'+data.job_id+' started!</b><br>You can close the browser now.</div>';
+      status.innerHTML = '<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:12px;border-radius:5px;color:#166534"><b>✅ Job #'+data.job_id+' started!</b><br>Querying Common Crawl + verifying each URL.<br><br><b>You can close the browser now.</b><br>Come back in 10-20 min to see results.</div>';
       loadWixJobs();
     } else {
       status.innerHTML = '<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">Error: '+(data.error||'Unknown')+'</div>';
@@ -2380,11 +2299,12 @@ async function loadWixJobs(){
       let color = '#f59e0b';
       let icon = '🔄';
       if(j.status === 'completed'){ color = '#16a34a'; icon = '✅'; }
+      else if(j.status === 'cancelled'){ color = '#ef4444'; icon = '⏹️'; }
       const pct = j.total > 0 ? Math.round((j.processed / j.total) * 100) : 0;
       html += '<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+color+'">';
       html += '<div><b>'+icon+' Job #'+j.id+'</b> — '+j.saved+' real stores saved ('+j.processed+'/'+j.total+' verified)<br>';
       html += '<span style="font-size:12px;color:#666">'+j.created_at+' · found '+j.found+' candidates</span></div>';
-      html += '<div style="margin-top:8px;background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+pct+'%;height:14px;background:'+color+'"></div></div>';
+      html += '<div style="margin-top:8px;background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+pct+'%;height:14px;background:'+color+';text-align:center;color:white;font-size:11px;line-height:14px">'+pct+'%</div></div>';
       html += '</div>';
     });
     c.innerHTML = html;
@@ -2403,6 +2323,7 @@ async function loadWixStores(){
       html += '<div style="background:#f9f9f9;padding:10px;border-radius:6px;margin:6px 0;border-left:4px solid #0d9488">';
       html += '<b><a href="https://'+s.domain+'" target="_blank" style="color:#3b82f6">'+s.domain+'</a></b>';
       if(s.country) html += ' <span style="font-size:11px;background:#e0f2fe;color:#0369a1;padding:2px 6px;border-radius:4px">'+s.country+'</span>';
+      html += ' <span style="font-size:11px;color:#666">('+s.source+')</span>';
       html += '</div>';
     });
     if(data.stores.length > 50){ html += '<p style="color:#666;font-size:13px">... and '+(data.stores.length - 50)+' more</p>'; }
@@ -2416,302 +2337,11 @@ async function clearWixStores(){
   loadWixStores();
 }
 
-async function loadWarehouseStats(){
-  try{
-    const r = await fetch('/wix/warehouse');
-    const d = await r.json();
-    let rows = '';
-    (d.daily_last_14||[]).slice(0,5).forEach(x => { rows += '<div>'+x.date+': <b>+'+x.count+'</b></div>'; });
-    document.getElementById('warehouseStats').innerHTML = '<div><b>Total:</b> '+d.total+' | <b>Pending:</b> '+d.pending+' | <b>Processing:</b> '+d.processing+'</div><div style="margin-top:6px;color:#666">Last 5 days:</div>'+rows;
-  }catch(e){ document.getElementById('warehouseStats').textContent = 'Error'; }
-}
-async function ingestNow(){
-  const s = document.getElementById('ingestStatus');
-  s.innerHTML = '<p style="color:#666">⏳ Ingesting…</p>';
-  try{
-    const r = await fetch('/wix/ingest', {method:'POST', headers:{'X-Cron-Secret': 'MANUAL_FROM_UI'}});
-    const d = await r.json();
-    if(d.status === 'ok'){ s.innerHTML = '<div style="color:#166534;background:#f0fdf4;padding:10px;border-radius:5px"><b>✅ +'+d.new+' new</b> (skipped '+d.duplicates_skipped+')</div>'; loadWarehouseStats(); }
-    else { s.innerHTML = '<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">Error: '+(d.error||'Unknown')+'</div>'; }
-  }catch(e){ s.innerHTML = '<div style="color:red">Error: '+e.message+'</div>'; }
-}
-async function pullFromWarehouse(){
-  const s = document.getElementById('pullStatus');
-  const n = parseInt(document.getElementById('wixPullCount').value) || 500;
-  s.innerHTML = '<p style="color:#666">⏳ Pulling…</p>';
-  try{
-    const r = await fetch('/wix/request', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({count: n})});
-    const d = await r.json();
-    if(d.success && d.pulled > 0){ s.innerHTML = '<div style="color:#166534;background:#f0fdf4;padding:10px;border-radius:5px"><b>✅ Pulled '+d.pulled+'</b>. Redirecting…</div>'; sessionStorage.setItem('wix_pending_domains', d.domains.join('\\n')); setTimeout(()=>window.location.href='/wix/finder', 800); }
-    else if(d.pulled === 0){ s.innerHTML = '<div style="color:#721c24;background:#f8d7da;padding:10px;border-radius:5px">No pending rows.</div>'; }
-  }catch(e){ s.innerHTML = '<div style="color:red">Error: '+e.message+'</div>'; }
-}
-async function resetWarehouse(){ if(!confirm('Reset?')) return; const r = await fetch('/wix/warehouse/reset',{method:'POST'}); const d = await r.json(); if(d.success) { alert('✅ Reset '+d.reset+' rows'); loadWarehouseStats(); } }
-window.onload = function(){ loadWixJobs(); loadWixStores(); loadWarehouseStats(); };
+function sendAllToWixFinder(){ alert('Wix Email Finder is coming in Step 2!'); }
+
+window.onload = function(){ loadWixJobs(); loadWixStores(); setInterval(loadWixJobs, 5000); };
 </script>'''
     return render_page("Wix Store Finder", body)
-
-# ==========================================
-# WIX EMAIL FINDER PAGE
-# ==========================================
-@app.route('/wix/finder')
-@login_required
-def wix_finder_page():
-    body = '''<div style="max-width:900px;margin:20px auto;padding:20px">
-<div style="background:linear-gradient(135deg,#0d9488,#0891b2);color:white;padding:20px;border-radius:10px;margin-bottom:20px">
-<h1 style="margin:0">📧 Wix Email Finder</h1>
-</div>
-<div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
-<h3 style="margin-top:0">📥 URLs to Scan</h3>
-<textarea id="urls" style="width:100%;height:200px;padding:12px;border:2px solid #ddd;border-radius:8px;font-size:13px;font-family:monospace;box-sizing:border-box" placeholder="example.wixsite.com"></textarea>
-<button onclick="startFinder()" style="background:#0d9488;color:white;padding:12px;border:none;border-radius:8px;cursor:pointer;font-size:16px;width:100%;margin:10px 0">🚀 Find Emails (Background)</button>
-<div id="result"></div>
-</div>
-<div style="background:white;padding:20px;border-radius:10px">
-<h3 style="margin-top:0">📋 Last 3 Jobs</h3>
-<div id="jobsList">Loading…</div>
-</div>
-</div>
-<script>
-window.onload = function(){
-  const c = sessionStorage.getItem('wix_pending_domains');
-  if(c){ document.getElementById('urls').value = c; sessionStorage.removeItem('wix_pending_domains'); }
-  loadJobs(); setInterval(loadJobs, 5000);
-};
-async function startFinder(){
-  const stores = document.getElementById('urls').value.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);
-  if(stores.length===0){ alert('Enter URLs'); return; }
-  const result = document.getElementById('result');
-  result.innerHTML = '<p style="color:#666">⏳ Starting…</p>';
-  try{
-    const r = await fetch('/wix/start-email-finder-job', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({urls: stores})});
-    const d = await r.json();
-    if(d.success){ result.innerHTML = '<div style="color:#166534;background:#f0fdf4;padding:12px;border-radius:5px"><b>✅ Job #'+d.job_id+' started</b>. Close browser if you want.</div>'; document.getElementById('urls').value=''; loadJobs(); }
-    else { result.innerHTML = '<div style="color:red">Error: '+(d.error||'Unknown')+'</div>'; }
-  }catch(e){ result.innerHTML = '<div style="color:red">Error: '+e.message+'</div>'; }
-}
-async function loadJobs(){
-  try{
-    const r = await fetch('/wix/get-email-finder-jobs'); const d = await r.json();
-    const c = document.getElementById('jobsList');
-    if(!d.jobs || d.jobs.length===0){ c.innerHTML = '<p style="color:#666">No jobs yet.</p>'; return; }
-    let html = '';
-    d.jobs.forEach(j => {
-      const color = j.status === 'completed' ? '#16a34a' : '#f59e0b';
-      html += '<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+color+'">';
-      html += '<b>Job #'+j.id+'</b> — '+j.emails+' emails from '+j.total+' stores<br>';
-      html += '<button onclick="viewJob('+j.id+')" style="background:#3b82f6;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px;margin-top:6px">View</button>';
-      if(j.status === 'completed' && j.emails > 0){
-        html += ' <button onclick="toVerify('+j.id+')" style="background:#f59e0b;color:white;padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px;margin-top:6px">→ Verify</button>';
-      }
-      html += '<div id="job-'+j.id+'" style="display:none;margin-top:10px"></div></div>';
-    });
-    c.innerHTML = html;
-  }catch(e){}
-}
-async function viewJob(id){
-  const c = document.getElementById('job-'+id);
-  if(c.style.display === 'block'){ c.style.display='none'; return; }
-  c.innerHTML = 'Loading…'; c.style.display='block';
-  try{
-    const r = await fetch('/wix/get-email-finder-job/'+id); const d = await r.json();
-    if(!d.results || d.results.length === 0){ c.innerHTML = '<p style="color:#666">No results yet.</p>'; return; }
-    let html = '<div style="background:white;padding:10px;border-radius:6px;max-height:300px;overflow-y:auto;font-size:13px">';
-    d.results.forEach(r => {
-      html += '<div style="padding:8px 0;border-bottom:1px solid #eee"><b>'+r.store+'</b>';
-      (r.emails||[]).forEach(e => { html += '<div style="padding-left:14px">📧 '+e+'</div>'; });
-      html += '</div>';
-    });
-    c.innerHTML = html + '</div>';
-  }catch(e){ c.innerHTML = 'Error'; }
-}
-async function toVerify(id){
-  try{
-    const r = await fetch('/wix/get-email-finder-job/'+id); const d = await r.json();
-    if(!d.results) return;
-    const pairs = [];
-    d.results.forEach(r => { (r.emails||[]).forEach(e => pairs.push({email:e, store:r.store||''})); });
-    if(pairs.length === 0){ alert('No emails'); return; }
-    await fetch('/wix/store-emails', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({pairs: pairs})});
-    alert('✅ '+pairs.length+' emails saved. Go to Wix Verify → From Finder.');
-  }catch(e){ alert('Error: '+e.message); }
-}
-</script>'''
-    return render_page("Wix Email Finder", body)
-
-# ==========================================
-# WIX VERIFY PAGE
-# ==========================================
-@app.route('/wix/verify')
-@login_required
-def wix_verify_page():
-    body = '''<div style="max-width:900px;margin:20px auto;padding:20px">
-<div style="background:#f59e0b;color:white;padding:20px;border-radius:10px;margin-bottom:20px"><h1 style="margin:0">✅ Wix Verify</h1></div>
-<div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
-<h3 style="margin-top:0">📋 Last 3 Jobs</h3>
-<div id="jobsList">Loading…</div>
-</div>
-<div style="background:white;padding:20px;border-radius:10px">
-<textarea id="emailsInput" style="width:100%;height:180px;border:1px solid #ddd;border-radius:5px;padding:10px;font-family:monospace;box-sizing:border-box"></textarea>
-<button onclick="fromFinder()" style="background:#0d9488;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-right:8px;margin-top:8px">📥 From Wix Finder</button>
-<button onclick="startVerify()" style="background:#f59e0b;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-top:8px">▶️ Start Verify</button>
-<div id="startMsg" style="margin-top:10px"></div>
-</div></div>
-<script>
-async function fromFinder(){ const r = await fetch('/wix/get-wix-emails'); const d = await r.json(); if(d.emails && d.emails.length > 0){ document.getElementById('emailsInput').value = d.emails.join('\\n'); alert('Loaded '+d.emails.length); } else { alert('No Wix emails yet'); } }
-async function startVerify(){ const emails = document.getElementById('emailsInput').value.split('\\n').map(s=>s.trim()).filter(s=>s.length>0); if(emails.length===0){ alert('Enter emails'); return; } const name = 'Wix Job '+new Date().toLocaleString(); try{ const r = await fetch('/wix/verify-async', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({emails: emails, name: name})}); const d = await r.json(); if(d.success){ document.getElementById('startMsg').innerHTML='<p style="color:green">✅ Job #'+d.job_id+' started</p>'; refreshJobs(); } }catch(e){} }
-async function refreshJobs(){ const r = await fetch('/wix/verify-jobs'); const d = await r.json(); const c = document.getElementById('jobsList'); if(!d.jobs || d.jobs.length===0){ c.innerHTML='<p style="color:#666">No jobs yet.</p>'; return; } let html=''; d.jobs.forEach(j => { const pct = j.total>0?Math.round((j.processed/j.total)*100):0; const sc = j.status==='completed'?'#0d9488':(j.status==='running'?'#f59e0b':'#ef4444'); html += '<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+sc+'"><b>'+j.name+'</b><div style="background:#e0e0e0;border-radius:8px;overflow:hidden;margin-top:8px"><div style="width:'+pct+'%;height:16px;background:'+sc+';text-align:center;color:white;font-size:11px;line-height:16px">'+pct+'%</div></div><div style="font-size:13px;margin-top:6px">'+j.processed+'/'+j.total+' | ✅ '+j.valid+' | ❌ '+j.invalid+'</div></div>'; }); c.innerHTML = html; }
-window.onload = function(){ refreshJobs(); setInterval(refreshJobs, 10000); };
-</script>'''
-    return render_page("Wix Verify", body)
-
-# ==========================================
-# WIX SCOUT PAGE
-# ==========================================
-@app.route('/wix/scout')
-@login_required
-def wix_scout_page():
-    body = '''<div style="max-width:900px;margin:20px auto;padding:20px">
-<div style="background:#8b5cf6;color:white;padding:20px;border-radius:10px;margin-bottom:20px"><h1 style="margin:0">📨 Wix Scout</h1></div>
-<div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
-<h3 style="margin-top:0">📥 Recipients</h3>
-<button onclick="fromVerified()" style="background:#f59e0b;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;font-size:13px;margin-bottom:10px">✅ From Wix Verified</button>
-<textarea id="emailsInput" style="width:100%;height:160px;padding:10px;border:1px solid #ddd;border-radius:5px;font-family:monospace;box-sizing:border-box"></textarea>
-<div id="count" style="margin-top:10px;font-weight:bold">0 recipients</div>
-</div>
-<div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
-<h3 style="margin-top:0">✍️ Template</h3>
-<input type="text" id="subjectLine" placeholder="Subject" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;margin-bottom:10px;box-sizing:border-box">
-<textarea id="messageBody" rows="5" placeholder="Message" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;box-sizing:border-box"></textarea>
-</div>
-<div style="background:white;padding:20px;border-radius:10px">
-<button onclick="start()" style="background:#8b5cf6;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer">▶️ Start</button>
-<button onclick="stop()" style="background:#ef4444;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer">⏹️ Stop</button>
-</div></div>
-<script>
-let recipients=[], i=0, running=false;
-async function fromVerified(){ const r = await fetch('/wix/get-wix-verified-emails'); const d = await r.json(); if(d.emails && d.emails.length > 0){ document.getElementById('emailsInput').value = d.emails.join('\\n'); recipients = d.emails; document.getElementById('count').textContent = recipients.length+' recipients'; } else { alert('No verified Wix emails'); } }
-function start(){ const v = document.getElementById('emailsInput').value; recipients = v.split('\\n').map(s=>s.trim()).filter(s=>s.length>0); if(recipients.length===0){ alert('None'); return; } running=true; i=0; next(); }
-function stop(){ running=false; }
-function next(){ if(!running) return; if(i >= recipients.length){ running=false; return; } const e = recipients[i]; const subj = document.getElementById('subjectLine').value; const body = document.getElementById('messageBody').value; window.location.href = 'mailto:' + e + '?subject=' + encodeURIComponent(subj) + '&body=' + encodeURIComponent(body); i++; }
-document.addEventListener('visibilitychange', function(){ if(document.visibilityState==='visible' && running) setTimeout(next, 2000); });
-</script>'''
-    return render_page("Wix Scout", body)
-
-# ==========================================
-# WIX AUDIT PAGE
-# ==========================================
-@app.route('/wix/audit')
-@login_required
-def wix_audit_page():
-    user_email = session.get('user_id')
-    sender_name = get_user_sender_name(user_email) or ''
-    current_limit = get_send_limit(user_email)
-    body = '''<div style="max-width:900px;margin:20px auto;padding:20px">
-<div style="background:#65a30d;color:white;padding:20px;border-radius:10px;margin-bottom:20px">
-<h1 style="margin:0">🚀 Wix Analyze & Send</h1>
-<p style="margin:4px 0 0 0;font-size:14px">Wix-specific audit — extracts top products from HTML</p>
-</div>
-<div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
-<h3 style="margin-top:0">📥 Import Wix Emails</h3>
-<button onclick="imp('finder')" style="background:#0d9488;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:13px">🔍 From Wix Finder</button>
-<button onclick="imp('verified')" style="background:#f59e0b;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:13px">✅ From Wix Verified</button>
-<div id="importStatus" style="margin-top:10px"></div>
-</div>
-<div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
-<h3 style="margin-top:0">📋 Queue (<span id="queueCount">0</span>)</h3>
-<div id="queueList" style="margin-top:12px">Loading…</div>
-</div>
-<div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
-<h3 style="margin-top:0">🚀 Process</h3>
-<label style="font-weight:bold;font-size:13px">Your name:</label>
-<input type="text" id="senderName" value="''' + sender_name.replace('"','') + '''" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:5px;margin:5px 0 15px 0;box-sizing:border-box">
-<button onclick="analyzeNext()" style="background:#3b82f6;color:white;padding:12px 24px;border:none;border-radius:8px;cursor:pointer;font-size:15px">▶️ Analyze Next</button>
-<div id="status" style="margin-top:10px"></div>
-</div>
-<div id="auditSection" style="display:none">
-<div id="label" style="background:#65a30d;color:white;padding:10px;border-radius:8px;font-weight:bold;margin-bottom:15px"></div>
-<div id="result"></div>
-<div id="outreach" style="display:none;background:white;padding:20px;border-radius:10px;margin-top:20px">
-<h3 style="margin-top:0">✉️ Email</h3>
-<label style="font-weight:bold">Subject:</label>
-<input type="text" id="genSubject" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;margin:5px 0 10px 0;box-sizing:border-box">
-<label style="font-weight:bold">Message:</label>
-<textarea id="genBody" rows="10" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;font-family:monospace;box-sizing:border-box"></textarea>
-<button onclick="sendIt()" style="background:#0d9488;color:white;padding:12px 24px;border:none;border-radius:6px;cursor:pointer;font-size:15px;margin-top:12px;margin-right:8px">📨 Send & Open Gmail</button>
-<button onclick="skipIt()" style="background:#6b7280;color:white;padding:12px 24px;border:none;border-radius:6px;cursor:pointer;font-size:15px;margin-top:12px">⏭️ Skip</button>
-</div>
-</div>
-</div>
-<script>
-let currentItem = null, currentReport = null;
-async function imp(source){
-  const s = document.getElementById('importStatus');
-  s.innerHTML = '<p style="color:#666">⏳ Importing…</p>';
-  try{
-    const r = await fetch('/wix/import-to-queue', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({source: source})});
-    const d = await r.json();
-    if(d.success){ s.innerHTML = '<p style="color:green">✅ Added '+d.added+' (skipped '+d.skipped+')</p>'; loadQueue(); }
-    else { s.innerHTML = '<p style="color:red">Error: '+(d.error||'Unknown')+'</p>'; }
-  }catch(e){ s.innerHTML = '<p style="color:red">Error: '+e.message+'</p>'; }
-}
-async function loadQueue(){
-  const r = await fetch('/wix/get-audit-queue'); const d = await r.json();
-  document.getElementById('queueCount').textContent = d.items.length;
-  const c = document.getElementById('queueList');
-  if(d.items.length === 0){ c.innerHTML = '<p style="color:#666">Queue empty.</p>'; return; }
-  let html = '';
-  d.items.forEach(i => {
-    const color = i.status==='done'?'#16a34a':(i.status==='current'?'#3b82f6':(i.status==='skipped'?'#6b7280':'#f59e0b'));
-    html += '<div style="padding:10px;border-radius:6px;margin:6px 0;background:#f9f9f9;border-left:4px solid '+color+'"><b>'+i.email+'</b><br><span style="color:#666;font-size:12px">'+i.domain+'</span></div>';
-  });
-  c.innerHTML = html;
-}
-async function analyzeNext(){
-  const r = await fetch('/wix/get-next-pending'); const d = await r.json();
-  if(!d.item){ alert('Queue empty'); return; }
-  currentItem = d.item;
-  document.getElementById('auditSection').style.display='block';
-  document.getElementById('result').innerHTML='<p style="color:#666;padding:20px;text-align:center">⏳ Analyzing Wix store… (extracts top products)</p>';
-  document.getElementById('outreach').style.display='none';
-  await fetch('/wix/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id: currentItem.id, status:'current'})});
-  try{
-    const r = await fetch('/wix/analyze-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id: currentItem.id})});
-    const d = await r.json();
-    if(d.success){
-      currentReport = d.item.report;
-      document.getElementById('label').textContent = '📧 '+d.item.email+' → '+d.item.domain;
-      renderReport(d.item.report);
-      document.getElementById('outreach').style.display='block';
-      await genEmail();
-      loadQueue();
-    } else { document.getElementById('result').innerHTML = '<p style="color:red">Error</p>'; }
-  }catch(e){ document.getElementById('result').innerHTML = '<p style="color:red">Error: '+e.message+'</p>'; }
-}
-function bar(l,s){ const c = s>=75?'#16a34a':(s>=50?'#f59e0b':'#ef4444'); return '<div style="margin:10px 0"><b>'+l+'</b> <span style="color:'+c+';font-weight:bold">'+s+'%</span><div style="background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+s+'%;height:12px;background:'+c+'"></div></div></div>'; }
-function renderReport(r){
-  const sc = r.scores||{}, iss = r.issues||[], prods = r.top_products||[];
-  let h = '<div style="background:white;padding:20px;border-radius:10px;margin-bottom:15px"><h3 style="margin-top:0">Scores</h3>'+bar('Overall', sc.overall_score||0)+bar('Trust', sc.trust_score||0)+bar('Technical', sc.technical_score||0)+bar('Marketing', sc.marketing_score||0)+'</div>';
-  if(prods.length > 0){ h += '<div style="background:white;padding:20px;border-radius:10px;margin-bottom:15px"><h3 style="margin-top:0">🛍️ Top Products Detected</h3>'; prods.forEach(p => { h += '<div style="padding:8px 0;border-bottom:1px solid #eee"><b>'+p.title+'</b>'+(p.price?' — '+p.price:'')+'</div>'; }); h += '</div>'; }
-  if(iss.length > 0){ h += '<div style="background:white;padding:20px;border-radius:10px"><h3 style="margin-top:0;color:#991b1b">⚠️ Issues</h3>'; iss.forEach(i => { h += '<div style="background:#fef2f2;border-left:4px solid #ef4444;padding:10px;border-radius:6px;margin:8px 0"><b>'+i.title+'</b><div style="font-size:13px">'+i.description+'</div></div>'; }); h += '</div>'; }
-  document.getElementById('result').innerHTML = h;
-}
-async function genEmail(){
-  const r = await fetch('/wix/generate-email', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({report: currentReport, tone:'friendly', sender_name: document.getElementById('senderName').value, email: currentItem.email})});
-  const d = await r.json();
-  if(d.success){ document.getElementById('genSubject').value = d.subject; document.getElementById('genBody').value = d.body; }
-}
-async function sendIt(){
-  if(!currentItem) return;
-  await fetch('/wix/mark-sent', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email: currentItem.email})});
-  await fetch('/wix/delete-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id: currentItem.id})});
-  loadQueue();
-  window.location.href = 'mailto:' + currentItem.email + '?subject=' + encodeURIComponent(document.getElementById('genSubject').value) + '&body=' + encodeURIComponent(document.getElementById('genBody').value);
-}
-async function skipIt(){ if(!currentItem) return; await fetch('/wix/update-queue-item',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentItem.id,status:'skipped'})}); document.getElementById('auditSection').style.display='none'; currentItem=null; loadQueue(); }
-window.onload = loadQueue;
-</script>'''
-    return render_page("Wix Analyze & Send", body)
 
 # ==========================================
 # WIX API ROUTES
@@ -2768,339 +2398,1228 @@ def clear_wix_stores_route():
     finally: release_db(conn)
 
 # ==========================================
-# WIX WAREHOUSE ROUTES
+# DISCOVERY API (Shopify)
 # ==========================================
-@app.route('/wix/ingest', methods=['GET', 'POST'])
-def wix_ingest_route():
-    header_secret = request.headers.get('X-Cron-Secret', '')
-    cron_secret = os.environ.get('CRON_SECRET', '')
-    valid_cron = bool(cron_secret) and header_secret == cron_secret
-    valid_user = ('user_id' in session) and header_secret == 'MANUAL_FROM_UI'
-    if not (valid_cron or valid_user):
-        return jsonify({'status': 'error', 'error': 'forbidden'}), 403
-    if valid_user and not valid_cron:
-        try:
-            import importlib
-            import ingest_leadita
-            importlib.reload(ingest_leadita)
-            result = ingest_leadita.run(get_db, release_db)
-            code = 200 if result.get('status') == 'ok' else 500
-            return jsonify(result), code
-        except Exception as e:
-            return jsonify({'status': 'error', 'error': str(e)[:300]}), 500
-    def _bg():
-        try:
-            import importlib, ingest_leadita
-            importlib.reload(ingest_leadita)
-            print(f"🕒 [cron] {ingest_leadita.run(get_db, release_db)}")
-        except Exception as e:
-            print(f"🕒 [cron] error: {e}")
-    threading.Thread(target=_bg, daemon=True).start()
-    return jsonify({'status': 'accepted'}), 202
-
-@app.route('/wix/warehouse')
+@app.route('/import-from-huggingface', methods=['POST'])
 @login_required
-def wix_warehouse_status():
+def import_from_hf():
+    user_email = session.get('user_id')
+    count = int(request.json.get('count', 200))
+    if count < 10: count = 10
+    if count > 1000: count = 1000
+    result = do_hf_import(user_email, count)
+    return jsonify(result)
+
+@app.route('/get-hf-history')
+@login_required
+def get_hf_history_route():
+    user_email = session.get('user_id')
+    return jsonify({'history': get_hf_history(user_email)})
+
+@app.route('/get-hf-import/<int:import_id>')
+@login_required
+def get_hf_import_detail_route(import_id):
+    user_email = session.get('user_id')
+    return jsonify({'domains': get_hf_import_detail(import_id, user_email)})
+
+@app.route('/run-discovery', methods=['POST'])
+@login_required
+def run_discovery():
+    user_email = session.get('user_id')
+    method = request.json.get('method', 'all')
+    by_method = {}; all_found = []
+    try:
+        if method in ['shodan', 'all']:
+            r = discover_via_shodan(limit=5); by_method['shodan'] = len(r); all_found.extend(r)
+        if method in ['theme', 'all']:
+            r = discover_via_theme_showcase(); by_method['theme'] = len(r); all_found.extend(r)
+        if method in ['search', 'all']:
+            r = discover_via_search(''); by_method['search'] = len(r); all_found.extend(r)
+        if method in ['related', 'all']:
+            r = discover_via_related(user_email); by_method['related'] = len(r); all_found.extend(r)
+        unique = {}
+        for s in all_found: unique[s['domain']] = s
+        found_list = list(unique.values())
+        saved = save_discovered(user_email, found_list) if found_list else 0
+        return jsonify({'success': True, 'found': len(found_list), 'saved': saved, 'by_method': by_method})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+def discover_via_shodan(limit=5):
+    discovered = []; seen_roots = set()
+    for ip in SHOPIFY_IPS[:limit]:
+        try:
+            url = f"https://api.shodan.io/shodan/host/{ip}?key={SHODAN_API_KEY}"
+            r = requests.get(url, timeout=15)
+            if r.status_code == 200:
+                for hn in r.json().get('hostnames', []):
+                    root = root_domain(hn)
+                    if "shopify" in root: continue
+                    if '.' not in root or len(root) < 5: continue
+                    if root in seen_roots: continue
+                    seen_roots.add(root)
+                    discovered.append({'domain': root, 'source': 'shodan'})
+            elif r.status_code == 403: break
+            time.sleep(1)
+        except: continue
+    return discovered
+
+def discover_via_theme_showcase():
+    discovered = []; seen = set()
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    for page in ["https://themes.shopify.com/themes?sort_by=most_recent","https://themes.shopify.com/themes?sort_by=popular"]:
+        try:
+            r = requests.get(page, headers=headers, timeout=15)
+            if r.status_code == 200:
+                for m in re.findall(r'https://([a-z0-9\-]+)\.myshopify\.com', r.text, re.IGNORECASE):
+                    if m in seen or m in ['www','cdn','checkout','account','admin']: continue
+                    seen.add(m)
+                    discovered.append({'domain': f"{m}.myshopify.com", 'source': 'theme_showcase'})
+        except: continue
+    return discovered
+
+def discover_via_search(keyword=''):
+    discovered = []; seen_roots = set()
+    try:
+        query = f'"Powered by Shopify" {keyword}'.strip()
+        url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+        r = requests.post(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            for link in re.findall(r'class="result__a" href="(.*?)"', r.text)[:30]:
+                if "uddg=" in link:
+                    import urllib.parse
+                    parsed = urllib.parse.parse_qs(urllib.parse.urlparse(link).query)
+                    if 'uddg' in parsed: link = parsed['uddg'][0]
+                clean = link.replace("https://", "").replace("http://", "").split("/")[0]
+                root = root_domain(clean)
+                if "shopify.com" in root or "duckduckgo" in root: continue
+                if root in seen_roots: continue
+                seen_roots.add(root)
+                discovered.append({'domain': root, 'source': 'search'})
+    except: pass
+    return discovered
+
+def discover_via_related(user_email):
+    discovered = []; seen_roots = set()
     conn = get_db()
-    if not conn: return jsonify({'error': 'no db'}), 500
+    if not conn: return discovered
     try:
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM wix_warehouse")
-        total = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM wix_warehouse WHERE status='pending'")
-        pending = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM wix_warehouse WHERE status='processing'")
-        processing = cur.fetchone()[0]
-        cur.execute("""SELECT DATE(created_at) AS d, COUNT(*) AS c FROM wix_warehouse
-            GROUP BY DATE(created_at) ORDER BY DATE(created_at) DESC LIMIT 14""")
-        daily = [{'date': str(r[0]), 'count': r[1]} for r in cur.fetchall()]
-        cur.close()
-        return jsonify({'total': total, 'pending': pending, 'processing': processing, 'daily_last_14': daily})
-    except Exception as e:
-        return jsonify({'error': str(e)[:200]}), 500
+        cur.execute("SELECT domain FROM discovered_stores WHERE user_email = %s LIMIT 5", (user_email,))
+        seeds = [r[0] for r in cur.fetchall()]; cur.close()
     finally: release_db(conn)
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    for seed in seeds:
+        try:
+            r = requests.get(f"https://{seed}", headers=headers, timeout=8)
+            if r.status_code == 200:
+                for ext in re.findall(r'href="https?://([a-zA-Z0-9\.\-]+)"', r.text)[:20]:
+                    root = root_domain(ext)
+                    if root == seed or root in seen_roots: continue
+                    if any(s in root for s in ['shopify','facebook','instagram','twitter','youtube','tiktok','pinterest','google','apple']): continue
+                    if '.' not in root or len(root) < 5: continue
+                    seen_roots.add(root)
+                    discovered.append({'domain': root, 'source': 'related'})
+        except: continue
+    return discovered
 
-@app.route('/wix/request', methods=['POST'])
-@login_required
-def wix_request():
-    data = request.get_json(silent=True) or {}
-    n = int(data.get('count', 500)); n = max(1, min(n, 5000))
+def save_discovered(user_email, stores):
     conn = get_db()
-    if not conn: return jsonify({'success': False, 'error': 'No DB'})
+    if not conn: return 0
+    saved = 0
     try:
         cur = conn.cursor()
-        cur.execute("""UPDATE wix_warehouse SET status='processing'
-            WHERE id IN (SELECT id FROM wix_warehouse WHERE status='pending'
-            ORDER BY created_at DESC LIMIT %s) RETURNING domain""", (n,))
-        rows = cur.fetchall(); conn.commit(); cur.close()
-        domains = [r[0] for r in rows]
-        return jsonify({'success': True, 'pulled': len(domains), 'domains': domains})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)[:200]})
+        for store in stores:
+            try:
+                cur.execute("""INSERT INTO discovered_stores (user_email, domain, source)
+                    VALUES (%s, %s, %s) ON CONFLICT (user_email, domain) DO NOTHING""",
+                    (user_email, store['domain'], store.get('source', 'unknown')))
+                if cur.rowcount > 0: saved += 1
+            except: pass
+        conn.commit(); cur.close()
+    except: pass
+    finally: release_db(conn)
+    return saved
+
+@app.route('/get-discovered')
+@login_required
+def get_discovered():
+    user_email = session.get('user_id')
+    conn = get_db()
+    if not conn: return jsonify({'stores': []})
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT domain, source, discovered_at FROM discovered_stores WHERE user_email = %s ORDER BY discovered_at DESC LIMIT 10000", (user_email,))
+        rows = cur.fetchall(); cur.close()
+        return jsonify({'stores': [{'domain': r[0], 'source': r[1], 'discovered_at': str(r[2])[:16]} for r in rows]})
+    except: return jsonify({'stores': []})
     finally: release_db(conn)
 
-@app.route('/wix/warehouse/reset', methods=['POST'])
+@app.route('/clear-discovered', methods=['POST'])
 @login_required
-def wix_warehouse_reset():
+def clear_discovered():
+    user_email = session.get('user_id')
     conn = get_db()
     if not conn: return jsonify({'success': False})
     try:
         cur = conn.cursor()
-        cur.execute("UPDATE wix_warehouse SET status='pending' WHERE status='processing'")
-        n = cur.rowcount; conn.commit(); cur.close()
-        return jsonify({'success': True, 'reset': n})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)[:200]})
+        cur.execute("DELETE FROM discovered_stores WHERE user_email = %s", (user_email,))
+        conn.commit(); cur.close()
+        return jsonify({'success': True})
+    except: return jsonify({'success': False})
     finally: release_db(conn)
 
 # ==========================================
-# WIX EMAIL FINDER API
+# VERIFY PAGE
 # ==========================================
-@app.route('/wix/start-email-finder-job', methods=['POST'])
+@app.route('/verify')
 @login_required
-def wix_start_email_finder_job():
+def verify_page():
+    body = '''<div style="max-width:800px;margin:20px auto;padding:20px">
+<div style="background:#f59e0b;color:white;padding:20px;border-radius:10px;margin-bottom:20px"><h1 style="margin:0">✅ Verify Emails</h1></div>
+<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
+<h3 style="margin-top:0">📋 Last 3 Jobs</h3>
+<div id="jobsList">Loading...</div>
+</div>
+<div style="background:white;padding:20px;border-radius:10px">
+<textarea id="emailsInput" style="width:100%;height:180px;border:1px solid #ddd;border-radius:5px;padding:10px;font-family:monospace;box-sizing:border-box"></textarea>
+<button onclick="loadFromFinder()" style="background:#f59e0b;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-right:8px;margin-top:8px">📥 From Finder</button>
+<button onclick="startBackgroundVerify()" style="background:#0d9488;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-top:8px">▶️ Start Verify</button>
+<div id="startMsg" style="margin-top:10px"></div>
+</div></div>
+<script>
+async function loadFromFinder(){const res=await fetch('/get-stored-emails');const data=await res.json();if(data.emails&&data.emails.length>0){document.getElementById('emailsInput').value=data.emails.join('\\n');alert('Loaded '+data.emails.length)}}
+async function startBackgroundVerify(){const emails=document.getElementById('emailsInput').value.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);if(emails.length===0){alert('Enter emails');return}const name='Job '+new Date().toLocaleString();document.getElementById('startMsg').innerHTML='<p style="color:#666">Starting...</p>';try{const res=await fetch('/verify-async',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({emails:emails,name:name||'Untitled'})});const data=await res.json();if(data.success){document.getElementById('startMsg').innerHTML='<p style="color:green">✅ Job #'+data.job_id+' started!</p>';document.getElementById('emailsInput').value='';refreshJobs()}}catch(e){document.getElementById('startMsg').innerHTML='<p style="color:red">Error: '+e+'</p>'}}
+async function refreshJobs(){const res=await fetch('/verify-jobs');const data=await res.json();const container=document.getElementById('jobsList');if(!data.jobs||data.jobs.length===0){container.innerHTML='<p style="color:#666">No jobs yet.</p>';return}let html='';data.jobs.forEach(job=>{const percent=job.total>0?Math.round((job.processed/job.total)*100):0;const sc=job.status==='completed'?'#0d9488':(job.status==='running'?'#f59e0b':'#ef4444');const si=job.status==='completed'?'✅':(job.status==='running'?'🔄':'⏹️');html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+sc+'"><div style="font-weight:bold">'+si+' '+job.name+'</div><div style="margin-top:8px;background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+percent+'%;height:16px;background:'+sc+';text-align:center;color:white;font-size:11px;line-height:16px">'+percent+'%</div></div><div style="font-size:13px;margin-top:6px">'+job.processed+' / '+job.total+' | ✅ '+job.valid+' | ❌ '+job.invalid+'</div></div>'});container.innerHTML=html}
+window.onload=function(){refreshJobs();setInterval(refreshJobs,10000)};
+</script>'''
+    return render_page("Verify", body)
+
+# ==========================================
+# SCOUT
+# ==========================================
+@app.route('/scout')
+@login_required
+def scout():
+    body = '''<div style="max-width:800px;margin:20px auto;padding:20px">
+<div style="background:#0d9488;color:white;padding:20px;border-radius:10px;margin-bottom:20px"><h1 style="margin:0">📨 Email Scout</h1></div>
+<div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
+<h3 style="margin-top:0">📥 Recipients</h3>
+<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+<button onclick="loadFromFinder()" style="background:#667eea;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;font-size:13px">📥 From Finder</button>
+<button onclick="loadFromVerified()" style="background:#f59e0b;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;font-size:13px">✅ From Verified</button>
+<button onclick="clearRecipients()" style="background:#ef4444;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;font-size:13px">🗑️ Clear</button>
+</div>
+<textarea id="emailsInput" oninput="syncRecipients()" style="width:100%;height:160px;border:1px solid #ddd;border-radius:5px;padding:10px;font-family:monospace;box-sizing:border-box"></textarea>
+<div id="emailCount" style="margin-top:10px;font-weight:bold">0 recipients</div>
+<div id="loadStatus" style="margin-top:6px;font-size:13px"></div>
+</div>
+<div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
+<h3 style="margin-top:0">✍️ Template</h3>
+<input type="text" id="subjectLine" placeholder="Subject" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;margin-bottom:10px;box-sizing:border-box">
+<textarea id="messageBody" rows="5" placeholder="Message" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;box-sizing:border-box"></textarea>
+</div>
+<div style="background:white;padding:20px;border-radius:10px">
+<button onclick="startCampaign()" style="background:#0d9488;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-right:8px">▶️ Start</button>
+<button onclick="stopCampaign()" style="background:#ef4444;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer">⏹️ Stop</button>
+<div id="launchStatus" style="margin-top:10px"></div>
+</div></div>
+<script>
+let recipients=[],scoutedEmails=0,isRunning=false;
+function syncRecipients(){const val=document.getElementById('emailsInput').value;recipients=val.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);document.getElementById('emailCount').textContent=recipients.length+' recipients';saveState()}
+window.onload=async function(){try{const res=await fetch('/load-scout-state');const data=await res.json();
+  if(data.recipients) {recipients = data.recipients;document.getElementById('emailsInput').value = recipients.join('\\n');}
+  if(data.subject) document.getElementById('subjectLine').value = data.subject;
+  if(data.message) document.getElementById('messageBody').value = data.message;
+}catch(e){};document.getElementById('emailCount').textContent=recipients.length+' recipients';};
+
+async function loadFromFinder(){
+  const status = document.getElementById('loadStatus');
+  status.textContent = '⏳ Loading from Finder...';
+  try{
+    const res = await fetch('/get-stored-emails');
+    const data = await res.json();
+    if(!data.emails || data.emails.length === 0){
+      status.innerHTML = '<span style="color:#dc2626">No emails found in Finder results.</span>';
+      return;
+    }
+    document.getElementById('emailsInput').value = data.emails.join('\\n');
+    syncRecipients();
+    status.innerHTML = '<span style="color:#16a34a">✅ Loaded ' + data.emails.length + ' emails from Finder</span>';
+  }catch(e){ status.innerHTML = '<span style="color:#dc2626">Error: ' + e.message + '</span>'; }
+}
+
+async function loadFromVerified(){
+  const status = document.getElementById('loadStatus');
+  status.textContent = '⏳ Loading from last Verify job...';
+  try{
+    const res = await fetch('/get-verified-emails');
+    const data = await res.json();
+    if(!data.emails || data.emails.length === 0){
+      status.innerHTML = '<span style="color:#dc2626">No valid emails from last verify job.</span>';
+      return;
+    }
+    document.getElementById('emailsInput').value = data.emails.join('\\n');
+    syncRecipients();
+    status.innerHTML = '<span style="color:#16a34a">✅ Loaded ' + data.emails.length + ' verified emails</span>';
+  }catch(e){ status.innerHTML = '<span style="color:#dc2626">Error: ' + e.message + '</span>'; }
+}
+
+function clearRecipients(){
+  if(!confirm('Clear all recipients?')) return;
+  document.getElementById('emailsInput').value = '';
+  syncRecipients();
+  document.getElementById('loadStatus').textContent = '';
+}
+
+async function saveState(){try{await fetch('/save-scout-state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients:recipients,subject:document.getElementById('subjectLine').value,message:document.getElementById('messageBody').value,count:scoutedEmails})})}catch(e){}}
+function startCampaign(){if(recipients.length===0){alert('Add recipients');return}isRunning=true;openNextEmail()}
+function stopCampaign(){isRunning=false}
+function openNextEmail(){if(!isRunning)return;if(scoutedEmails>=recipients.length){isRunning=false;return}const email=recipients[scoutedEmails];const subj=document.getElementById('subjectLine').value;const msg=document.getElementById('messageBody').value;const body=msg.replace('{name}','Store Owner').replace('{email}',email);window.location.href='mailto:'+email+'?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(body);scoutedEmails++;saveState()}
+document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible'&&isRunning)setTimeout(openNextEmail,2000)});
+</script>'''
+    return render_page("Scout", body)
+
+# ==========================================
+# ANALYZE & SEND
+# ==========================================
+@app.route('/audit')
+@login_required
+def audit_page():
     user_email = session.get('user_id')
-    urls = request.json.get('urls', [])
-    if not urls: return jsonify({'success': False, 'error': 'No URLs'})
-    conn = get_db()
-    if not conn: return jsonify({'success': False})
+    sender_name = get_user_sender_name(user_email) or ''
+    current_limit = get_send_limit(user_email)
+    body = '''<div style="max-width:900px;margin:20px auto;padding:20px">
+
+<div style="background:#65a30d;color:white;padding:20px;border-radius:10px;margin-bottom:20px;display:flex;align-items:center;gap:16px">
+<svg width="56" height="56" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" style="flex-shrink:0"><path d="M32 4L8 14V30C8 45 19 57 32 60C45 57 56 45 56 30V14L32 4Z" fill="white" opacity="0.25" stroke="white" stroke-width="2" stroke-linejoin="round"/><path d="M22 32L29 39L43 25" stroke="white" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+<div><h1 style="margin:0;font-size:24px">Analyze & Send</h1><p style="margin:4px 0 0 0;font-size:14px;opacity:0.9">Bulk audit + personalized outreach</p></div>
+</div>
+
+<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
+<h3 style="margin-top:0">📥 Import Emails</h3>
+<button onclick="importFrom('finder')" style="background:#667eea;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:13px">🔍 From Finder</button>
+<button onclick="importFrom('verified')" style="background:#f59e0b;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:13px">✅ From Verified</button>
+<button onclick="toggleManual()" style="background:#0d9488;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:13px">✍️ Paste Manual</button>
+<div id="manualPaste" style="display:none;margin-top:10px">
+<textarea id="manualEmails" placeholder="Paste emails one per line" style="width:100%;height:100px;padding:10px;border:1px solid #ddd;border-radius:5px;font-family:monospace;box-sizing:border-box"></textarea>
+<button onclick="addManual()" style="background:#0d9488;color:white;padding:8px 16px;border:none;border-radius:5px;cursor:pointer;margin-top:5px">Add to Queue</button>
+</div>
+<div id="importStatus" style="margin-top:10px"></div>
+</div>
+
+<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
+<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+<h3 style="margin:0">📋 Queue (<span id="queueCount">0</span>)</h3>
+<div style="display:flex;gap:6px;flex-wrap:wrap">
+<button onclick="fixDomains()" style="background:#0891b2;color:white;padding:6px 14px;border:none;border-radius:5px;cursor:pointer;font-size:12px">🔧 Fix Old Domains</button>
+<button onclick="clearQueue('pending')" style="background:#6b7280;color:white;padding:6px 14px;border:none;border-radius:5px;cursor:pointer;font-size:12px">🗑️ Clear Pending</button>
+</div>
+</div>
+<div id="progressBar" style="margin-top:12px;display:none;background:#e0e0e0;border-radius:8px;overflow:hidden">
+<div id="progressFill" style="height:20px;background:linear-gradient(90deg,#4ade80,#22c55e);text-align:center;color:white;font-size:12px;line-height:20px;transition:width 0.3s">0%</div>
+</div>
+<div id="queueList" style="margin-top:12px">Loading...</div>
+</div>
+
+<div id="modeButtons" style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
+<h3 style="margin-top:0">🚀 Start Processing</h3>
+<div style="margin-bottom:10px">
+<label style="font-weight:bold;font-size:13px">Your name:</label>
+<input type="text" id="senderName" value="''' + sender_name.replace('"','') + '''" placeholder="e.g. Daniel Phillips" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:5px;margin:5px 0;box-sizing:border-box;font-size:14px">
+</div>
+
+<div style="margin-bottom:15px">
+<label style="font-weight:bold;font-size:13px;display:flex;align-items:center;gap:8px;cursor:pointer">
+<input type="checkbox" id="includeCatalogue" style="width:18px;height:18px;cursor:pointer">
+<span>🛍️ Include product catalogue insights in emails</span>
+</label>
+<div style="font-size:11px;color:#666;margin-left:26px">Fetches top 50 products to add product data to your outreach (slight speed impact)</div>
+</div>
+
+<div id="sessionCounterBox" style="background:linear-gradient(135deg,#1f2937,#374151);color:white;padding:16px;border-radius:10px;margin-bottom:15px">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+<span style="font-size:15px;font-weight:bold">📧 Sent this session</span>
+<span id="counterText" style="font-size:20px;font-weight:bold">0 / ''' + str(current_limit) + '''</span>
+</div>
+<div style="background:#111827;border-radius:8px;overflow:hidden;height:14px">
+<div id="counterBar" style="width:0%;height:100%;background:linear-gradient(90deg,#22c55e,#16a34a);transition:width 0.3s"></div>
+</div>
+<div id="counterHint" style="font-size:12px;margin-top:8px;opacity:0.85">Auto mode pauses at every milestone. Press Continue to resume.</div>
+
+<div style="margin-top:12px;padding-top:12px;border-top:1px solid #4b5563">
+  <label style="font-size:13px;font-weight:bold;display:block;margin-bottom:6px">⚙️ Pause every N emails:</label>
+  <div style="display:flex;gap:8px;align-items:center">
+    <input type="number" id="limitInput" value="''' + str(current_limit) + '''" min="1" max="10000" style="flex:1;padding:8px;border:1px solid #4b5563;border-radius:6px;background:#111827;color:white;font-size:14px;box-sizing:border-box">
+    <button onclick="saveLimit()" style="background:#0d9488;color:white;padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:bold">Save</button>
+  </div>
+  <div id="limitMsg" style="font-size:12px;color:#86efac;margin-top:4px"></div>
+</div>
+
+<div style="display:flex;gap:8px;margin-top:12px">
+<button id="continueBtn" onclick="continueAuto()" style="display:none;flex:1;background:#0d9488;color:white;padding:10px;border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:bold">▶️ Continue</button>
+<button onclick="resetCounter()" style="background:#dc2626;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;font-size:14px">🔄 Reset</button>
+</div>
+</div>
+
+<div id="pipelineBox" style="background:#eff6ff;border-left:4px solid #3b82f6;padding:10px 14px;border-radius:8px;margin-bottom:15px;font-size:13px;color:#1e40af;display:none">
+<span id="pipelineText"></span>
+</div>
+
+<button onclick="startManualMode()" style="background:#3b82f6;color:white;padding:14px 24px;border:none;border-radius:8px;cursor:pointer;font-size:16px;margin-right:10px;margin-bottom:10px">▶️ Start Manual</button>
+<button onclick="startAutoMode()" style="background:#0d9488;color:white;padding:14px 24px;border:none;border-radius:8px;cursor:pointer;font-size:16px;margin-bottom:10px">⚡ Start Auto</button>
+<button onclick="stopAutoMode()" id="stopBtn" style="background:#ef4444;color:white;padding:14px 24px;border:none;border-radius:8px;cursor:pointer;font-size:16px;display:none;margin-left:10px">⏹️ Stop Auto</button>
+<div id="modeStatus" style="margin-top:10px"></div>
+</div>
+
+<div id="auditSection" style="display:none">
+<div id="currentEmailLabel" style="background:#65a30d;color:white;padding:10px 16px;border-radius:8px;font-weight:bold;margin-bottom:15px"></div>
+<div id="auditResult"></div>
+
+<div id="outreachSection" style="display:none;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-top:20px">
+<h3 style="margin-top:0">✉️ Outreach Email</h3>
+<div style="margin-bottom:10px">
+<button onclick="regenerateEmail('friendly')" style="background:#0d9488;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;margin-right:5px">😊 Friendly</button>
+<button onclick="regenerateEmail('professional')" style="background:#3b82f6;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;margin-right:5px">💼 Professional</button>
+<button onclick="regenerateEmail('casual')" style="background:#f59e0b;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px">😎 Casual</button>
+<button onclick="generateEmail(autoTone)" style="background:#8b5cf6;color:white;padding:8px 14px;border:none;border-radius:5px;cursor:pointer;font-size:13px;margin-left:5px">🔄 Regenerate</button>
+</div>
+<div id="emailPreview" style="display:none">
+<label style="font-weight:bold;font-size:13px">Subject:</label>
+<input type="text" id="genSubject" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;margin:5px 0 10px 0;box-sizing:border-box;font-size:14px">
+<label style="font-weight:bold;font-size:13px">Message:</label>
+<textarea id="genBody" rows="10" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;margin-top:5px;box-sizing:border-box;font-size:13px;font-family:monospace"></textarea>
+<button onclick="sendToScoutAndOpen()" style="background:#0d9488;color:white;padding:12px 24px;border:none;border-radius:6px;cursor:pointer;font-size:15px;margin-top:12px;margin-right:8px">📨 Send to Scout & Open Gmail</button>
+<button onclick="skipCurrent()" style="background:#6b7280;color:white;padding:12px 24px;border:none;border-radius:6px;cursor:pointer;font-size:15px;margin-top:12px">⏭️ Skip</button>
+<div id="actionStatus" style="font-size:13px;color:green;margin-top:8px"></div>
+</div>
+</div>
+</div>
+
+</div>
+
+<div id="toneModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);z-index:10000;align-items:center;justify-content:center">
+  <div style="background:white;padding:24px;border-radius:12px;max-width:340px;width:90%;text-align:center">
+    <h3 style="margin:0 0 16px 0">Choose Email Tone</h3>
+    <button onclick="pickTone('friendly')" style="display:block;width:100%;background:#0d9488;color:white;padding:12px;border:none;border-radius:8px;cursor:pointer;font-size:15px;margin-bottom:8px">😊 Friendly</button>
+    <button onclick="pickTone('professional')" style="display:block;width:100%;background:#3b82f6;color:white;padding:12px;border:none;border-radius:8px;cursor:pointer;font-size:15px;margin-bottom:8px">💼 Professional</button>
+    <button onclick="pickTone('casual')" style="display:block;width:100%;background:#f59e0b;color:white;padding:12px;border:none;border-radius:8px;cursor:pointer;font-size:15px">😎 Casual</button>
+    <button onclick="closeToneModal()" style="display:block;width:100%;background:#e5e7eb;color:#374151;padding:10px;border:none;border-radius:8px;cursor:pointer;font-size:14px;margin-top:12px">Cancel</button>
+  </div>
+</div>
+
+<script>
+let currentItem = null;
+let currentAuditReport = null;
+let autoMode = false;
+let autoTone = 'friendly';
+let pendingAction = false;
+let SEND_LIMIT = ''' + str(current_limit) + ''';
+
+const MAX_PARALLEL = 3;
+let readyBuffer = [];
+let preparingSet = new Set();
+let refilling = false;
+
+function updatePipelineUI(){
+  const box = document.getElementById('pipelineBox');
+  const txt = document.getElementById('pipelineText');
+  if(autoMode){
+    box.style.display = 'block';
+    txt.textContent = '⚡ Pipeline: ' + readyBuffer.length + ' ready · ' + preparingSet.size + ' preparing (running ' + MAX_PARALLEL + ' at a time)';
+  } else {
+    box.style.display = 'none';
+  }
+}
+
+async function saveLimit(){
+  const val = parseInt(document.getElementById('limitInput').value);
+  if(!val || val < 1){ alert('Enter a number >= 1'); return; }
+  const res = await fetch('/set-send-limit', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({limit: val})});
+  const data = await res.json();
+  if(data.success){
+    SEND_LIMIT = data.limit;
+    document.getElementById('limitMsg').textContent = '✅ Pause every ' + data.limit + ' emails';
+    setTimeout(()=>{ document.getElementById('limitMsg').textContent = ''; }, 2500);
+    await loadCounter();
+  } else {
+    alert('Error: ' + (data.error || 'Unknown'));
+  }
+}
+
+async function prepareItem(id){
+  try{
+    const includeCat = document.getElementById('includeCatalogue').checked;
+    const res = await fetch('/analyze-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id: id, include_catalogue: includeCat})});
+    const data = await res.json();
+    if(!data.success || !data.item) return null;
+    const item = data.item;
+    const senderName = document.getElementById('senderName').value.trim();
+    const emailRes = await fetch('/generate-email', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({
+      report: item.report, tone: autoTone, sender_name: senderName, email: item.email
+    })});
+    const emailData = await emailRes.json();
+    return {
+      id: item.id,
+      email: item.email,
+      domain: item.domain,
+      report: item.report,
+      subject: emailData.success ? emailData.subject : '',
+      message: emailData.success ? emailData.body : ''
+    };
+  }catch(e){ console.error('prepareItem:', e); return null; }
+}
+
+async function refillPipeline(){
+  if(refilling) return;
+  refilling = true;
+  try{
+    while(autoMode && (readyBuffer.length + preparingSet.size) < MAX_PARALLEL){
+      let nextRes;
+      try { nextRes = await fetch('/get-next-pending'); } catch(e){ break; }
+      const nextData = await nextRes.json();
+      if(!nextData.item) break;
+      const id = nextData.item.id;
+      try{
+        await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id: id, status: 'current'})});
+      }catch(e){ break; }
+      preparingSet.add(id);
+      loadQueue();
+      updatePipelineUI();
+      (async () => {
+        const item = await prepareItem(id);
+        preparingSet.delete(id);
+        if(item) readyBuffer.push(item);
+        updatePipelineUI();
+        loadQueue();
+        refillPipeline();
+      })();
+      await new Promise(r => setTimeout(r, 100));
+    }
+  } finally {
+    refilling = false;
+    updatePipelineUI();
+  }
+}
+
+async function safeGetNextPending(retries = 5){
+  for(let i = 0; i < retries; i++){
+    try{
+      const res = await fetch('/get-next-pending');
+      if(res.ok){
+        const data = await res.json();
+        return { ok: true, item: data.item || null };
+      }
+    }catch(e){ /* retry */ }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  return { ok: false, item: null };
+}
+
+async function showNextReady(){
+  if(!autoMode) return;
+  while(autoMode && readyBuffer.length === 0){
+    document.getElementById('auditSection').style.display = 'block';
+    document.getElementById('currentEmailLabel').textContent = '⏳ Preparing next email...';
+    document.getElementById('auditResult').innerHTML = '<p style="color:#666;padding:20px;text-align:center">⚡ Audit running in background (' + preparingSet.size + ' in progress, ' + readyBuffer.length + ' ready)...</p>';
+    document.getElementById('outreachSection').style.display = 'none';
+    updatePipelineUI();
+    await new Promise(r => setTimeout(r, 500));
+    refillPipeline();
+    if(preparingSet.size === 0 && readyBuffer.length === 0){
+      const check = await safeGetNextPending(5);
+      if(check.ok && !check.item){ break; }
+    }
+  }
+  if(!autoMode) return;
+  if(readyBuffer.length === 0){
+    autoMode = false;
+    updatePipelineUI();
+    document.getElementById('modeStatus').innerHTML = '<p style="color:blue">🎉 Auto complete! All emails processed.</p>';
+    document.getElementById('stopBtn').style.display = 'none';
+    return;
+  }
+  const item = readyBuffer.shift();
+  currentItem = {id: item.id, email: item.email, domain: item.domain, report: item.report};
+  currentAuditReport = item.report;
+  document.getElementById('auditSection').style.display = 'block';
+  document.getElementById('currentEmailLabel').textContent = '📧 ' + item.email + '  →  ' + item.domain + '  (buffer: ' + readyBuffer.length + ' ready, ' + preparingSet.size + ' preparing)';
+  renderReport(item.report);
+  document.getElementById('outreachSection').style.display = 'block';
+  document.getElementById('genSubject').value = item.subject;
+  document.getElementById('genBody').value = item.message;
+  document.getElementById('emailPreview').style.display = 'block';
+  updatePipelineUI();
+  loadQueue();
+  refillPipeline();
+  if(autoMode && !pendingAction){
+    pendingAction = true;
+    setTimeout(async()=>{ pendingAction = false; await autoSend(); }, 150);
+  }
+}
+
+function showToneModal(){ document.getElementById('toneModal').style.display = 'flex'; }
+function closeToneModal(){ document.getElementById('toneModal').style.display = 'none'; }
+function pickTone(tone){
+  closeToneModal();
+  autoTone = tone;
+  autoMode = true;
+  pendingAction = false;
+  readyBuffer = [];
+  preparingSet.clear();
+  document.getElementById('modeStatus').innerHTML = '<p style="color:green">⚡ Auto mode ON (' + tone + ') — preparing 3 emails in parallel...</p>';
+  document.getElementById('stopBtn').style.display = 'inline-block';
+  refillPipeline();
+  nextAuto();
+}
+
+async function loadCounter(){
+  try{
+    const res = await fetch('/get-session-counter');
+    const data = await res.json();
+    SEND_LIMIT = data.limit;
+    updateCounterUI(data.count, data.next_milestone, data.at_milestone);
+  }catch(e){ console.error(e); }
+}
+
+function updateCounterUI(count, nextMilestone, atMilestone){
+  document.getElementById('counterText').textContent = count + ' / ' + nextMilestone;
+  const withinMilestone = count % SEND_LIMIT;
+  const pct = count > 0 && withinMilestone === 0 ? 100 : Math.round((withinMilestone / SEND_LIMIT) * 100);
+  const bar = document.getElementById('counterBar');
+  bar.style.width = pct + '%';
+  const hint = document.getElementById('counterHint');
+  const contBtn = document.getElementById('continueBtn');
+  if(atMilestone){
+    bar.style.background = 'linear-gradient(90deg,#ef4444,#dc2626)';
+    hint.innerHTML = '🛑 Milestone reached (' + count + ' sent). Auto mode paused.';
+    hint.style.color = '#fca5a5';
+    contBtn.style.display = 'block';
+  } else {
+    bar.style.background = 'linear-gradient(90deg,#22c55e,#16a34a)';
+    hint.innerHTML = 'Next pause at ' + nextMilestone + ' emails. Press Continue to resume when paused.';
+    hint.style.color = '';
+    contBtn.style.display = 'none';
+  }
+}
+
+async function resetCounter(){
+  if(!confirm('Reset the session counter to 0? Auto mode will stop.')) return;
+  autoMode = false;
+  pendingAction = false;
+  readyBuffer = [];
+  updatePipelineUI();
+  await fetch('/reset-session-counter', {method:'POST'});
+  await loadCounter();
+  document.getElementById('modeStatus').innerHTML = '<p style="color:red">🔄 Counter reset to 0. Auto mode stopped.</p>';
+  document.getElementById('stopBtn').style.display = 'none';
+}
+
+async function continueAuto(){
+  await loadCounter();
+  autoMode = true;
+  pendingAction = false;
+  document.getElementById('modeStatus').innerHTML = '<p style="color:green">▶️ Continuing auto mode...</p>';
+  document.getElementById('stopBtn').style.display = 'inline-block';
+  refillPipeline();
+  nextAuto();
+}
+
+async function loadQueue(){
+  try{
+    const res = await fetch('/get-audit-queue');
+    const data = await res.json();
+    const c = document.getElementById('queueList');
+    document.getElementById('queueCount').textContent = data.items.length;
+    const total = data.items.length;
+    const done = data.items.filter(i=>i.status==='done'||i.status==='skipped').length;
+    if(total > 0){
+      document.getElementById('progressBar').style.display='block';
+      const pct = Math.round((done/total)*100);
+      document.getElementById('progressFill').style.width = pct + '%';
+      document.getElementById('progressFill').textContent = pct + '% (' + done + '/' + total + ')';
+    }
+    if(total === 0){ c.innerHTML='<p style="color:#666">Queue empty. Import emails above.</p>'; return; }
+    let html='';
+    data.items.forEach(i=>{
+      let icon = '⏳'; let color = '#f59e0b';
+      if(i.status==='done'){ icon='✅'; color='#16a34a'; }
+      else if(i.status==='current'){ icon='⚙️'; color='#3b82f6'; }
+      else if(i.status==='skipped'){ icon='⏭️'; color='#6b7280'; }
+      html += '<div style="background:#f9f9f9;padding:10px;border-radius:6px;margin:6px 0;border-left:4px solid '+color+';display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">';
+      html += '<div style="font-size:14px"><span style="margin-right:8px">'+icon+'</span><b>'+i.email+'</b><br><span style="color:#666;font-size:12px">'+i.domain+'</span></div>';
+      html += '<div style="display:flex;gap:6px">';
+      if(i.status === 'pending' || i.status === 'current'){
+        html += '<button onclick="analyzeItem('+i.id+')" style="background:#3b82f6;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">Analyze</button>';
+        html += '<button onclick="skipItem('+i.id+')" style="background:#6b7280;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">Skip</button>';
+      } else {
+        html += '<button onclick="resetItem('+i.id+')" style="background:#f59e0b;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">Undo</button>';
+        html += '<button onclick="deleteItem('+i.id+')" style="background:#ef4444;color:white;padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px">🗑️</button>';
+      }
+      html += '</div></div>';
+    });
+    c.innerHTML = html;
+  }catch(e){ console.error(e); }
+}
+
+async function importFrom(source){
+  const status = document.getElementById('importStatus');
+  status.innerHTML = '<p style="color:#666">⏳ Importing...</p>';
+  try{
+    const res = await fetch('/import-to-queue', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({source: source})});
+    const data = await res.json();
+    if(data.success){
+      status.innerHTML = '<p style="color:green">✅ Added '+data.added+' (skipped '+data.skipped+')</p>';
+      loadQueue();
+    } else { status.innerHTML = '<p style="color:red">Error: '+(data.error||'Unknown')+'</p>'; }
+  }catch(e){ status.innerHTML = '<p style="color:red">Error: '+e.message+'</p>'; }
+}
+
+async function fixDomains(){
+  if(!confirm('Fix queue items whose domain is a public provider (gmail.com, etc.)?')) return;
+  const res = await fetch('/fix-queue-domains', {method:'POST'});
+  const data = await res.json();
+  if(data.success){
+    alert('✅ Fixed ' + data.fixed + ' queue items');
+    loadQueue();
+  }
+}
+
+function toggleManual(){ const el = document.getElementById('manualPaste'); el.style.display = el.style.display === 'none' ? 'block' : 'none'; }
+async function addManual(){
+  const text = document.getElementById('manualEmails').value;
+  const emails = text.split('\\n').map(s=>s.trim()).filter(s=>s.includes('@'));
+  if(emails.length === 0){ alert('No valid emails'); return; }
+  const res = await fetch('/add-to-queue', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({emails: emails})});
+  const data = await res.json();
+  if(data.success){
+    document.getElementById('importStatus').innerHTML = '<p style="color:green">✅ Added '+data.added+' (skipped '+data.skipped+')</p>';
+    document.getElementById('manualEmails').value='';
+    loadQueue();
+  }
+}
+
+async function clearQueue(mode){
+  const msg = mode === 'all'
+    ? 'Delete ALL emails from the queue?'
+    : 'Delete all PENDING emails from the queue?';
+  if(!confirm(msg)) return;
+  const res = await fetch('/clear-queue', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({mode: mode})
+  });
+  const data = await res.json();
+  if(data.success){
+    alert('✅ Cleared ' + data.cleared + ' items');
+    loadQueue();
+  }
+}
+
+async function skipItem(id){ await fetch('/update-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id, status:'skipped'})}); loadQueue(); if(autoMode) nextAuto(); }
+async function resetItem(id){ await fetch('/update-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id, status:'pending'})}); loadQueue(); }
+async function deleteItem(id){
+  if(!confirm('Delete this email from the queue permanently?')) return;
+  await fetch('/delete-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id: id})});
+  loadQueue();
+}
+
+async function analyzeItem(id){
+  autoMode = false;
+  pendingAction = false;
+  document.getElementById('auditSection').style.display = 'block';
+  document.getElementById('auditResult').innerHTML = '<p style="color:#666;padding:20px;text-align:center">⏳ Running audit... 30-45 seconds</p>';
+  document.getElementById('outreachSection').style.display = 'none';
+  document.getElementById('currentEmailLabel').textContent = '🔍 Loading...';
+  await fetch('/update-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id, status:'current'})});
+  try{
+    const includeCat = document.getElementById('includeCatalogue').checked;
+    const res = await fetch('/analyze-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id, include_catalogue: includeCat})});
+    const data = await res.json();
+    if(data.success){
+      currentItem = data.item;
+      currentAuditReport = data.item.report;
+      document.getElementById('currentEmailLabel').textContent = '📧 ' + currentItem.email + '  →  ' + currentItem.domain;
+      renderReport(data.item.report);
+      document.getElementById('outreachSection').style.display = 'block';
+      await generateEmail(autoTone);
+      loadQueue();
+    } else {
+      document.getElementById('auditResult').innerHTML = '<p style="color:red">Error: '+(data.error||'Unknown')+'</p>';
+    }
+  }catch(e){
+    document.getElementById('auditResult').innerHTML = '<p style="color:red">Error: '+e.message+'</p>';
+  }
+}
+
+function scoreColor(s){if(s>=75)return '#16a34a';if(s>=50)return '#f59e0b';return '#ef4444'}
+function scoreBar(l,s){const c=scoreColor(s);return '<div style="margin:10px 0"><div style="display:flex;justify-content:space-between;margin-bottom:4px"><b>'+l+'</b><span style="color:'+c+';font-weight:bold">'+s+'%</span></div><div style="background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+s+'%;height:12px;background:'+c+'"></div></div></div>'}
+
+function renderReport(r){
+  const ch=r.checks||{};const sc=r.scores||{};const iss=r.issues||[];
+  let h='';
+  h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:15px"><h2 style="margin:0">Store Audit Overview</h2><div style="color:#666;font-size:13px;margin-top:6px">Store: <a href="https://'+r.domain+'" target="_blank" style="color:#3b82f6">https://'+r.domain+'/</a></div>'+(r.case_id?'<div style="background:#f3f4f6;padding:6px 12px;border-radius:6px;font-size:13px;color:#374151;margin-top:8px;display:inline-block">Case ID: <b>'+r.case_id+'</b></div>':'')+'</div>';
+  if(ch.platform) h+='<div style="background:#f3f4f6;padding:6px 12px;border-radius:6px;font-size:13px;color:#374151;margin-bottom:15px;display:inline-block">Platform: <b>'+ch.platform+'</b></div>';
+  h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:15px"><h3 style="margin-top:0">📈 Scores</h3>'+scoreBar('Overall',sc.overall_score||0)+scoreBar('Trust',sc.trust_score||0)+scoreBar('Technical',sc.technical_score||0)+scoreBar('Marketing',sc.marketing_score||0)+'</div>';
+
+  if(r.catalogue){
+    const cat = r.catalogue;
+    h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:15px">';
+    h+='<h3 style="margin-top:0">🛍️ Product Catalogue</h3>';
+    h+='<div style="font-size:14px;color:#374151">';
+    h+='<div><b>Products:</b> '+cat.product_count+'</div>';
+    if(cat.categories && cat.categories.length) h+='<div style="margin-top:4px"><b>Top categories:</b> '+cat.categories.join(', ')+'</div>';
+    if(cat.vendors && cat.vendors.length) h+='<div style="margin-top:4px"><b>Top vendors:</b> '+cat.vendors.join(', ')+'</div>';
+    if(cat.sold_out_count > 0) h+='<div style="margin-top:4px;color:#dc2626"><b>Sold out:</b> '+cat.sold_out_count+' products</div>';
+    if(cat.bestsellers && cat.bestsellers.length){
+      h+='<div style="margin-top:8px"><b>Top products:</b></div>';
+      cat.bestsellers.slice(0,3).forEach(b=>{
+        h+='<div style="padding-left:12px;font-size:13px;color:#555">• '+b.title+(b.variants?' ('+b.variants+' variants)':'')+'</div>';
+      });
+    }
+    h+='</div></div>';
+  }
+
+  const hi=iss.filter(i=>i.severity==='high');
+  if(hi.length>0)h+='<div style="background:#fef2f2;border-left:4px solid #ef4444;padding:15px;border-radius:8px;margin-bottom:15px"><div style="color:#991b1b;font-weight:bold">⚠️ '+hi.length+' critical issue(s)</div></div>';
+  if(iss.length>0){h+='<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:15px"><h3 style="margin-top:0;color:#991b1b">⚠️ Issues ('+iss.length+')</h3>';iss.forEach(i=>{const c=i.severity==='high'?'#ef4444':(i.severity==='medium'?'#f59e0b':'#6b7280');h+='<div style="background:#fef2f2;border-left:4px solid '+c+';padding:12px;border-radius:6px;margin:8px 0"><div style="font-weight:bold;font-size:14px">⚠️ '+i.title+'</div><div style="color:#374151;font-size:13px;margin:4px 0">'+i.description+'</div><div style="background:#fef3c7;padding:8px;border-radius:5px;font-size:12px;color:#78350f"><b>💡</b> '+i.recommendation+'</div></div>'});h+='</div>'}
+  if(r.positives&&r.positives.length>0){h+='<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:12px;border-radius:6px;margin-bottom:15px"><b style="color:#166534">✅ Works Well</b>';r.positives.forEach(p=>{h+='<div style="margin:4px 0;color:#14532d;font-size:13px">✅ '+p+'</div>'});h+='</div>'}
+  document.getElementById('auditResult').innerHTML=h;
+}
+
+async function generateEmail(tone){
+  if(!currentAuditReport){ return; }
+  const senderName = document.getElementById('senderName').value.trim();
+  const emailAddr = currentItem ? currentItem.email : '';
+  try{
+    const res = await fetch('/generate-email', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({report: currentAuditReport, tone: tone, sender_name: senderName, email: emailAddr})});
+    const data = await res.json();
+    if(data.success){
+      document.getElementById('genSubject').value = data.subject;
+      document.getElementById('genBody').value = data.body;
+      document.getElementById('emailPreview').style.display = 'block';
+      if(senderName){
+        fetch('/save-sender-name',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sender_name:senderName})});
+      }
+    }
+  }catch(e){ console.error(e); }
+}
+
+async function regenerateEmail(tone){ autoTone = tone; await generateEmail(tone); }
+
+async function sendToScoutAndOpen(){
+  if(!currentItem){ alert('No active item'); return; }
+  const subj = document.getElementById('genSubject').value;
+  const body = document.getElementById('genBody').value;
+  if(!subj || !body){ alert('Generate email first'); return; }
+  const itemId = currentItem.id;
+  const itemEmail = currentItem.email;
+  await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id:itemId, subject:subj, message:body})});
+  await fetch('/save-scout-recipients', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [itemEmail]})});
+  await fetch('/save-scout-state', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [itemEmail], subject:subj, message:body, count:0})});
+  await fetch('/mark-sent', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({email: itemEmail})});
+  await fetch('/delete-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id: itemId})});
+  await fetch('/increment-session-counter', {method:'POST'});
+  await loadCounter();
+  loadQueue();
+  const mailto = 'mailto:' + itemEmail + '?subject=' + encodeURIComponent(subj) + '&body=' + encodeURIComponent(body);
+  window.location.href = mailto;
+}
+
+async function skipCurrent(){
+  if(!currentItem){ return; }
+  await fetch('/update-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentItem.id, status:'skipped'})});
+  currentItem = null;
+  document.getElementById('auditSection').style.display = 'none';
+  loadQueue();
+  if(autoMode) nextAuto();
+}
+
+async function startManualMode(){
+  autoMode = false;
+  pendingAction = false;
+  document.getElementById('modeStatus').innerHTML = '<p style="color:blue">▶️ Manual mode: click each email to analyze</p>';
+  document.getElementById('stopBtn').style.display = 'none';
+  updatePipelineUI();
+}
+
+async function startAutoMode(){
+  await fetch('/reset-session-counter', {method:'POST'});
+  await loadCounter();
+  showToneModal();
+}
+
+function stopAutoMode(){
+  autoMode = false;
+  pendingAction = false;
+  for(const item of readyBuffer){
+    fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id: item.id, status: 'pending'})});
+  }
+  readyBuffer = [];
+  updatePipelineUI();
+  document.getElementById('modeStatus').innerHTML = '<p style="color:red">⏹️ Auto mode stopped</p>';
+  document.getElementById('stopBtn').style.display = 'none';
+}
+
+function playAlarm(){
+  try{
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.type = 'square';
+    osc.frequency.value = 880;
+    gain.gain.value = 0.15;
+    osc.start();
+    let t = ctx.currentTime;
+    for(let i=0;i<3;i++){
+      gain.gain.setValueAtTime(0.15, t + i*0.4);
+      gain.gain.setValueAtTime(0, t + i*0.4 + 0.2);
+    }
+    osc.stop(t + 1.4);
+  }catch(e){ console.error('Audio error:', e); }
+}
+
+async function nextAuto(){
+  if(!autoMode) return;
+  try{
+    const cntRes = await fetch('/get-session-counter');
+    const cntData = await cntRes.json();
+    SEND_LIMIT = cntData.limit;
+    updateCounterUI(cntData.count, cntData.next_milestone, cntData.at_milestone);
+    if(cntData.at_milestone){
+      autoMode = false;
+      pendingAction = false;
+      playAlarm();
+      document.getElementById('modeStatus').innerHTML = '<p style="color:red;font-weight:bold">🛑 Milestone reached ('+cntData.count+' sent). Auto mode PAUSED. Press Continue to resume.</p>';
+      document.getElementById('stopBtn').style.display = 'none';
+      return;
+    }
+  }catch(e){ console.error(e); }
+  await showNextReady();
+}
+
+async function autoSend(){
+  if(!autoMode) return;
+  if(!currentItem) { nextAuto(); return; }
+  const subj = document.getElementById('genSubject').value;
+  const body = document.getElementById('genBody').value;
+  if(!subj || !body){
+    await fetch('/update-queue-item', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentItem.id, status:'skipped'})});
+    nextAuto();
+    return;
+  }
+  const itemId = currentItem.id;
+  const itemEmail = currentItem.email;
+  await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id:itemId, subject:subj, message:body})});
+  await fetch('/save-scout-recipients', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [itemEmail]})});
+  await fetch('/save-scout-state', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [itemEmail], subject:subj, message:body, count:0})});
+  await fetch('/mark-sent', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({email: itemEmail})});
+  await fetch('/delete-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id: itemId})});
+  try{
+    const incRes = await fetch('/increment-session-counter', {method:'POST'});
+    const incData = await incRes.json();
+    SEND_LIMIT = incData.limit;
+    updateCounterUI(incData.count, incData.next_milestone, incData.at_milestone);
+  }catch(e){ console.error(e); }
+  loadQueue();
+  const mailto = 'mailto:' + itemEmail + '?subject=' + encodeURIComponent(subj) + '&body=' + encodeURIComponent(body);
+  localStorage.setItem('lastAutoSentId', itemId.toString());
+  window.location.href = mailto;
+}
+
+document.addEventListener('visibilitychange', function(){
+  if(document.visibilityState === 'visible' && autoMode){
+    const lastSent = localStorage.getItem('lastAutoSentId');
+    if(lastSent){
+      localStorage.removeItem('lastAutoSentId');
+      currentItem = null;
+      setTimeout(nextAuto, 200);
+    }
+  }
+});
+
+window.onload = function(){ loadQueue(); loadCounter(); };
+</script>'''
+    return render_page("Analyze & Send", body)
+
+# ==========================================
+# QUEUE API
+# ==========================================
+@app.route('/get-audit-queue')
+@login_required
+def get_audit_queue_route():
+    user_email = session.get('user_id')
+    return jsonify({'items': get_queue(user_email)})
+
+@app.route('/import-to-queue', methods=['POST'])
+@login_required
+def import_to_queue():
+    user_email = session.get('user_id')
+    source = request.json.get('source', '')
+    pairs = []
     try:
-        cur = conn.cursor()
-        cur.execute("INSERT INTO wix_email_jobs (user_email, total, remaining_urls, results, status) VALUES (%s,%s,%s,'[]','pending') RETURNING id",
-                    (user_email, len(urls), '|||'.join(urls)))
-        job_id = cur.fetchone()[0]; conn.commit(); cur.close()
-    finally: release_db(conn)
-    threading.Thread(target=wix_process_subjob, args=(job_id,), daemon=True).start()
-    return jsonify({'success': True, 'job_id': job_id, 'total': len(urls)})
+        if source == 'finder':
+            pairs = load_found_pairs(user_email)
+        elif source == 'verified':
+            state = load_user_state(user_email)
+            emails = state.get('verified_emails', [])
+            if not emails:
+                conn = get_db()
+                if conn:
+                    try:
+                        cur = conn.cursor()
+                        cur.execute("SELECT valid_emails FROM verify_jobs WHERE user_email = %s AND status = 'completed' ORDER BY created_at DESC LIMIT 1", (user_email,))
+                        row = cur.fetchone(); cur.close()
+                        if row and row[0]: emails = row[0].split('|||')
+                    except: pass
+                    finally: release_db(conn)
+            found_pairs = load_found_pairs(user_email)
+            email_to_store = {}
+            for e, s in found_pairs:
+                if e not in email_to_store: email_to_store[e] = s
+            for e in emails:
+                pairs.append((e, email_to_store.get(e, '')))
+        else:
+            return jsonify({'success': False, 'error': 'Unknown source'})
+        if not pairs: return jsonify({'success': False, 'error': 'No emails available'})
+        added, skipped = add_to_queue(user_email, pairs)
+        return jsonify({'success': True, 'added': added, 'skipped': skipped})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
 
-@app.route('/wix/get-email-finder-jobs')
+@app.route('/add-to-queue', methods=['POST'])
 @login_required
-def wix_get_email_jobs_route():
-    return jsonify({'jobs': wix_get_email_jobs(session.get('user_id'))})
-
-@app.route('/wix/get-email-finder-job/<int:job_id>')
-@login_required
-def wix_get_email_job_route(job_id):
-    return jsonify(wix_get_email_job_detail(job_id, session.get('user_id')) or {'results': []})
-
-@app.route('/wix/store-emails', methods=['POST'])
-@login_required
-def wix_store_emails():
+def add_to_queue_route():
     user_email = session.get('user_id')
-    pairs = request.json.get('pairs', [])
-    items = []
-    for p in pairs:
-        e = p.get('email', '').strip().lower()
-        s = (p.get('store', '') or '').strip().lower()
-        if e: items.append(f"{e}:::{s}" if s else e)
-    if user_email and items: save_user_state(user_email, wix_found_emails='|||'.join(items))
+    emails = request.json.get('emails', [])
+    pairs = [(e, '') for e in emails]
+    added, skipped = add_to_queue(user_email, pairs)
+    return jsonify({'success': True, 'added': added, 'skipped': skipped})
+
+@app.route('/update-queue-item', methods=['POST'])
+@login_required
+def update_queue_item_route():
+    user_email = session.get('user_id')
+    data = request.json
+    item_id = data.pop('id', None)
+    if not item_id: return jsonify({'success': False, 'error': 'No id'})
+    update_queue_item(item_id, user_email, **data)
     return jsonify({'success': True})
 
-@app.route('/wix/get-wix-emails')
+@app.route('/delete-queue-item', methods=['POST'])
 @login_required
-def wix_get_emails():
-    state = load_wix_state(session.get('user_id'))
-    emails = []
-    for item in state.get('wix_found_emails', []):
-        if not item: continue
-        emails.append(item.split(':::', 1)[0].strip() if ':::' in item else item.strip())
-    return jsonify({'emails': [e for e in emails if e]})
+def delete_queue_item_route():
+    user_email = session.get('user_id')
+    item_id = request.json.get('id')
+    if not item_id: return jsonify({'success': False, 'error': 'No id'})
+    deleted = delete_queue_item(item_id, user_email)
+    return jsonify({'success': deleted})
+
+@app.route('/mark-sent', methods=['POST'])
+@login_required
+def mark_sent_route():
+    user_email = session.get('user_id')
+    email = request.json.get('email', '')
+    if email: mark_sent(user_email, email)
+    return jsonify({'success': True})
+
+@app.route('/clear-queue', methods=['POST'])
+@login_required
+def clear_queue_route():
+    user_email = session.get('user_id')
+    mode = request.json.get('mode', 'done') if request.is_json else 'done'
+    n = clear_queue(user_email, mode=mode)
+    return jsonify({'success': True, 'cleared': n})
+
+@app.route('/fix-queue-domains', methods=['POST'])
+@login_required
+def fix_queue_domains_route():
+    user_email = session.get('user_id')
+    fixed = fix_queue_domains(user_email)
+    return jsonify({'success': True, 'fixed': fixed})
+
+@app.route('/get-next-pending')
+@login_required
+def get_next_pending_route():
+    user_email = session.get('user_id')
+    item = get_next_pending_item(user_email)
+    return jsonify({'item': item})
 
 # ==========================================
-# WIX VERIFY API
+# SESSION COUNTER API
 # ==========================================
-@app.route('/wix/verify-async', methods=['POST'])
+@app.route('/get-session-counter')
 @login_required
-def wix_verify_async():
+def get_session_counter_route():
     user_email = session.get('user_id')
-    d = request.json
-    emails = d.get('emails', [])
-    name = d.get('name', f"Wix Job {int(time.time())}")
+    return jsonify(counter_status(user_email))
+
+@app.route('/increment-session-counter', methods=['POST'])
+@login_required
+def increment_session_counter_route():
+    user_email = session.get('user_id')
+    increment_session_sent_count(user_email)
+    return jsonify(counter_status(user_email))
+
+@app.route('/reset-session-counter', methods=['POST'])
+@login_required
+def reset_session_counter_route():
+    user_email = session.get('user_id')
+    reset_session_sent_count(user_email)
+    return jsonify(counter_status(user_email))
+
+@app.route('/set-send-limit', methods=['POST'])
+@login_required
+def set_send_limit_route():
+    user_email = session.get('user_id')
+    try:
+        limit = int(request.json.get('limit', DEFAULT_SEND_LIMIT))
+    except:
+        return jsonify({'success': False, 'error': 'Invalid limit'})
+    if limit < 1: limit = 1
+    if limit > 10000: limit = 10000
+    ok = set_send_limit(user_email, limit)
+    if ok:
+        return jsonify({'success': True, 'limit': limit})
+    return jsonify({'success': False, 'error': 'Could not save'})
+
+@app.route('/analyze-queue-item', methods=['POST'])
+@login_required
+def analyze_queue_item():
+    user_email = session.get('user_id')
+    data = request.json
+    item_id = data.get('id')
+    include_catalogue = bool(data.get('include_catalogue', False))
+    item = get_queue_item(item_id, user_email)
+    if not item: return jsonify({'success': False, 'error': 'Item not found'})
+    if item.get('report'):
+        return jsonify({'success': True, 'item': item})
+    case_id = generate_case_id()
+    report = audit_store(item['domain'], case_id, include_catalogue=include_catalogue)
+    update_queue_item(item_id, user_email, report=report, status='current')
+    save_audit_history(user_email, item['domain'], report)
+    item = get_queue_item(item_id, user_email)
+    return jsonify({'success': True, 'item': item})
+
+@app.route('/save-sender-name', methods=['POST'])
+@login_required
+def save_sender_name():
+    user_email = session.get('user_id')
+    name = request.json.get('sender_name', '').strip()
+    if user_email and name:
+        set_user_sender_name(user_email, name)
+    return jsonify({'success': True})
+
+@app.route('/generate-email', methods=['POST'])
+@login_required
+def generate_email_route():
+    data = request.json
+    report = data.get('report', {})
+    tone = data.get('tone', 'friendly')
+    sender_name = data.get('sender_name', '').strip()
+    email = data.get('email', '').strip()
+    if not sender_name:
+        sender_name = get_user_sender_name(session.get('user_id')) or ''
+    if not report: return jsonify({'success': False, 'error': 'No report'})
+    try:
+        result = generate_outreach_email(report, tone, sender_name, email)
+        return jsonify({'success': True, 'subject': result['subject'], 'body': result['body']})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/verify-async', methods=['POST'])
+@login_required
+def verify_async():
+    user_email = session.get('user_id')
+    data = request.json
+    emails = data.get('emails', [])
+    job_name = data.get('name', f"Job {int(time.time())}")
     if not emails: return jsonify({'error': 'No emails'}), 400
     conn = get_db()
     if not conn: return jsonify({'error': 'No DB'}), 500
     try:
         cur = conn.cursor()
-        cur.execute("""INSERT INTO wix_verify_jobs (user_email, job_name, total, remaining_emails, valid_emails, invalid_emails, status)
-            VALUES (%s,%s,%s,%s,'','','pending') RETURNING id""", (user_email, name, len(emails), '|||'.join(emails)))
-        job_id = cur.fetchone()[0]; conn.commit(); cur.close()
+        cur.execute("""INSERT INTO verify_jobs (user_email, job_name, total, remaining_emails, valid_emails, invalid_emails, status)
+            VALUES (%s, %s, %s, %s, '', '', 'pending') RETURNING id""", (user_email, job_name, len(emails), '|||'.join(emails)))
+        job_id = cur.fetchone()[0]
+        conn.commit(); cur.close()
     finally: release_db(conn)
-    threading.Thread(target=wix_verify_worker, args=(job_id,), daemon=True).start()
+    thread = threading.Thread(target=background_verify_worker, args=(job_id,), daemon=True)
+    thread.start()
     return jsonify({'success': True, 'job_id': job_id, 'total': len(emails)})
 
-@app.route('/wix/verify-jobs')
+@app.route('/verify-jobs')
 @login_required
-def wix_verify_jobs_list():
+def verify_jobs_list():
+    user_email = session.get('user_id')
     conn = get_db()
     if not conn: return jsonify({'jobs': []})
     try:
         cur = conn.cursor()
-        cur.execute("""SELECT id, job_name, total, processed, status, created_at, valid_emails, invalid_emails
-            FROM wix_verify_jobs WHERE user_email=%s ORDER BY created_at DESC LIMIT 3""", (session.get('user_id'),))
+        cur.execute("""SELECT id, job_name, total, processed, status, created_at, valid_emails, invalid_emails FROM verify_jobs WHERE user_email = %s ORDER BY created_at DESC LIMIT 3""", (user_email,))
         rows = cur.fetchall(); cur.close()
         return jsonify({'jobs': [{'id': r[0], 'name': r[1], 'total': r[2], 'processed': r[3], 'status': r[4], 'created_at': str(r[5]), 'valid': len(r[6].split('|||')) if r[6] else 0, 'invalid': len(r[7].split('|||')) if r[7] else 0} for r in rows]})
     finally: release_db(conn)
 
-@app.route('/wix/get-wix-verified-emails')
+@app.route('/get-stored-emails')
 @login_required
-def wix_get_verified_emails():
-    state = load_wix_state(session.get('user_id'))
-    return jsonify({'emails': [e.strip() for e in state.get('wix_verified_emails', []) if e.strip()]})
-
-# ==========================================
-# WIX AUDIT QUEUE API
-# ==========================================
-@app.route('/wix/import-to-queue', methods=['POST'])
-@login_required
-def wix_import_to_queue():
+def get_stored_emails():
     user_email = session.get('user_id')
-    source = request.json.get('source', '')
-    pairs = []
-    if source == 'finder':
-        pairs = load_wix_found_pairs(user_email)
-    elif source == 'verified':
-        state = load_wix_state(user_email)
-        emails = state.get('wix_verified_emails', [])
-        fp = load_wix_found_pairs(user_email)
-        e2s = {}
-        for e, s in fp:
-            if e not in e2s: e2s[e] = s
-        for e in emails: pairs.append((e, e2s.get(e, '')))
-    else: return jsonify({'success': False, 'error': 'Unknown source'})
-    if not pairs: return jsonify({'success': False, 'error': 'No emails'})
-    conn = get_db()
-    if not conn: return jsonify({'success': False})
-    added = skipped = 0
-    try:
-        cur = conn.cursor()
-        for email, store in pairs:
-            email = email.strip().lower()
-            if not email or '@' not in email: continue
-            store = (store or email).strip().lower()
-            if store in PUBLIC_EMAIL_DOMAINS: store = email
-            try:
-                cur.execute("""INSERT INTO wix_audit_queue (user_email, email, domain, status) VALUES (%s,%s,%s,'pending')
-                    ON CONFLICT (user_email, email) DO NOTHING""", (user_email, email, store))
-                if cur.rowcount > 0: added += 1
-                else: skipped += 1
-            except: pass
-        conn.commit(); cur.close()
-    except: pass
-    finally: release_db(conn)
-    return jsonify({'success': True, 'added': added, 'skipped': skipped})
+    state = load_user_state(user_email) if user_email else {}
+    emails = []
+    for item in state.get('found_emails', []):
+        if not item: continue
+        if ':::' in item:
+            emails.append(item.split(':::', 1)[0].strip())
+        else:
+            emails.append(item.strip())
+    return jsonify({'emails': [e for e in emails if e]})
 
-@app.route('/wix/get-audit-queue')
+@app.route('/get-verified-emails')
 @login_required
-def wix_get_audit_queue():
-    conn = get_db()
-    if not conn: return jsonify({'items': []})
-    try:
-        cur = conn.cursor()
-        cur.execute("""SELECT id, email, domain, status FROM wix_audit_queue WHERE user_email=%s
-            ORDER BY CASE status WHEN 'pending' THEN 1 WHEN 'current' THEN 2 ELSE 3 END, added_at ASC""", (session.get('user_id'),))
-        rows = cur.fetchall(); cur.close()
-        return jsonify({'items': [{'id': r[0], 'email': r[1], 'domain': r[2], 'status': r[3]} for r in rows]})
-    finally: release_db(conn)
-
-@app.route('/wix/update-queue-item', methods=['POST'])
-@login_required
-def wix_update_queue_item():
+def get_verified_emails():
     user_email = session.get('user_id')
-    d = request.json; item_id = d.pop('id', None)
-    if not item_id: return jsonify({'success': False})
     conn = get_db()
-    if not conn: return jsonify({'success': False})
+    if not conn: return jsonify({'emails': []})
     try:
         cur = conn.cursor()
-        for k, v in d.items():
-            if v is not None: cur.execute(f"UPDATE wix_audit_queue SET {k}=%s, updated_at=NOW() WHERE id=%s AND user_email=%s", (v, item_id, user_email))
-        conn.commit(); cur.close()
-        return jsonify({'success': True})
-    except: return jsonify({'success': False})
-    finally: release_db(conn)
-
-@app.route('/wix/delete-queue-item', methods=['POST'])
-@login_required
-def wix_delete_queue_item():
-    conn = get_db()
-    if not conn: return jsonify({'success': False})
-    try:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM wix_audit_queue WHERE id=%s AND user_email=%s", (request.json.get('id'), session.get('user_id')))
-        conn.commit(); cur.close()
-        return jsonify({'success': True})
-    except: return jsonify({'success': False})
-    finally: release_db(conn)
-
-@app.route('/wix/get-next-pending')
-@login_required
-def wix_get_next_pending():
-    conn = get_db()
-    if not conn: return jsonify({'item': None})
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT id, email, domain FROM wix_audit_queue WHERE user_email=%s AND status='pending' ORDER BY added_at ASC LIMIT 1", (session.get('user_id'),))
+        cur.execute("""SELECT valid_emails FROM verify_jobs
+            WHERE user_email = %s AND status = 'completed'
+            ORDER BY created_at DESC LIMIT 1""", (user_email,))
         row = cur.fetchone(); cur.close()
-        if not row: return jsonify({'item': None})
-        return jsonify({'item': {'id': row[0], 'email': row[1], 'domain': row[2]}})
+        if row and row[0]:
+            emails = [e.strip() for e in row[0].split('|||') if e.strip()]
+            return jsonify({'emails': emails})
+        return jsonify({'emails': []})
+    except: return jsonify({'emails': []})
     finally: release_db(conn)
 
-@app.route('/wix/analyze-queue-item', methods=['POST'])
+@app.route('/save-scout-recipients', methods=['POST'])
 @login_required
-def wix_analyze_queue_item():
+def save_scout_recipients():
     user_email = session.get('user_id')
-    item_id = request.json.get('id')
-    conn = get_db()
-    if not conn: return jsonify({'success': False})
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT id, email, domain, report FROM wix_audit_queue WHERE id=%s AND user_email=%s", (item_id, user_email))
-        row = cur.fetchone(); cur.close()
-        if not row: return jsonify({'success': False, 'error': 'Not found'})
-        item_id, email, domain, report_json = row
-        if report_json:
-            try: report = json.loads(report_json) if isinstance(report_json, str) else report_json
-            except: report = None
-            if report: return jsonify({'success': True, 'item': {'id': item_id, 'email': email, 'domain': domain, 'report': report}})
-    finally: release_db(conn)
-    case_id = generate_case_id()
-    report = audit_store_wix(domain, case_id)
-    conn = get_db()
-    if conn:
-        try:
-            cur = conn.cursor()
-            cur.execute("UPDATE wix_audit_queue SET report=%s, status='current', updated_at=NOW() WHERE id=%s", (json.dumps(report), item_id))
-            cur.execute("INSERT INTO wix_audit_history (user_email, domain, report) VALUES (%s,%s,%s)", (user_email, domain, json.dumps(report)))
-            conn.commit(); cur.close()
-        finally: release_db(conn)
-    return jsonify({'success': True, 'item': {'id': item_id, 'email': email, 'domain': domain, 'report': report}})
+    recipients = request.json.get('recipients', [])
+    if user_email: save_user_state(user_email, scout_recipients='|||'.join(recipients))
+    return jsonify({'success': True})
 
-@app.route('/wix/generate-email', methods=['POST'])
+@app.route('/load-scout-state')
 @login_required
-def wix_generate_email():
-    d = request.json
-    report = d.get('report', {}); tone = d.get('tone', 'friendly')
-    name = d.get('sender_name','').strip() or get_user_sender_name(session.get('user_id')) or ''
-    email = d.get('email','').strip()
-    if not report: return jsonify({'success': False})
-    try:
-        r = generate_outreach_email_wix(report, tone, name, email)
-        return jsonify({'success': True, 'subject': r['subject'], 'body': r['body']})
-    except Exception as e: return jsonify({'success': False, 'error': str(e)})
+def load_scout_state():
+    user_email = session.get('user_id')
+    state = load_user_state(user_email) if user_email else {}
+    return jsonify({'recipients': state.get('scout_recipients', []), 'subject': state.get('scout_subject', ''), 'message': state.get('scout_message', ''), 'count': state.get('scout_count', 0)})
 
-@app.route('/wix/mark-sent', methods=['POST'])
+@app.route('/save-scout-state', methods=['POST'])
 @login_required
-def wix_mark_sent():
-    conn = get_db()
-    if not conn: return jsonify({'success': False})
-    try:
-        cur = conn.cursor()
-        cur.execute("INSERT INTO wix_sent_log (user_email, email) VALUES (%s,%s) ON CONFLICT DO NOTHING",
-                    (session.get('user_id'), request.json.get('email','')))
-        conn.commit(); cur.close()
-        return jsonify({'success': True})
-    except: return jsonify({'success': False})
-    finally: release_db(conn)
+def save_scout_state_route():
+    user_email = session.get('user_id')
+    data = request.json
+    if user_email:
+        save_user_state(user_email, scout_recipients='|||'.join(data.get('recipients', [])), scout_subject=data.get('subject', ''), scout_message=data.get('message', ''), scout_count=data.get('count', 0))
+    return jsonify({'success': True})
 
 # ==========================================
 # STARTUP RESUME
