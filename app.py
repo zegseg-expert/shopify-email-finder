@@ -1852,6 +1852,14 @@ def discover_page():
 <div id="hfHistory">Loading...</div>
 </div>
 
+<div style="background:linear-gradient(135deg,#065f46,#10b981);color:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
+<h3 style="margin-top:0">🏭 Shopify Warehouse (Leadita Daily)</h3>
+<p style="font-size:14px;margin:5px 0;opacity:0.9">500 fresh Shopify domains added automatically every day from Leadita's public dataset. Grows forever, deduplicates itself.</p>
+<div id="shopifyWarehouseStats" style="background:rgba(255,255,255,0.15);padding:12px;border-radius:6px;margin:10px 0;font-size:13px">Loading…</div>
+<button onclick="ingestShopifyNow()" style="background:white;color:#065f46;padding:10px 18px;border:none;border-radius:6px;cursor:pointer;font-weight:bold;font-size:14px;margin:4px 4px 4px 0">📥 Ingest Today's Batch</button>
+<button onclick="pullShopifyFromWarehouse()" style="background:rgba(255,255,255,0.25);color:white;padding:10px 18px;border:none;border-radius:6px;cursor:pointer;font-weight:bold;font-size:14px;margin:4px 0">📧 Send to Discovery List</button>
+<div id="shopifyIngestStatus" style="margin-top:10px;font-size:13px"></div>
+</div>
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
 <h3 style="margin-top:0">🔎 Other Discovery Methods</h3>
 <button onclick="runDiscovery('shodan')" style="background:#8b5cf6;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:14px">🔍 Shodan</button>
