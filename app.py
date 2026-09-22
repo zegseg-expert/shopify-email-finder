@@ -2200,39 +2200,16 @@ def clear_discovered():
     finally: release_db(conn)
 
 # ==========================================
-# VERIFY PAGE
-# ==========================================
-@app.route('/verify')
-@login_required
-def verify_page():
-    body = '''<div style="max-width:800px;margin:20px auto;padding:20px">
-<div style="background:#f59e0b;color:white;padding:20px;border-radius:10px;margin-bottom:20px"><h1 style="margin:0">✅ Verify Emails</h1></div>
-<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
-<h3 style="margin-top:0">📋 Last 3 Jobs</h3>
-<div id="jobsList">Loading...</div>
-</div>
-<div style="background:white;padding:20px;border-radius:10px">
-<textarea id="emailsInput" style="width:100%;height:180px;border:1px solid #ddd;border-radius:5px;padding:10px;font-family:monospace;box-sizing:border-box"></textarea>
-<button onclick="loadFromFinder()" style="background:#f59e0b;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-right:8px;margin-top:8px">📥 From Finder</button>
-<button onclick="startBackgroundVerify()" style="background:#0d9488;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-top:8px">▶️ Start Verify</button>
-<div id="startMsg" style="margin-top:10px"></div>
-</div></div>
-<script>
-async function loadFromFinder(){const res=await fetch('/get-stored-emails');const data=await res.json();if(data.emails&&data.emails.length>0){document.getElementById('emailsInput').value=data.emails.join('\\n');alert('Loaded '+data.emails.length)}}
-async function startBackgroundVerify(){const emails=document.getElementById('emailsInput').value.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);if(emails.length===0){alert('Enter emails');return}const name='Job '+new Date().toLocaleString();document.getElementById('startMsg').innerHTML='<p style="color:#666">Starting...</p>';try{const res=await fetch('/verify-async',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({emails:emails,name:name||'Untitled'})});const data=await res.json();if(data.success){document.getElementById('startMsg').innerHTML='<p style="color:green">✅ Job #'+data.job_id+' started!</p>';document.getElementById('emailsInput').value='';refreshJobs()}}catch(e){document.getElementById('startMsg').innerHTML='<p style="color:red">Error: '+e+'</p>'}}
-async function refreshJobs(){const res=await fetch('/verify-jobs');const data=await res.json();const container=document.getElementById('jobsList');if(!data.jobs||data.jobs.length===0){container.innerHTML='<p style="color:#666">No jobs yet.</p>';return}let html='';data.jobs.forEach(job=>{const percent=job.total>0?Math.round((job.processed/job.total)*100):0;const sc=job.status==='completed'?'#0d9488':(job.status==='running'?'#f59e0b':'#ef4444');const si=job.status==='completed'?'✅':(job.status==='running'?'🔄':'⏹️');html+='<div style="background:#f9f9f9;padding:12px;border-radius:8px;margin:8px 0;border-left:4px solid '+sc+'"><div style="font-weight:bold">'+si+' '+job.name+'</div><div style="margin-top:8px;background:#e0e0e0;border-radius:8px;overflow:hidden"><div style="width:'+percent+'%;height:16px;background:'+sc+';text-align:center;color:white;font-size:11px;line-height:16px">'+percent+'%</div></div><div style="font-size:13px;margin-top:6px">'+job.processed+' / '+job.total+' | ✅ '+job.valid+' | ❌ '+job.invalid+'</div></div>'});container.innerHTML=html}
-window.onload=function(){refreshJobs();setInterval(refreshJobs,10000)};
-</script>'''
-    return render_page("Verify", body)
-
-# ==========================================
 # SCOUT
 # ==========================================
 @app.route('/scout')
 @login_required
 def scout():
+    user_email = session.get('user_id')
+    current_limit = get_send_limit(user_email)
     body = '''<div style="max-width:800px;margin:20px auto;padding:20px">
 <div style="background:#0d9488;color:white;padding:20px;border-radius:10px;margin-bottom:20px"><h1 style="margin:0">📨 Email Scout</h1></div>
+
 <div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
 <h3 style="margin-top:0">📥 Recipients</h3>
 <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
@@ -2244,69 +2221,227 @@ def scout():
 <div id="emailCount" style="margin-top:10px;font-weight:bold">0 recipients</div>
 <div id="loadStatus" style="margin-top:6px;font-size:13px"></div>
 </div>
+
 <div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
 <h3 style="margin-top:0">✍️ Template</h3>
 <input type="text" id="subjectLine" placeholder="Subject" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;margin-bottom:10px;box-sizing:border-box">
 <textarea id="messageBody" rows="5" placeholder="Message" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;box-sizing:border-box"></textarea>
 </div>
+
+<div style="background:linear-gradient(135deg,#1f2937,#374151);color:white;padding:16px;border-radius:10px;margin-bottom:20px">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+<span style="font-size:15px;font-weight:bold">📧 Sent this session</span>
+<span id="counterText" style="font-size:20px;font-weight:bold">0 / ''' + str(current_limit) + '''</span>
+</div>
+<div style="background:#111827;border-radius:8px;overflow:hidden;height:14px">
+<div id="counterBar" style="width:0%;height:100%;background:linear-gradient(90deg,#22c55e,#16a34a)"></div>
+</div>
+<div id="counterHint" style="font-size:12px;margin-top:8px;opacity:0.85">Auto stops at milestone. Press Continue to resume.</div>
+<div style="margin-top:12px;padding-top:12px;border-top:1px solid #4b5563">
+<label style="font-size:13px;font-weight:bold;display:block;margin-bottom:6px">⚙️ Stop after N emails:</label>
+<div style="display:flex;gap:8px;align-items:center">
+<input type="number" id="limitInput" value="''' + str(current_limit) + '''" min="1" max="10000" style="flex:1;padding:8px;border:1px solid #4b5563;border-radius:6px;background:#111827;color:white;font-size:14px;box-sizing:border-box">
+<button onclick="saveLimit()" style="background:#0d9488;color:white;padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-weight:bold">Save</button>
+</div>
+<div id="limitMsg" style="font-size:12px;color:#86efac;margin-top:4px"></div>
+</div>
+<div style="display:flex;gap:8px;margin-top:12px">
+<button id="continueBtn" onclick="continueCampaign()" style="display:none;flex:1;background:#0d9488;color:white;padding:10px;border:none;border-radius:6px;cursor:pointer;font-weight:bold">▶️ Continue</button>
+<button onclick="resetCounter()" style="background:#dc2626;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer">🔄 Reset</button>
+</div>
+</div>
+
 <div style="background:white;padding:20px;border-radius:10px">
-<button onclick="startCampaign()" style="background:#0d9488;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-right:8px">▶️ Start</button>
-<button onclick="stopCampaign()" style="background:#ef4444;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer">⏹️ Stop</button>
+<button onclick="startCampaign()" id="startBtn" style="background:#0d9488;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-right:8px">▶️ Start</button>
+<button onclick="stopCampaign()" id="stopBtn" style="background:#ef4444;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;display:none">⏹️ Stop</button>
 <div id="launchStatus" style="margin-top:10px"></div>
-</div></div>
+</div>
+</div>
 <script>
-let recipients=[],scoutedEmails=0,isRunning=false;
-function syncRecipients(){const val=document.getElementById('emailsInput').value;recipients=val.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);document.getElementById('emailCount').textContent=recipients.length+' recipients';saveState()}
-window.onload=async function(){try{const res=await fetch('/load-scout-state');const data=await res.json();
-  if(data.recipients) {recipients = data.recipients;document.getElementById('emailsInput').value = recipients.join('\\n');}
-  if(data.subject) document.getElementById('subjectLine').value = data.subject;
-  if(data.message) document.getElementById('messageBody').value = data.message;
-}catch(e){};document.getElementById('emailCount').textContent=recipients.length+' recipients';};
+let recipients=[];
+let isRunning=false;
+let currentEmail=null;
+let awaitingReturn=false;
+let SEND_LIMIT=''' + str(current_limit) + ''';
+
+function syncRecipients(){
+  const val=document.getElementById('emailsInput').value;
+  recipients=val.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);
+  document.getElementById('emailCount').textContent=recipients.length+' recipients';
+  saveState();
+}
+
+window.onload=async function(){
+  try{
+    const res=await fetch('/load-scout-state');const data=await res.json();
+    if(data.recipients){recipients=data.recipients;document.getElementById('emailsInput').value=recipients.join('\\n');}
+    if(data.subject) document.getElementById('subjectLine').value = data.subject;
+    if(data.message) document.getElementById('messageBody').value = data.message;
+  }catch(e){}
+  document.getElementById('emailCount').textContent=recipients.length+' recipients';
+  await loadCounter();
+};
+
+async function loadCounter(){
+  try{
+    const r=await fetch('/get-session-counter');
+    const d=await r.json();
+    SEND_LIMIT=d.limit;
+    document.getElementById('limitInput').value=d.limit;
+    updateCounterUI(d.count, d.next_milestone, d.at_milestone);
+  }catch(e){}
+}
+
+function updateCounterUI(count, next, at){
+  document.getElementById('counterText').textContent=count+' / '+next;
+  const within=count % SEND_LIMIT;
+  const pct=count>0 && within===0 ? 100 : Math.round((within/SEND_LIMIT)*100);
+  const bar=document.getElementById('counterBar');
+  bar.style.width=pct+'%';
+  const hint=document.getElementById('counterHint');
+  const contBtn=document.getElementById('continueBtn');
+  if(at){
+    bar.style.background='linear-gradient(90deg,#ef4444,#dc2626)';
+    hint.innerHTML='🛑 Reached '+count+' emails. Stopped.';
+    hint.style.color='#fca5a5';
+    contBtn.style.display='block';
+  } else {
+    bar.style.background='linear-gradient(90deg,#22c55e,#16a34a)';
+    hint.innerHTML='Will stop at '+next+' emails.';
+    hint.style.color='';
+    contBtn.style.display='none';
+  }
+}
+
+async function saveLimit(){
+  const v=parseInt(document.getElementById('limitInput').value);
+  if(!v || v<1){alert('Enter >= 1');return;}
+  const r=await fetch('/set-send-limit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:v})});
+  const d=await r.json();
+  if(d.success){SEND_LIMIT=d.limit;document.getElementById('limitMsg').textContent='✅ Stop after '+d.limit;setTimeout(()=>{document.getElementById('limitMsg').textContent='';},2500);loadCounter();}
+}
+
+async function resetCounter(){
+  if(!confirm('Reset the counter to 0?')) return;
+  isRunning=false;awaitingReturn=false;currentEmail=null;
+  document.getElementById('stopBtn').style.display='none';
+  document.getElementById('startBtn').style.display='inline-block';
+  await fetch('/reset-session-counter',{method:'POST'});
+  await loadCounter();
+  document.getElementById('launchStatus').innerHTML='<p style="color:red">🔄 Counter reset to 0.</p>';
+}
+
+async function continueCampaign(){
+  await loadCounter();
+  isRunning=true;
+  document.getElementById('startBtn').style.display='none';
+  document.getElementById('stopBtn').style.display='inline-block';
+  document.getElementById('launchStatus').innerHTML='<p style="color:green">▶️ Continuing...</p>';
+  openNext();
+}
+
+function startCampaign(){
+  if(recipients.length===0){alert('Add recipients');return;}
+  isRunning=true;awaitingReturn=false;currentEmail=null;
+  document.getElementById('startBtn').style.display='none';
+  document.getElementById('stopBtn').style.display='inline-block';
+  document.getElementById('launchStatus').innerHTML='<p style="color:green">▶️ Started.</p>';
+  openNext();
+}
+
+function stopCampaign(){
+  isRunning=false;awaitingReturn=false;
+  document.getElementById('startBtn').style.display='inline-block';
+  document.getElementById('stopBtn').style.display='none';
+  document.getElementById('launchStatus').innerHTML='<p style="color:red">⏹️ Stopped.</p>';
+}
+
+function openNext(){
+  if(!isRunning) return;
+  if(recipients.length===0){
+    isRunning=false;
+    document.getElementById('startBtn').style.display='inline-block';
+    document.getElementById('stopBtn').style.display='none';
+    document.getElementById('launchStatus').innerHTML='<p style="color:green">✅ All recipients sent!</p>';
+    return;
+  }
+  currentEmail=recipients[0];
+  awaitingReturn=true;
+  const subj=document.getElementById('subjectLine').value;
+  const body=document.getElementById('messageBody').value;
+  window.location.href='mailto:'+currentEmail+'?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(body);
+}
+
+document.addEventListener('visibilitychange', async function(){
+  if(document.visibilityState==='visible' && isRunning && awaitingReturn && currentEmail){
+    awaitingReturn=false;
+    try{
+      const incRes=await fetch('/increment-session-counter',{method:'POST'});
+      const incData=await incRes.json();
+      SEND_LIMIT=incData.limit;
+      updateCounterUI(incData.count, incData.next_milestone, incData.at_milestone);
+      if(incData.at_milestone){
+        isRunning=false;
+        document.getElementById('startBtn').style.display='inline-block';
+        document.getElementById('stopBtn').style.display='none';
+        document.getElementById('launchStatus').innerHTML='<p style="color:red;font-weight:bold">🛑 Reached '+incData.count+' sent. Stopped.</p>';
+        return;
+      }
+      recipients.shift();
+      document.getElementById('emailsInput').value=recipients.join('\\n');
+      document.getElementById('emailCount').textContent=recipients.length+' recipients';
+      saveState();
+      setTimeout(openNext, 1500);
+    }catch(e){
+      console.error(e);
+      setTimeout(openNext, 1500);
+    }
+  }
+});
 
 async function loadFromFinder(){
-  const status = document.getElementById('loadStatus');
-  status.textContent = '⏳ Loading from Finder...';
+  const status=document.getElementById('loadStatus');
+  status.textContent='⏳ Loading from Finder...';
   try{
-    const res = await fetch('/get-stored-emails');
-    const data = await res.json();
-    if(!data.emails || data.emails.length === 0){
-      status.innerHTML = '<span style="color:#dc2626">No emails found in Finder results.</span>';
-      return;
-    }
-    document.getElementById('emailsInput').value = data.emails.join('\\n');
+    const res=await fetch('/get-stored-emails');
+    const data=await res.json();
+    if(!data.emails || data.emails.length===0){status.innerHTML='<span style="color:#dc2626">No emails found in Finder results.</span>';return;}
+    document.getElementById('emailsInput').value=data.emails.join('\\n');
     syncRecipients();
-    status.innerHTML = '<span style="color:#16a34a">✅ Loaded ' + data.emails.length + ' emails from Finder</span>';
-  }catch(e){ status.innerHTML = '<span style="color:#dc2626">Error: ' + e.message + '</span>'; }
+    status.innerHTML='<span style="color:#16a34a">✅ Loaded '+data.emails.length+' emails from Finder</span>';
+  }catch(e){status.innerHTML='<span style="color:#dc2626">Error: '+e.message+'</span>';}
 }
 
 async function loadFromVerified(){
-  const status = document.getElementById('loadStatus');
-  status.textContent = '⏳ Loading from last Verify job...';
+  const status=document.getElementById('loadStatus');
+  status.textContent='⏳ Loading from last Verify job...';
   try{
-    const res = await fetch('/get-verified-emails');
-    const data = await res.json();
-    if(!data.emails || data.emails.length === 0){
-      status.innerHTML = '<span style="color:#dc2626">No valid emails from last verify job.</span>';
-      return;
-    }
-    document.getElementById('emailsInput').value = data.emails.join('\\n');
+    const res=await fetch('/get-verified-emails');
+    const data=await res.json();
+    if(!data.emails || data.emails.length===0){status.innerHTML='<span style="color:#dc2626">No valid emails from last verify job.</span>';return;}
+    document.getElementById('emailsInput').value=data.emails.join('\\n');
     syncRecipients();
-    status.innerHTML = '<span style="color:#16a34a">✅ Loaded ' + data.emails.length + ' verified emails</span>';
-  }catch(e){ status.innerHTML = '<span style="color:#dc2626">Error: ' + e.message + '</span>'; }
+    status.innerHTML='<span style="color:#16a34a">✅ Loaded '+data.emails.length+' verified emails</span>';
+  }catch(e){status.innerHTML='<span style="color:#dc2626">Error: '+e.message+'</span>';}
 }
 
 function clearRecipients(){
   if(!confirm('Clear all recipients?')) return;
-  document.getElementById('emailsInput').value = '';
+  document.getElementById('emailsInput').value='';
   syncRecipients();
-  document.getElementById('loadStatus').textContent = '';
+  document.getElementById('loadStatus').textContent='';
 }
 
-async function saveState(){try{await fetch('/save-scout-state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients:recipients,subject:document.getElementById('subjectLine').value,message:document.getElementById('messageBody').value,count:scoutedEmails})})}catch(e){}}
-function startCampaign(){if(recipients.length===0){alert('Add recipients');return}isRunning=true;openNextEmail()}
-function stopCampaign(){isRunning=false}
-function openNextEmail(){if(!isRunning)return;if(scoutedEmails>=recipients.length){isRunning=false;return}const email=recipients[scoutedEmails];const subj=document.getElementById('subjectLine').value;const msg=document.getElementById('messageBody').value;const body=msg.replace('{name}','Store Owner').replace('{email}',email);window.location.href='mailto:'+email+'?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(body);scoutedEmails++;saveState()}
-document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible'&&isRunning)setTimeout(openNextEmail,2000)});
+async function saveState(){
+  try{
+    await fetch('/save-scout-state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      recipients:recipients,
+      subject:document.getElementById('subjectLine').value,
+      message:document.getElementById('messageBody').value,
+      count:0
+    })});
+  }catch(e){}
+}
 </script>'''
     return render_page("Scout", body)
 
