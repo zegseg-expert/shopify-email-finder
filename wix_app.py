@@ -433,7 +433,6 @@ def audit_store_wix(domain, case_id):
     report["site_type"] = site_type
     report["checks"]["site_type"] = site_type
 
-    # Products — physical + digital stores only
     if site_type in ('physical_store', 'digital_store'):
         try:
             products = extract_wix_products(html, base_url, 3)
@@ -444,13 +443,11 @@ def audit_store_wix(domain, case_id):
                 report["issues"].append({"title":"No Products Detected","description":"Could not find product pages","recommendation":"Feature products on homepage","severity":"high"})
         except: pass
 
-    # Mobile — all
     hv = 'name="viewport"' in low
     report["checks"]["mobile_responsive"] = hv
     if hv: report["positives"].append("Mobile responsive")
     else: report["issues"].append({"title":"Not Mobile Responsive","description":"Missing viewport","recommendation":"Enable mobile in Wix editor","severity":"high"})
 
-    # Contact — all
     he = bool(re.search(r'mailto:[^"\']+', html))
     hp = bool(re.search(r'tel:[^"\']+', html))
     report["checks"]["has_email_link"] = he
@@ -458,13 +455,11 @@ def audit_store_wix(domain, case_id):
     if he or hp: report["positives"].append("Contact info present")
     else: report["issues"].append({"title":"No Contact Info","description":"No email/phone link on homepage","recommendation":"Add a Contact page with email","severity":"high"})
 
-    # Social — all
     socials = [p.split('.')[0] for p in ['facebook.com','instagram.com','twitter.com','tiktok.com','youtube.com','pinterest.com','linkedin.com'] if p in low]
     report["checks"]["social_links"] = socials
     if len(socials) >= 2: report["positives"].append(f"{len(socials)} socials")
     elif not socials: report["issues"].append({"title":"No Social Media","description":"None found on homepage","recommendation":"Add social profiles","severity":"medium"})
 
-    # Policies — physical + digital only
     pf = 0
     if site_type in ('physical_store', 'digital_store'):
         policy_paths = ['/terms', '/privacy', '/shipping', '/returns', '/policies',
@@ -482,7 +477,6 @@ def audit_store_wix(domain, case_id):
         if pf >= 3: report["positives"].append(f"{pf} policy pages present")
         elif pf < 2: report["issues"].append({"title":"Missing Policies","description":f"Only {pf} policy pages found","recommendation":"Add terms, privacy, and returns/refund policy","severity":"high"})
 
-    # Payments — physical + digital only
     payments = []
     if site_type in ('physical_store', 'digital_store'):
         for name, sigs in {"PayPal":["paypal.com","paypal"],"Stripe":["stripe.com","js.stripe"],"Apple Pay":["apple-pay","applepay"],"Google Pay":["google-pay","googlepay"]}.items():
@@ -492,7 +486,6 @@ def audit_store_wix(domain, case_id):
         if len(payments) >= 2: report["positives"].append(f"{len(payments)} payment options")
         elif len(payments) == 0: report["issues"].append({"title":"No Payment Method Detected","description":"Could not detect a payment provider","recommendation":"Add PayPal or Stripe for checkout","severity":"medium"})
 
-    # Free shipping — physical only
     free_ship = False
     if site_type == 'physical_store':
         free_ship = any(x in low for x in ['free shipping','free delivery','shipping on us'])
@@ -500,7 +493,6 @@ def audit_store_wix(domain, case_id):
         if free_ship: report["positives"].append("Free shipping banner present")
         else: report["issues"].append({"title":"No Free Shipping Banner","description":"Free shipping is a top buyer priority","recommendation":"Advertise a free shipping threshold on your homepage","severity":"medium"})
 
-    # Service-specific
     if site_type == 'service_site':
         has_booking = any(x in low for x in ['book now','booking','schedule','appointment','calendly','wix-bookings','book a'])
         report["checks"]["has_booking"] = has_booking
@@ -517,7 +509,6 @@ def audit_store_wix(domain, case_id):
         if not has_services_list:
             report["issues"].append({"title":"No Services Section","description":"Clear services list is missing","recommendation":"Add a dedicated Services section","severity":"medium"})
 
-    # Informational-specific
     if site_type == 'informational':
         has_about = any(x in low for x in ['about us','our story','our mission','who we are'])
         report["checks"]["has_about"] = has_about
@@ -529,7 +520,6 @@ def audit_store_wix(domain, case_id):
         if has_donate_or_contact: report["positives"].append("Clear call-to-action")
         else: report["issues"].append({"title":"No Call-to-Action","description":"No obvious next step for visitors","recommendation":"Add a Contact / Subscribe / Donate CTA","severity":"medium"})
 
-    # SEO — all
     tm = re.search(r'<title[^>]*>(.*?)</title>', html, re.I | re.S)
     dm = re.search(r'<meta[^>]*name=["\']description["\'][^>]*content=["\']([^"\']*)["\']', html, re.I | re.S)
     title = tm.group(1).strip() if tm else ''
@@ -539,7 +529,6 @@ def audit_store_wix(domain, case_id):
     if not title: report["issues"].append({"title":"Missing Page Title","description":"No <title> tag","recommendation":"Add a descriptive page title","severity":"high"})
     if not desc: report["issues"].append({"title":"Missing Meta Description","description":"No meta description","recommendation":"Add a 150-160 character description","severity":"medium"})
 
-    # Scoring
     trust = 0
     if he or hp: trust += 25
     if len(socials) >= 2: trust += 15
@@ -634,7 +623,6 @@ WIX_SIGNOFF_LINES = {
 }
 WIX_SIGNOFFS = ["Best regards,", "Cheers,", "Best,", "Warmly,"]
 
-# Site-type-aware openers
 WIX_TYPE_OPENERS = {
     'friendly': {
         'physical_store': "Just had a quick look at {url} — nice product lineup. Spotted a few things.",
@@ -659,7 +647,6 @@ WIX_TYPE_OPENERS = {
     }
 }
 
-# Subject pools
 WIX_SUBJECT_TEMPLATES = {
     'friendly': {
         'low_score': ["Quick note about {brand}","Spotted something on {brand}","A few things on {brand}","{brand} — quick heads up","Small things I noticed on {brand}","Just checked {brand} — 3 quick wins","Idea for {brand}","Noticed a few things on {brand}","One thing about {brand}","Had a look at {brand}"],
@@ -715,10 +702,8 @@ def generate_wix_email(report, tone='friendly', sender_name='', email=''):
     top_issues = sorted_issues[:3]
     issue_bullets = [i.get('title','') for i in top_issues]
 
-    # Randomized subject
     subject = _wix_pick_subject(report, tone)
 
-    # Site-aware opener
     if display_url:
         opener_template = WIX_TYPE_OPENERS.get(tone, WIX_TYPE_OPENERS['friendly']).get(site_type, WIX_TYPE_OPENERS[tone]['unknown'])
         opener = opener_template.replace('{url}', display_url)
@@ -1020,29 +1005,202 @@ window.onload = function(){ refresh(); setInterval(refresh, 10000); };
 @wix_bp.route('/wix/scout')
 def wix_scout_page():
     if 'user_id' not in session: return redirect('/login')
+    user_email = session.get('user_id')
+    try:
+        current_limit = wix_get_send_limit(user_email)
+    except:
+        current_limit = 70
     body = '''<div style="max-width:900px;margin:20px auto;padding:20px">
 <div style="background:#8b5cf6;color:white;padding:20px;border-radius:10px;margin-bottom:20px"><h1 style="margin:0">📨 Wix Scout</h1></div>
+
 <div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
+<h3 style="margin-top:0">📥 Recipients</h3>
 <button onclick="fromVerified()" style="background:#f59e0b;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;margin-bottom:10px">✅ From Wix Verified</button>
-<textarea id="emailsInput" style="width:100%;height:160px;padding:10px;border:1px solid #ddd;border-radius:5px;font-family:monospace;box-sizing:border-box"></textarea>
+<textarea id="emailsInput" oninput="syncRecipients()" style="width:100%;height:160px;padding:10px;border:1px solid #ddd;border-radius:5px;font-family:monospace;box-sizing:border-box"></textarea>
 <div id="count" style="margin-top:10px;font-weight:bold">0 recipients</div>
+<div id="loadStatus" style="margin-top:6px;font-size:13px"></div>
 </div>
+
 <div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
+<h3 style="margin-top:0">✍️ Template</h3>
 <input type="text" id="subjectLine" placeholder="Subject" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;margin-bottom:10px;box-sizing:border-box">
 <textarea id="messageBody" rows="5" placeholder="Message" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;box-sizing:border-box"></textarea>
 </div>
+
+<div style="background:linear-gradient(135deg,#1f2937,#374151);color:white;padding:16px;border-radius:10px;margin-bottom:20px">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+<span style="font-size:15px;font-weight:bold">📧 Sent this session</span>
+<span id="counterText" style="font-size:20px;font-weight:bold">0 / ''' + str(current_limit) + '''</span>
+</div>
+<div style="background:#111827;border-radius:8px;overflow:hidden;height:14px">
+<div id="counterBar" style="width:0%;height:100%;background:linear-gradient(90deg,#22c55e,#16a34a)"></div>
+</div>
+<div id="counterHint" style="font-size:12px;margin-top:8px;opacity:0.85">Auto stops at milestone. Press Continue to resume.</div>
+<div style="margin-top:12px;padding-top:12px;border-top:1px solid #4b5563">
+<label style="font-size:13px;font-weight:bold;display:block;margin-bottom:6px">⚙️ Stop after N emails:</label>
+<div style="display:flex;gap:8px;align-items:center">
+<input type="number" id="limitInput" value="''' + str(current_limit) + '''" min="1" max="10000" style="flex:1;padding:8px;border:1px solid #4b5563;border-radius:6px;background:#111827;color:white;font-size:14px;box-sizing:border-box">
+<button onclick="saveLimit()" style="background:#8b5cf6;color:white;padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-weight:bold">Save</button>
+</div>
+<div id="limitMsg" style="font-size:12px;color:#c4b5fd;margin-top:4px"></div>
+</div>
+<div style="display:flex;gap:8px;margin-top:12px">
+<button id="continueBtn" onclick="continueCampaign()" style="display:none;flex:1;background:#8b5cf6;color:white;padding:10px;border:none;border-radius:6px;cursor:pointer;font-weight:bold">▶️ Continue</button>
+<button onclick="resetCounter()" style="background:#dc2626;color:white;padding:10px 16px;border:none;border-radius:6px;cursor:pointer">🔄 Reset</button>
+</div>
+</div>
+
 <div style="background:white;padding:20px;border-radius:10px">
-<button onclick="start()" style="background:#8b5cf6;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer">▶️ Start</button>
-<button onclick="stop()" style="background:#ef4444;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer">⏹️ Stop</button>
+<button onclick="startCampaign()" id="startBtn" style="background:#8b5cf6;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin-right:8px">▶️ Start</button>
+<button onclick="stopCampaign()" id="stopBtn" style="background:#ef4444;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;display:none">⏹️ Stop</button>
+<div id="launchStatus" style="margin-top:10px"></div>
 </div>
 </div>
 <script>
-let recipients=[], i=0, running=false;
-async function fromVerified(){ const r = await fetch('/wix/get-wix-verified-emails'); const d = await r.json(); if(d.emails && d.emails.length){ document.getElementById('emailsInput').value = d.emails.join('\\n'); recipients = d.emails; document.getElementById('count').textContent = recipients.length+' recipients'; } else alert('No verified Wix emails'); }
-function start(){ const v = document.getElementById('emailsInput').value; recipients = v.split('\\n').map(x=>x.trim()).filter(x=>x); if(!recipients.length){ alert('None'); return; } running=true; i=0; next(); }
-function stop(){ running=false; }
-function next(){ if(!running || i>=recipients.length){ running=false; return; } const e = recipients[i]; const s = document.getElementById('subjectLine').value; const b = document.getElementById('messageBody').value; window.location.href='mailto:'+e+'?subject='+encodeURIComponent(s)+'&body='+encodeURIComponent(b); i++; }
-document.addEventListener('visibilitychange', function(){ if(document.visibilityState==='visible' && running) setTimeout(next, 2000); });
+let recipients=[];
+let isRunning=false;
+let currentEmail=null;
+let awaitingReturn=false;
+let SEND_LIMIT=''' + str(current_limit) + ''';
+
+function syncRecipients(){
+  const val=document.getElementById('emailsInput').value;
+  recipients=val.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);
+  document.getElementById('count').textContent=recipients.length+' recipients';
+}
+
+window.onload=async function(){
+  await loadCounter();
+};
+
+async function loadCounter(){
+  try{
+    const r=await fetch('/wix/get-counter');
+    const d=await r.json();
+    SEND_LIMIT=d.limit;
+    document.getElementById('limitInput').value=d.limit;
+    updateCounterUI(d.count, d.next_milestone, d.at_milestone);
+  }catch(e){}
+}
+
+function updateCounterUI(count, next, at){
+  document.getElementById('counterText').textContent=count+' / '+next;
+  const within=count % SEND_LIMIT;
+  const pct=count>0 && within===0 ? 100 : Math.round((within/SEND_LIMIT)*100);
+  const bar=document.getElementById('counterBar');
+  bar.style.width=pct+'%';
+  const hint=document.getElementById('counterHint');
+  const contBtn=document.getElementById('continueBtn');
+  if(at){
+    bar.style.background='linear-gradient(90deg,#ef4444,#dc2626)';
+    hint.innerHTML='🛑 Reached '+count+' emails. Stopped.';
+    hint.style.color='#fca5a5';
+    contBtn.style.display='block';
+  } else {
+    bar.style.background='linear-gradient(90deg,#22c55e,#16a34a)';
+    hint.innerHTML='Will stop at '+next+' emails.';
+    hint.style.color='';
+    contBtn.style.display='none';
+  }
+}
+
+async function saveLimit(){
+  const v=parseInt(document.getElementById('limitInput').value);
+  if(!v || v<1){alert('Enter >= 1');return;}
+  const r=await fetch('/wix/set-limit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:v})});
+  const d=await r.json();
+  if(d.success){SEND_LIMIT=d.limit;document.getElementById('limitMsg').textContent='✅ Stop after '+d.limit;setTimeout(()=>{document.getElementById('limitMsg').textContent='';},2500);loadCounter();}
+}
+
+async function resetCounter(){
+  if(!confirm('Reset the counter to 0?')) return;
+  isRunning=false;awaitingReturn=false;currentEmail=null;
+  document.getElementById('stopBtn').style.display='none';
+  document.getElementById('startBtn').style.display='inline-block';
+  await fetch('/wix/reset-counter',{method:'POST'});
+  await loadCounter();
+  document.getElementById('launchStatus').innerHTML='<p style="color:red">🔄 Counter reset to 0.</p>';
+}
+
+async function continueCampaign(){
+  await loadCounter();
+  isRunning=true;
+  document.getElementById('startBtn').style.display='none';
+  document.getElementById('stopBtn').style.display='inline-block';
+  document.getElementById('launchStatus').innerHTML='<p style="color:green">▶️ Continuing...</p>';
+  openNext();
+}
+
+function startCampaign(){
+  if(recipients.length===0){alert('Add recipients');return;}
+  isRunning=true;awaitingReturn=false;currentEmail=null;
+  document.getElementById('startBtn').style.display='none';
+  document.getElementById('stopBtn').style.display='inline-block';
+  document.getElementById('launchStatus').innerHTML='<p style="color:green">▶️ Started.</p>';
+  openNext();
+}
+
+function stopCampaign(){
+  isRunning=false;awaitingReturn=false;
+  document.getElementById('startBtn').style.display='inline-block';
+  document.getElementById('stopBtn').style.display='none';
+  document.getElementById('launchStatus').innerHTML='<p style="color:red">⏹️ Stopped.</p>';
+}
+
+function openNext(){
+  if(!isRunning) return;
+  if(recipients.length===0){
+    isRunning=false;
+    document.getElementById('startBtn').style.display='inline-block';
+    document.getElementById('stopBtn').style.display='none';
+    document.getElementById('launchStatus').innerHTML='<p style="color:green">✅ All recipients sent!</p>';
+    return;
+  }
+  currentEmail=recipients[0];
+  awaitingReturn=true;
+  const subj=document.getElementById('subjectLine').value;
+  const body=document.getElementById('messageBody').value;
+  window.location.href='mailto:'+currentEmail+'?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(body);
+}
+
+document.addEventListener('visibilitychange', async function(){
+  if(document.visibilityState==='visible' && isRunning && awaitingReturn && currentEmail){
+    awaitingReturn=false;
+    try{
+      const incRes=await fetch('/wix/increment-counter',{method:'POST'});
+      const incData=await incRes.json();
+      SEND_LIMIT=incData.limit;
+      updateCounterUI(incData.count, incData.next_milestone, incData.at_milestone);
+      if(incData.at_milestone){
+        isRunning=false;
+        document.getElementById('startBtn').style.display='inline-block';
+        document.getElementById('stopBtn').style.display='none';
+        document.getElementById('launchStatus').innerHTML='<p style="color:red;font-weight:bold">🛑 Reached '+incData.count+' sent. Stopped.</p>';
+        return;
+      }
+      recipients.shift();
+      document.getElementById('emailsInput').value=recipients.join('\\n');
+      document.getElementById('count').textContent=recipients.length+' recipients';
+      setTimeout(openNext, 1500);
+    }catch(e){
+      console.error(e);
+      setTimeout(openNext, 1500);
+    }
+  }
+});
+
+async function fromVerified(){
+  const status=document.getElementById('loadStatus');
+  status.textContent='⏳ Loading...';
+  try{
+    const r=await fetch('/wix/get-wix-verified-emails');
+    const d=await r.json();
+    if(!d.emails || d.emails.length===0){status.innerHTML='<span style="color:#dc2626">No verified Wix emails.</span>';return;}
+    document.getElementById('emailsInput').value=d.emails.join('\\n');
+    syncRecipients();
+    status.innerHTML='<span style="color:#16a34a">✅ Loaded '+d.emails.length+' verified emails</span>';
+  }catch(e){status.innerHTML='<span style="color:#dc2626">Error: '+e.message+'</span>';}
+}
 </script>'''
     return _page("Wix Scout", body)
 
