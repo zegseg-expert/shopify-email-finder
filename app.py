@@ -2498,6 +2498,19 @@ def audit_page():
 </div>
 
 <div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
+<h3 style="margin-top:0">📤 Send Method</h3>
+<label style="display:flex;align-items:center;gap:10px;padding:10px;background:#f9f9f9;border-radius:8px;margin-bottom:8px;cursor:pointer;font-size:14px">
+<input type="radio" name="sendMethod" value="mailto" onchange="setSendMethod('mailto')">
+<div><b>📧 Gmail (mailto)</b><br><span style="font-size:12px;color:#666">Opens Gmail app on your phone. Existing method.</span></div>
+</label>
+<label style="display:flex;align-items:center;gap:10px;padding:10px;background:#f0fdf4;border-radius:8px;cursor:pointer;font-size:14px;border:2px solid #16a34a">
+<input type="radio" name="sendMethod" value="brevo" checked onchange="setSendMethod('brevo')">
+<div><b>🚀 Brevo SMTP</b><br><span style="font-size:12px;color:#166534">Sends directly from server. No Gmail. From zegseg@danielphillips.dev</span></div>
+</label>
+<div id="sendMethodHint" style="font-size:12px;color:#666;margin-top:8px">Currently: <b>Brevo SMTP</b> — fully automatic, no Gmail opens</div>
+</div>
+
+<div style="background:white;padding:20px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin-bottom:20px">
 <h3 style="margin-top:0">📥 Import Emails</h3>
 <button onclick="importFrom('finder')" style="background:#667eea;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:13px">🔍 From Finder</button>
 <button onclick="importFrom('verified')" style="background:#f59e0b;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;margin:4px;font-size:13px">✅ From Verified</button>
@@ -2590,7 +2603,7 @@ def audit_page():
 <input type="text" id="genSubject" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;margin:5px 0 10px 0;box-sizing:border-box;font-size:14px">
 <label style="font-weight:bold;font-size:13px">Message:</label>
 <textarea id="genBody" rows="10" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;margin-top:5px;box-sizing:border-box;font-size:13px;font-family:monospace"></textarea>
-<button onclick="sendToScoutAndOpen()" style="background:#0d9488;color:white;padding:12px 24px;border:none;border-radius:6px;cursor:pointer;font-size:15px;margin-top:12px;margin-right:8px">📨 Send to Scout & Open Gmail</button>
+<button onclick="sendToScoutAndOpen()" style="background:#0d9488;color:white;padding:12px 24px;border:none;border-radius:6px;cursor:pointer;font-size:15px;margin-top:12px;margin-right:8px">📨 Send Now</button>
 <button onclick="skipCurrent()" style="background:#6b7280;color:white;padding:12px 24px;border:none;border-radius:6px;cursor:pointer;font-size:15px;margin-top:12px">⏭️ Skip</button>
 <div id="actionStatus" style="font-size:13px;color:green;margin-top:8px"></div>
 </div>
@@ -2616,6 +2629,17 @@ let autoMode = false;
 let autoTone = 'friendly';
 let pendingAction = false;
 let SEND_LIMIT = ''' + str(current_limit) + ''';
+
+let sendMethod = localStorage.getItem('sendMethod') || 'brevo';
+function setSendMethod(m){
+  sendMethod = m;
+  localStorage.setItem('sendMethod', m);
+  const hint = document.getElementById('sendMethodHint');
+  if(hint){
+    hint.innerHTML = 'Currently: <b>' + (m === 'brevo' ? 'Brevo SMTP' : 'Gmail (mailto)') + '</b>' + (m === 'brevo' ? ' — fully automatic, no Gmail opens' : ' — opens Gmail app');
+  }
+  document.querySelectorAll('input[name="sendMethod"]').forEach(r => { r.checked = (r.value === m); });
+}
 
 const MAX_PARALLEL = 3;
 let readyBuffer = [];
@@ -3014,9 +3038,33 @@ async function sendToScoutAndOpen(){
   if(!subj || !body){ alert('Generate email first'); return; }
   const itemId = currentItem.id;
   const itemEmail = currentItem.email;
+  const senderName = document.getElementById('senderName').value.trim();
   await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id:itemId, subject:subj, message:body})});
   await fetch('/save-scout-recipients', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [itemEmail]})});
   await fetch('/save-scout-state', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [itemEmail], subject:subj, message:body, count:0})});
+
+  if(sendMethod === 'brevo'){
+    document.getElementById('actionStatus').textContent = '⏳ Sending via Brevo...';
+    try{
+      const r = await fetch('/send-email', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({to: itemEmail, subject: subj, body: body, sender_name: senderName})});
+      const d = await r.json();
+      if(!d.success){
+        document.getElementById('actionStatus').textContent = '❌ ' + (d.error || 'Send failed');
+        return;
+      }
+    }catch(e){
+      document.getElementById('actionStatus').textContent = '❌ Network error: ' + e.message;
+      return;
+    }
+    await fetch('/delete-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id: itemId})});
+    await loadCounter();
+    loadQueue();
+    document.getElementById('actionStatus').textContent = '✅ Sent via Brevo';
+    currentItem = null;
+    document.getElementById('auditSection').style.display = 'none';
+    return;
+  }
+
   await fetch('/mark-sent', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({email: itemEmail})});
   await fetch('/delete-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id: itemId})});
   await fetch('/increment-session-counter', {method:'POST'});
@@ -3112,9 +3160,45 @@ async function autoSend(){
   }
   const itemId = currentItem.id;
   const itemEmail = currentItem.email;
+  const senderName = document.getElementById('senderName').value.trim();
   await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id:itemId, subject:subj, message:body})});
   await fetch('/save-scout-recipients', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [itemEmail]})});
   await fetch('/save-scout-state', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({recipients: [itemEmail], subject:subj, message:body, count:0})});
+
+  if(sendMethod === 'brevo'){
+    try{
+      const r = await fetch('/send-email', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({to: itemEmail, subject: subj, body: body, sender_name: senderName})});
+      const d = await r.json();
+      if(d.success && d.counter){
+        SEND_LIMIT = d.counter.limit;
+        updateCounterUI(d.counter.count, d.counter.next_milestone, d.counter.at_milestone);
+        if(d.counter.at_milestone){
+          autoMode = false;
+          playAlarm();
+          document.getElementById('modeStatus').innerHTML = '<p style="color:red;font-weight:bold">🛑 Milestone reached ('+d.counter.count+' sent). Auto paused.</p>';
+          document.getElementById('stopBtn').style.display = 'none';
+          return;
+        }
+      } else {
+        await fetch('/update-queue-item', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:itemId, status:'pending'})});
+        autoMode = false;
+        document.getElementById('modeStatus').innerHTML = '<p style="color:red">❌ Brevo error: '+(d.error||'unknown')+'. Auto stopped.</p>';
+        document.getElementById('stopBtn').style.display = 'none';
+        return;
+      }
+    }catch(e){
+      autoMode = false;
+      document.getElementById('modeStatus').innerHTML = '<p style="color:red">❌ Network error. Auto stopped.</p>';
+      document.getElementById('stopBtn').style.display = 'none';
+      return;
+    }
+    await fetch('/delete-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id: itemId})});
+    loadQueue();
+    currentItem = null;
+    setTimeout(nextAuto, 1200);
+    return;
+  }
+
   await fetch('/mark-sent', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({email: itemEmail})});
   await fetch('/delete-queue-item', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({id: itemId})});
   try{
@@ -3130,7 +3214,7 @@ async function autoSend(){
 }
 
 document.addEventListener('visibilitychange', function(){
-  if(document.visibilityState === 'visible' && autoMode){
+  if(document.visibilityState === 'visible' && autoMode && sendMethod === 'mailto'){
     const lastSent = localStorage.getItem('lastAutoSentId');
     if(lastSent){
       localStorage.removeItem('lastAutoSentId');
@@ -3140,7 +3224,11 @@ document.addEventListener('visibilitychange', function(){
   }
 });
 
-window.onload = function(){ loadQueue(); loadCounter(); };
+window.onload = function(){
+  loadQueue();
+  loadCounter();
+  setSendMethod(sendMethod);
+};
 </script>'''
     return render_page("Analyze & Send", body)
 
