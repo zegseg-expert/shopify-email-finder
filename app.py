@@ -1501,6 +1501,43 @@ def generate_outreach_email(report, tone='friendly', sender_name='', email=''):
     return {'subject': subject, 'body': body, 'tone': tone}
 
 # ==========================================
+# BREVO SMTP SENDER
+# ==========================================
+def send_via_brevo(to_email, subject, body, sender_name='', sender_email=None):
+    """Send a single email through Brevo SMTP."""
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.utils import formataddr, formatdate, make_msgid
+
+    server = os.environ.get('BREVO_SMTP_SERVER', 'smtp-relay.brevo.com')
+    port = int(os.environ.get('BREVO_SMTP_PORT', '587'))
+    login = os.environ.get('BREVO_SMTP_LOGIN', '')
+    password = os.environ.get('BREVO_SMTP_KEY', '')
+    from_addr = sender_email or 'zegseg@danielphillips.dev'
+    from_name = (sender_name or 'Daniel Phillips').strip()
+
+    if not login or not password:
+        return False, 'Brevo credentials missing in environment'
+
+    msg = MIMEText(body, 'plain', 'utf-8')
+    msg['Subject'] = subject
+    msg['From'] = formataddr((from_name, from_addr))
+    msg['To'] = to_email
+    msg['Date'] = formatdate(localtime=True)
+    msg['Message-ID'] = make_msgid(domain='danielphillips.dev')
+
+    try:
+        with smtplib.SMTP(server, port, timeout=20) as s:
+            s.ehlo()
+            s.starttls()
+            s.ehlo()
+            s.login(login, password)
+            s.sendmail(from_addr, [to_email], msg.as_string())
+        return True, None
+    except Exception as e:
+        return False, str(e)[:300]
+
+# ==========================================
 # NAVBAR
 # ==========================================
 NAVBAR = '''
@@ -1548,7 +1585,6 @@ function closeDrawer(){document.getElementById('drawer').classList.remove('open'
 
 def render_page(title, body):
     return f'<!DOCTYPE html><html><head><title>{title}</title><meta name="viewport" content="width=device-width,initial-scale=1">{NAVBAR}</head><body style="margin:0;font-family:Arial"><div class="page-content">{body}</div></body></html>'
-
 # ==========================================
 # AUTH
 # ==========================================
