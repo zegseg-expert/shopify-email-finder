@@ -3339,6 +3339,124 @@ def verify_async():
     if not emails: return jsonify({'error': 'No emails'}), 400
     conn = get_db()
     if not conn: return jsonify({'error': 'No DB'}), 500
+# ==========================================
+# EMAIL SEND API
+# ==========================================
+@app.route('/send-email', methods=['POST'])
+@login_required
+def send_email_route():
+    user_email = session.get('user_id')
+    data = request.json or {}
+    to_email = (data.get('to') or '').strip()
+    subject = (data.get('subject') or '').strip()
+    body = (data.get('body') or '').strip()
+    sender_name = (data.get('sender_name') or '').strip()
+    if not sender_name:
+        sender_name = get_user_sender_name(user_email) or 'Daniel Phillips'
+    if not to_email or not subject or not body:
+        return jsonify({'success': False, 'error': 'Missing to/subject/body'})
+    ok, err = send_via_brevo(to_email, subject, body, sender_name)
+    if not ok:
+        return jsonify({'success': False, 'error': err})
+    try:
+        mark_sent(user_email, to_email)
+        increment_session_sent_count(user_email)
+    except Exception as e:
+        print(f"post-send bookkeeping error: {e}")
+    return jsonify({'success': True, 'counter': counter_status(user_email)})
+
+# ==========================================
+# SESSION COUNTER API
+# ==========================================
+@app.route('/get-session-counter')
+@login_required
+def get_session_counter_route():
+    user_email = session.get('user_id')
+    return jsonify(counter_status(user_email))
+
+@app.route('/increment-session-counter', methods=['POST'])
+@login_required
+def increment_session_counter_route():
+    user_email = session.get('user_id')
+    increment_session_sent_count(user_email)
+    return jsonify(counter_status(user_email))
+
+@app.route('/reset-session-counter', methods=['POST'])
+@login_required
+def reset_session_counter_route():
+    user_email = session.get('user_id')
+    reset_session_sent_count(user_email)
+    return jsonify(counter_status(user_email))
+
+@app.route('/set-send-limit', methods=['POST'])
+@login_required
+def set_send_limit_route():
+    user_email = session.get('user_id')
+    try:
+        limit = int(request.json.get('limit', DEFAULT_SEND_LIMIT))
+    except:
+        return jsonify({'success': False, 'error': 'Invalid limit'})
+    if limit < 1: limit = 1
+    if limit > 10000: limit = 10000
+    ok = set_send_limit(user_email, limit)
+    if ok:
+        return jsonify({'success': True, 'limit': limit})
+    return jsonify({'success': False, 'error': 'Could not save'})
+
+@app.route('/analyze-queue-item', methods=['POST'])
+@login_required
+def analyze_queue_item():
+    user_email = session.get('user_id')
+    data = request.json
+    item_id = data.get('id')
+    include_catalogue = bool(data.get('include_catalogue', False))
+    item = get_queue_item(item_id, user_email)
+    if not item: return jsonify({'success': False, 'error': 'Item not found'})
+    if item.get('report'):
+        return jsonify({'success': True, 'item': item})
+    case_id = generate_case_id()
+    report = audit_store(item['domain'], case_id, include_catalogue=include_catalogue)
+    update_queue_item(item_id, user_email, report=report, status='current')
+    save_audit_history(user_email, item['domain'], report)
+    item = get_queue_item(item_id, user_email)
+    return jsonify({'success': True, 'item': item})
+
+@app.route('/save-sender-name', methods=['POST'])
+@login_required
+def save_sender_name():
+    user_email = session.get('user_id')
+    name = request.json.get('sender_name', '').strip()
+    if user_email and name:
+        set_user_sender_name(user_email, name)
+    return jsonify({'success': True})
+
+@app.route('/generate-email', methods=['POST'])
+@login_required
+def generate_email_route():
+    data = request.json
+    report = data.get('report', {})
+    tone = data.get('tone', 'friendly')
+    sender_name = data.get('sender_name', '').strip()
+    email = data.get('email', '').strip()
+    if not sender_name:
+        sender_name = get_user_sender_name(session.get('user_id')) or ''
+    if not report: return jsonify({'success': False, 'error': 'No report'})
+    try:
+        result = generate_outreach_email(report, tone, sender_name, email)
+        return jsonify({'success': True, 'subject': result['subject'], 'body': result['body']})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/verify-async', methods=['POST'])
+@login_required
+def verify_async():
+    user_email = session.get('user_id')
+    data = request.json
+    emails = data.get('emails', [])
+    job_name = data.get('name', f"Job {int(time.time())}")
+    if not emails: return jsonify({'error': 'No emails'}), 400
+    conn = get_db()
+    if not conn: return jsonify({'error': 'No DB'}), 500
     try:
         cur = conn.cursor()
         cur.execute("""INSERT INTO verify_jobs (user_email, job_name, total, remaining_emails, valid_emails, invalid_emails, status)
