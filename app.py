@@ -1513,7 +1513,7 @@ def send_via_brevo(to_email, subject, body, sender_name='', sender_email=None):
     port = int(os.environ.get('BREVO_SMTP_PORT', '587'))
     login = os.environ.get('BREVO_SMTP_LOGIN', '')
     password = os.environ.get('BREVO_SMTP_KEY', '')
-    from_addr = sender_email or 'zegseg@danielphillips.dev'
+    from_addr = sender_email or 'hello@danielphillips.dev'
     from_name = (sender_name or 'Daniel Phillips').strip()
 
     if not login or not password:
