@@ -2247,13 +2247,26 @@ def scout():
 <div style="background:#0d9488;color:white;padding:20px;border-radius:10px;margin-bottom:20px"><h1 style="margin:0">📨 Email Scout</h1></div>
 
 <div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
+<h3 style="margin-top:0">📤 Send Method</h3>
+<label style="display:flex;align-items:center;gap:10px;padding:10px;background:#f9f9f9;border-radius:8px;margin-bottom:8px;cursor:pointer;font-size:14px">
+<input type="radio" name="scoutSendMethod" value="mailto" onchange="setScoutMethod('mailto')">
+<div><b>📧 Gmail (mailto)</b><br><span style="font-size:12px;color:#666">Opens Gmail app on your phone.</span></div>
+</label>
+<label style="display:flex;align-items:center;gap:10px;padding:10px;background:#f0fdf4;border-radius:8px;cursor:pointer;font-size:14px;border:2px solid #16a34a">
+<input type="radio" name="scoutSendMethod" value="brevo" checked onchange="setScoutMethod('brevo')">
+<div><b>🚀 Brevo SMTP</b><br><span style="font-size:12px;color:#166534">Sends directly from server. No Gmail. From hello@danielphillips.dev</span></div>
+</label>
+<div id="scoutSendHint" style="font-size:12px;color:#666;margin-top:8px">Currently: <b>Brevo SMTP</b> — fully automatic, no Gmail opens</div>
+</div>
+
+<div style="background:white;padding:20px;border-radius:10px;margin-bottom:20px">
 <h3 style="margin-top:0">📥 Recipients</h3>
 <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
 <button onclick="loadFromFinder()" style="background:#667eea;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;font-size:13px">📥 From Finder</button>
 <button onclick="loadFromVerified()" style="background:#f59e0b;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;font-size:13px">✅ From Verified</button>
 <button onclick="clearRecipients()" style="background:#ef4444;color:white;padding:8px 14px;border:none;border-radius:6px;cursor:pointer;font-size:13px">🗑️ Clear</button>
 </div>
-<textarea id="emailsInput" oninput="syncRecipients()" style="width:100%;height:160px;border:1px solid #ddd;border-radius:5px;padding:10px;font-family:monospace;box-sizing:border-box"></textarea>
+<textarea id="emailsInput" oninput="syncRecipients()" style="width:100%;height:160px;border:1px solid #ddd;border-radius:5px;padding:10px;font-family:monospace;box-sizing:border-box" placeholder="Paste emails, one per line&#10;e.g.&#10;test@gmail.com&#10;hello@example.com"></textarea>
 <div id="emailCount" style="margin-top:10px;font-weight:bold">0 recipients</div>
 <div id="loadStatus" style="margin-top:6px;font-size:13px"></div>
 </div>
@@ -2262,6 +2275,7 @@ def scout():
 <h3 style="margin-top:0">✍️ Template</h3>
 <input type="text" id="subjectLine" placeholder="Subject" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;margin-bottom:10px;box-sizing:border-box">
 <textarea id="messageBody" rows="5" placeholder="Message" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:5px;box-sizing:border-box"></textarea>
+<div style="font-size:12px;color:#666;margin-top:6px">💡 In Brevo mode, "Daniel Phillips" is added as sender — no need to sign the body.</div>
 </div>
 
 <div style="background:linear-gradient(135deg,#1f2937,#374151);color:white;padding:16px;border-radius:10px;margin-bottom:20px">
@@ -2300,6 +2314,17 @@ let currentEmail=null;
 let awaitingReturn=false;
 let SEND_LIMIT=''' + str(current_limit) + ''';
 
+let scoutSendMethod = localStorage.getItem('scoutSendMethod') || 'brevo';
+function setScoutMethod(m){
+  scoutSendMethod = m;
+  localStorage.setItem('scoutSendMethod', m);
+  const hint = document.getElementById('scoutSendHint');
+  if(hint){
+    hint.innerHTML = 'Currently: <b>' + (m === 'brevo' ? 'Brevo SMTP' : 'Gmail (mailto)') + '</b>' + (m === 'brevo' ? ' — fully automatic, no Gmail opens' : ' — opens Gmail app');
+  }
+  document.querySelectorAll('input[name="scoutSendMethod"]').forEach(r => { r.checked = (r.value === m); });
+}
+
 function syncRecipients(){
   const val=document.getElementById('emailsInput').value;
   recipients=val.split('\\n').map(s=>s.trim()).filter(s=>s.length>0);
@@ -2315,6 +2340,7 @@ window.onload=async function(){
     if(data.message) document.getElementById('messageBody').value = data.message;
   }catch(e){}
   document.getElementById('emailCount').textContent=recipients.length+' recipients';
+  setScoutMethod(scoutSendMethod);
   await loadCounter();
 };
 
@@ -2381,7 +2407,7 @@ function startCampaign(){
   isRunning=true;awaitingReturn=false;currentEmail=null;
   document.getElementById('startBtn').style.display='none';
   document.getElementById('stopBtn').style.display='inline-block';
-  document.getElementById('launchStatus').innerHTML='<p style="color:green">▶️ Started.</p>';
+  document.getElementById('launchStatus').innerHTML='<p style="color:green">▶️ Started. Method: <b>'+scoutSendMethod+'</b></p>';
   openNext();
 }
 
@@ -2392,7 +2418,7 @@ function stopCampaign(){
   document.getElementById('launchStatus').innerHTML='<p style="color:red">⏹️ Stopped.</p>';
 }
 
-function openNext(){
+async function openNext(){
   if(!isRunning) return;
   if(recipients.length===0){
     isRunning=false;
@@ -2402,14 +2428,52 @@ function openNext(){
     return;
   }
   currentEmail=recipients[0];
-  awaitingReturn=true;
   const subj=document.getElementById('subjectLine').value;
   const body=document.getElementById('messageBody').value;
+
+  if(scoutSendMethod === 'brevo'){
+    document.getElementById('launchStatus').innerHTML='<p style="color:#0d9488">⏳ Sending '+(recipients.length)+' remaining via Brevo...</p>';
+    try{
+      const res = await fetch('/send-email', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({to: currentEmail, subject: subj, body: body, sender_name: 'Daniel Phillips'})});
+      const data = await res.json();
+      if(!data.success){
+        isRunning=false;
+        document.getElementById('startBtn').style.display='inline-block';
+        document.getElementById('stopBtn').style.display='none';
+        document.getElementById('launchStatus').innerHTML='<p style="color:red">❌ Brevo error: '+(data.error||'unknown')+'</p>';
+        return;
+      }
+      if(data.counter){
+        SEND_LIMIT=data.counter.limit;
+        updateCounterUI(data.counter.count, data.counter.next_milestone, data.counter.at_milestone);
+        if(data.counter.at_milestone){
+          isRunning=false;
+          document.getElementById('startBtn').style.display='inline-block';
+          document.getElementById('stopBtn').style.display='none';
+          document.getElementById('launchStatus').innerHTML='<p style="color:red;font-weight:bold">🛑 Reached '+data.counter.count+' sent. Stopped.</p>';
+          return;
+        }
+      }
+      recipients.shift();
+      document.getElementById('emailsInput').value=recipients.join('\\n');
+      document.getElementById('emailCount').textContent=recipients.length+' recipients';
+      saveState();
+      setTimeout(openNext, 1200);
+    }catch(e){
+      isRunning=false;
+      document.getElementById('startBtn').style.display='inline-block';
+      document.getElementById('stopBtn').style.display='none';
+      document.getElementById('launchStatus').innerHTML='<p style="color:red">❌ Network error: '+e.message+'</p>';
+    }
+    return;
+  }
+
+  awaitingReturn=true;
   window.location.href='mailto:'+currentEmail+'?subject='+encodeURIComponent(subj)+'&body='+encodeURIComponent(body);
 }
 
 document.addEventListener('visibilitychange', async function(){
-  if(document.visibilityState==='visible' && isRunning && awaitingReturn && currentEmail){
+  if(document.visibilityState==='visible' && isRunning && awaitingReturn && currentEmail && scoutSendMethod === 'mailto'){
     awaitingReturn=false;
     try{
       const incRes=await fetch('/increment-session-counter',{method:'POST'});
@@ -2480,6 +2544,7 @@ async function saveState(){
 }
 </script>'''
     return render_page("Scout", body)
+
 
 # ==========================================
 # ANALYZE & SEND
