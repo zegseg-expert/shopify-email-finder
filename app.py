@@ -1504,8 +1504,9 @@ def generate_outreach_email(report, tone='friendly', sender_name='', email=''):
 # BREVO SMTP SENDER
 # ==========================================
 def send_via_brevo(to_email, subject, body, sender_name='', sender_email=None):
-    """Send a single email through Brevo SMTP."""
+    """Send a single email through Brevo SMTP. Tries configured port first, falls back to 465."""
     import smtplib
+    import ssl
     from email.mime.text import MIMEText
     from email.utils import formataddr, formatdate, make_msgid
 
@@ -1526,16 +1527,42 @@ def send_via_brevo(to_email, subject, body, sender_name='', sender_email=None):
     msg['Date'] = formatdate(localtime=True)
     msg['Message-ID'] = make_msgid(domain='danielphillips.dev')
 
-    try:
-        with smtplib.SMTP(server, port, timeout=20) as s:
+    def _try_starttls(p):
+        with smtplib.SMTP(server, p, timeout=20) as s:
             s.ehlo()
-            s.starttls()
+            s.starttls(context=ssl.create_default_context())
             s.ehlo()
             s.login(login, password)
             s.sendmail(from_addr, [to_email], msg.as_string())
+
+    def _try_ssl(p):
+        with smtplib.SMTP_SSL(server, p, timeout=20, context=ssl.create_default_context()) as s:
+            s.login(login, password)
+            s.sendmail(from_addr, [to_email], msg.as_string())
+
+    errors = []
+    # Attempt 1: whatever port is configured
+    try:
+        if port == 465:
+            _try_ssl(port)
+        else:
+            _try_starttls(port)
         return True, None
     except Exception as e:
-        return False, str(e)[:300]
+        errors.append(f"port {port}: {str(e)[:150]}")
+
+    # Attempt 2: fallback to the OTHER port
+    fallback_port = 465 if port != 465 else 587
+    try:
+        if fallback_port == 465:
+            _try_ssl(fallback_port)
+        else:
+            _try_starttls(fallback_port)
+        return True, None
+    except Exception as e:
+        errors.append(f"port {fallback_port}: {str(e)[:150]}")
+
+    return False, " | ".join(errors)
 
 # ==========================================
 # NAVBAR
